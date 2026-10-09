@@ -1,0 +1,23 @@
+# env 文件（含本地密钥/私网地址，禁止入库）
+.env
+.env.local
+.env.*.local
+
+# Dev Container 本地覆盖
+.devcontainer/docker-compose.local.yml
+
+# 构建与热重载产物
+/build/
+/tmp/
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# 编辑器与系统文件
+.DS_Store
+.idea/
+*.swp
+*~

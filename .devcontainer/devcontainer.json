@@ -1,0 +1,58 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/docker-existing-docker-compose
+{
+  "name": "easylive-api Dev",
+  // Update the 'dockerComposeFile' list if you have more compose files or use different names.
+  // The .devcontainer/docker-compose.yml file contains any overrides you need/want to make.
+  "dockerComposeFile": [
+    "../compose.yml",
+    "docker-compose.yml",
+    "docker-compose.local.yml"
+  ],
+  // The 'service' property is the name of the service for the container that VS Code should
+  // use. Update this value and .devcontainer/docker-compose.yml to the real service name.
+  "service": "app_dev",
+  // The optional 'workspaceFolder' property is the path VS Code should open by default when
+  // connected. This is typically a file mount in .devcontainer/docker-compose.yml
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  // 注意：forwardPorts 只能转发 TCP。WebRTC 媒体面的 UDP 端口必须由 .devcontainer/docker-compose.yml
+  // 的 ports 显式发布（${MEDIA_UDP_PORT}/udp），这里只列 TCP 端口方便点击打开。
+  "forwardPorts": [
+    8080,
+    5173
+  ],
+  "portsAttributes": {
+    "8080": {
+      "label": "signaling + graphql"
+    },
+    "5173": {
+      "label": "web (vite)"
+    }
+  },
+  // 首次创建容器后执行一次（幂等）
+  "postCreateCommand": "sh .devcontainer/install.sh",
+  // Configure tool-specific properties.
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "editor.formatOnPaste": true,
+        "editor.formatOnSave": true,
+        "editor.formatOnType": true,
+        "remote.localPortHost": "allInterfaces",
+        "go.useLanguageServer": true,
+        "go.testFlags": [
+          "-v"
+        ]
+      },
+      "extensions": [
+        "ms-azuretools.vscode-docker",
+        "golang.go",
+        "esbenp.prettier-vscode",
+        "dbaeumer.vscode-eslint",
+        "bradlc.vscode-tailwindcss"
+      ]
+    }
+  }
+  // Uncomment to connect as an existing user other than the container default. More info: https://aka.ms/dev-containers-non-root.
+  // "remoteUser": "devcontainer"
+}

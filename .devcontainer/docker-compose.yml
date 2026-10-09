@@ -1,0 +1,33 @@
+version: "3.8"
+services:
+  # Update this to the name of the service you want to work with in your docker-compose.yml file
+  app_dev:
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+      target: dev
+
+    env_file:
+      - .env
+
+    # 媒体面是 UDP：VS Code 的 forwardPorts 只能转发 TCP，必须在 compose 里显式发布。
+    # 单端口 UDP mux（MEDIA_UDP_PORT）让安全组/防火墙只需开一个口。
+    ports:
+      - "${APP_PORT:-8080}:${APP_PORT:-8080}"
+      - "${MEDIA_UDP_PORT:-7881}:${MEDIA_UDP_PORT:-7881}/udp"
+
+    volumes:
+      # Update this to wherever you want VS Code to mount the folder of your project
+      - ..:/workspaces:cached
+      - ${DOCKER_VOLUMES_ROOT_DIR}/app_dev_volume/go:/go
+
+    # Go 断点调试（delve）在容器内需要这两个权限；egg-api 里是注释状态，这里默认打开。
+    cap_add:
+      - SYS_PTRACE
+      # 需要在容器内跑 `tc netem` 做弱网注入时再打开（弱网实验更推荐在云主机/宿主机做）
+      # - NET_ADMIN
+    security_opt:
+      - seccomp:unconfined
+
+    # Overrides default command so things don't shut down after the process ends.
+    command: sleep infinity
