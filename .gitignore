@@ -16,6 +16,11 @@
 go.work
 go.work.sum
 
+# 生产部署的本地私密文件（真实环境变量与证书绝不入库）
+deploy/.env.prod
+deploy/certs/
+deploy/acme/
+
 # 编辑器与系统文件
 .DS_Store
 .idea/

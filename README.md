@@ -10,6 +10,10 @@
 | 数据 | PostgreSQL（pgx）；**不引入 Redis**：会话与媒体状态驻留进程内存 |
 | 开发环境 | Dev Container（`.devcontainer/`，约定与 `egg-api` / `titanium-line-api` 一致） |
 
+## 部署
+
+单节点生产部署（HTTPS/WSS + coturn 中继 + 一键起服务）见 **[deploy/README.md](deploy/README.md)**。
+
 ## 快速开始
 
 ### 方式 A：Dev Container（推荐）

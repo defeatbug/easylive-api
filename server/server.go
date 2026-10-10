@@ -22,6 +22,7 @@ import (
 	"easylive-api/config"
 	"easylive-api/sfu"
 	"easylive-api/signaling"
+	"easylive-api/turn"
 )
 
 type Server struct {
@@ -185,6 +186,25 @@ func (s *Server) build() *fiber.App {
 			"roomId":    req.RoomID,
 			"expiresAt": exp.UnixMilli(),
 			"video":     grant,
+		})
+	})
+
+	// ---- 客户端 ICE 配置：GET <basePath>/ice ----
+	//
+	// 为什么必须由服务端下发：STUN 只能做地址发现，双方都在对称 NAT 后必须走中继，
+	// 而把长期 TURN 密钥发给浏览器等于把中继开放成免费代理。这里按 coturn 的
+	// use-auth-secret 方案现签**临时凭证**（有效期 TURN_CRED_TTL，默认 1 小时）。
+	//
+	// identity 由客户端自报：它只影响凭证的归属标注，不能借此获得额外权限；
+	// 真正的授权边界是"密钥不下发 + 凭证会过期"。
+	router.Get("/ice", func(c *fiber.Ctx) error {
+		identity := c.Query("identity", "anonymous")
+		servers := turn.Servers(cfg.StunURLs, cfg.TurnURLs, cfg.TurnSecret, identity, cfg.TurnCredTTL)
+		return c.JSON(fiber.Map{
+			"iceServers":       servers,
+			"ttlSeconds":       turn.TTLSeconds(cfg.TurnCredTTL),
+			"turnEnabled":      len(cfg.TurnURLs) > 0 && cfg.TurnSecret != "",
+			"credentialScheme": "turn-rest-api", // coturn --use-auth-secret
 		})
 	})
 

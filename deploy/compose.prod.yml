@@ -1,0 +1,98 @@
+# 生产编排：一条命令起 api + web + postgres + coturn。
+#
+# 目录约定（重要）：两个仓库克隆在**同级目录**下
+#   ~/easylive-api/   ← 本文件所在仓库
+#   ~/easylive-web/
+# 因为 web 的镜像要构建它自己的源码，compose 里用相对路径 ../ 引用。
+#
+# 用法：
+#   cp deploy/.env.prod.example deploy/.env.prod   # 填好再启动
+#   docker compose -f deploy/compose.prod.yml --env-file deploy/.env.prod up -d --build
+#
+# 说明：coturn 用 host 网络——它需要一大段 UDP 端口，桥接模式下映射几十个端口既慢又难维护；
+#       媒体端口（7881/udp、7882/tcp）留在 api 服务上做端口映射即可，因为它们是单端口 mux。
+name: easylive
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    restart: always
+    env_file:
+      - .env.prod
+    # 容器里必须把 advertise IP 设成公网地址，否则浏览器拿到的是 172.x 内网候选，必然连不通
+    environment:
+      APP_ENV: production
+      POSTGRES_HOST: postgresql
+    ports:
+      - "7881:7881/udp" # 单端口媒体 mux
+      - "7882:7882/tcp" # ICE-TCP 兜底
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  web:
+    build:
+      context: ../../easylive-web
+      dockerfile: deploy/Dockerfile.web
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # 证书由宿主机签发后放进 deploy/certs（已被 .gitignore 排除）
+      - ./certs:/etc/nginx/certs:ro
+      # certbot webroot 续期用
+      - ./acme:/var/www/certbot:ro
+    depends_on:
+      - api
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  postgresql:
+    image: postgres:17.2-alpine3.20
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB_NAME:-sfu_prod}
+    volumes:
+      - ${DOCKER_VOLUMES_ROOT_DIR}/postgresql_volume/data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB_NAME:-sfu_prod}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # coturn：对称 NAT / UDP 被封时的中继兜底。
+  # 用 host 网络 + 显式 external-ip，参数与 deploy/turnserver.conf 一一对应。
+  coturn:
+    image: coturn/coturn:4.6
+    restart: always
+    network_mode: host
+    command: >
+      -n
+      --log-file=stdout
+      --simple-log
+      --external-ip=${TURN_EXTERNAL_IP}
+      --realm=${TURN_REALM}
+      --use-auth-secret
+      --static-auth-secret=${TURN_SECRET}
+      --min-port=49160
+      --max-port=49200
+      --fingerprint
+      --no-multicast-peers
+      --no-cli
+      --user-quota=12
+      --total-quota=1200
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

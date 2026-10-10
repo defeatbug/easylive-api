@@ -8,15 +8,11 @@
 package sfu
 
 import (
-	"crypto/hmac"
-	"crypto/sha1"
-	"encoding/base64"
 	"fmt"
 	"log"
+	"net"
 	"os"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
@@ -25,12 +21,16 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"easylive-api/config"
+	"easylive-api/turn"
 )
 
 type Engine struct {
 	api *webrtc.API
 	cfg *config.Config
 	mux ice.UDPMux
+	// tcpMux / tcpListener 是 ICE-TCP 兜底路径（UDP 被封锁的网络）
+	tcpMux      ice.TCPMux
+	tcpListener net.Listener
 }
 
 // NewEngine 构造 Pion API：单端口 UDP mux + 对外地址广播 + 默认拦截器（NACK / RTCP Report / TWCC）。
@@ -56,15 +56,36 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 	}
 	se.SetIncludeLoopbackCandidate(cfg.IncludeLoopback)
 
-	// 3) 服务端不需要 mDNS 候选
+	// 3) ICE-TCP 兜底：企业内网、部分校园网会封 UDP，此时只有 TCP 候选能连通。
+	//    与 UDP 一样做成单端口 mux，安全组只需额外开一个 TCP 端口。
+	//    （此前 ICETCPPort 只在配置里存在、代码里从未使用——这类"文档写了但没实现"
+	//      的不一致会在公网验收时变成"明明开了端口却连不上"，必须对齐。）
+	var tcpMux ice.TCPMux
+	var tcpListener net.Listener
+	if cfg.ICETCPPort > 0 {
+		ln, lerr := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ICETCPPort))
+		if lerr != nil {
+			return nil, fmt.Errorf("监听 ICE TCP 端口 %d 失败: %w", cfg.ICETCPPort, lerr)
+		}
+		tcpListener = ln
+		tcpMux = ice.NewTCPMuxDefault(ice.TCPMuxParams{
+			Listener:        ln,
+			Logger:          se.LoggerFactory.NewLogger("ice-tcp"),
+			WriteBufferSize: 4 * 1024 * 1024,
+		})
+		se.SetICETCPMux(tcpMux)
+		log.Printf("sfu: ICE-TCP 已启用，监听 tcp/%d（UDP 被封锁时的兜底路径）", cfg.ICETCPPort)
+	}
+
+	// 4) 服务端不需要 mDNS 候选
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 
-	// 4) Pion 自身日志。默认（error）会把 "Could not determine PayloadType"、"Failed to set
+	// 5) Pion 自身日志。默认（error）会把 "Could not determine PayloadType"、"Failed to set
 	//    codec settings" 这类**静默丢包**警告吞掉，排查"订阅端黑屏"时必开。
 	//    注意：debug 级别会有逐包日志，所以这里比应用日志低一档。
 	se.LoggerFactory = newLoggerFactory(cfg.LogLevel)
 
-	// 5) 默认编解码器与拦截器：NACK（丢包重传）、RTCP Report、TWCC（拥塞反馈）
+	// 6) 默认编解码器与拦截器：NACK（丢包重传）、RTCP Report、TWCC（拥塞反馈）
 	m := &webrtc.MediaEngine{}
 	// 注册 RFC 6464 音频电平头扩展（urn:ietf:params:rtp-hdrext:ssrc-audio-level）。
 	// 浏览器默认会在 offer 里带它；服务端这里注册后 answer 才会确认，
@@ -89,44 +110,37 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 		webrtc.WithInterceptorRegistry(ir),
 		webrtc.WithSettingEngine(se),
 	)
-	return &Engine{api: api, cfg: cfg, mux: mux}, nil
+	return &Engine{api: api, cfg: cfg, mux: mux, tcpMux: tcpMux, tcpListener: tcpListener}, nil
 }
 
-// Close 关闭 UDP mux，释放端口。
+// Close 关闭 UDP/TCP mux，释放端口。
 func (e *Engine) Close() error {
 	if e.mux != nil {
-		return e.mux.Close()
+		_ = e.mux.Close()
+	}
+	if e.tcpMux != nil {
+		_ = e.tcpMux.Close()
+	} else if e.tcpListener != nil {
+		_ = e.tcpListener.Close()
 	}
 	return nil
 }
 
 // Configuration 生成 ICE 配置：STUN 直连探测 + TURN 中继兜底（用于对称 NAT）。
+// 凭证生成与下发给浏览器的是同一套实现（turn 包），避免"服务端能用、客户端不能用"的偏差。
 func (e *Engine) Configuration(userID string) webrtc.Configuration {
-	cfg := webrtc.Configuration{ICEServers: []webrtc.ICEServer{}}
-
-	if len(e.cfg.StunURLs) > 0 {
-		cfg.ICEServers = append(cfg.ICEServers, webrtc.ICEServer{URLs: e.cfg.StunURLs})
+	servers := turn.Servers(e.cfg.StunURLs, e.cfg.TurnURLs, e.cfg.TurnSecret, userID, e.cfg.TurnCredTTL)
+	out := make([]webrtc.ICEServer, 0, len(servers))
+	for _, s := range servers {
+		item := webrtc.ICEServer{URLs: s.URLs}
+		if s.Username != "" {
+			item.Username = s.Username
+			item.Credential = s.Credential
+			item.CredentialType = webrtc.ICECredentialTypePassword
+		}
+		out = append(out, item)
 	}
-	if len(e.cfg.TurnURLs) > 0 && e.cfg.TurnSecret != "" {
-		user, cred := e.turnCredential(userID, time.Hour)
-		cfg.ICEServers = append(cfg.ICEServers, webrtc.ICEServer{
-			URLs:           e.cfg.TurnURLs,
-			Username:       user,
-			Credential:     cred,
-			CredentialType: webrtc.ICECredentialTypePassword,
-		})
-	}
-	return cfg
-}
-
-// turnCredential 实现 coturn 的 REST API 临时凭证：
-// username = <过期时间戳>:<用户标识>，password = base64(HMAC-SHA1(secret, username))。
-func (e *Engine) turnCredential(userID string, ttl time.Duration) (string, string) {
-	expiry := strconv.FormatInt(time.Now().Add(ttl).Unix(), 10)
-	username := expiry + ":" + userID
-	mac := hmac.New(sha1.New, []byte(e.cfg.TurnSecret))
-	mac.Write([]byte(username))
-	return username, base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	return webrtc.Configuration{ICEServers: out}
 }
 
 // NewPeerConnection 用统一配置创建一条 PeerConnection。

@@ -18,11 +18,14 @@ type Config struct {
 	LogLevel    string
 
 	// 媒体面
-	MediaUDPPort    int
-	AdvertiseIP     string
-	StunURLs        []string
-	TurnURLs        []string
-	TurnSecret      string
+	MediaUDPPort int
+	AdvertiseIP  string
+	StunURLs     []string
+	TurnURLs     []string
+	TurnSecret   string
+	// TurnCredTTL 是下发给客户端的 TURN 临时凭证有效期。
+	// 短一点更安全（泄漏窗口小），但要大于一次会议的典型时长，否则中途失效会掉中继。
+	TurnCredTTL     time.Duration
 	ICETCPPort      int
 	IncludeLoopback bool
 
@@ -74,6 +77,7 @@ func Load() *Config {
 		StunURLs:            getList("STUN_URLS", "stun:stun.l.google.com:19302"),
 		TurnURLs:            getList("TURN_URLS", ""),
 		TurnSecret:          getStr("TURN_SECRET", ""),
+		TurnCredTTL:         getDuration("TURN_CRED_TTL", time.Hour),
 		ICETCPPort:          getInt("ICE_TCP_PORT", 7882),
 		IncludeLoopback:     getBool("ICE_INCLUDE_LOOPBACK", true),
 		PostgresDSN:         buildDSN(),
@@ -99,7 +103,11 @@ func Load() *Config {
 // LogSummary 打印关键配置（不打印任何密钥），便于容器里一眼确认环境是否正确。
 func (c *Config) LogSummary() {
 	log.Printf("config: env=%s port=%s basePath=%q", c.AppEnv, c.AppPort, c.AppBasePath)
-	log.Printf("config: media udp=%d advertiseIP=%q stun=%v turn=%d 个", c.MediaUDPPort, c.AdvertiseIP, c.StunURLs, len(c.TurnURLs))
+	log.Printf("config: media udp=%d iceTcp=%d advertiseIP=%q stun=%v turn=%d 个（临时凭证 %s）",
+		c.MediaUDPPort, c.ICETCPPort, c.AdvertiseIP, c.StunURLs, len(c.TurnURLs), c.TurnCredTTL)
+	if len(c.TurnURLs) > 0 && c.TurnSecret == "" {
+		log.Printf("config: 警告 配置了 TURN_URLS 但没有 TURN_SECRET，将不下发 TURN（无凭证的中继只会拖慢建连）")
+	}
 	// 只打印"是否配置"，绝不打印密钥本身
 	if c.AuthMode != "off" && c.JWTSecret == "" {
 		log.Printf("config: 警告 AUTH_MODE=%s 但未配置 JWT_SECRET，鉴权将降级为不校验", c.AuthMode)

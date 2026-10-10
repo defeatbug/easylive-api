@@ -1,0 +1,37 @@
+# 生产镜像：多阶段构建。
+#
+# 为什么用 CGO_ENABLED=0：Pion / pgx 都是纯 Go，静态二进制可以直接跑在极简基础镜像上，
+# 没有 glibc 版本耦合，也不会因为宿主机升级而崩。
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /src
+
+# 先只拷依赖清单单独一层：只要 go.mod/go.sum 不变，改业务代码不会重新下载依赖
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# -trimpath 去掉本机绝对路径（既减小体积，也避免把开发机的目录结构带进镜像）
+# -ldflags "-s -w" 去掉符号表与调试信息
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/easylive-api .
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata wget \
+    && adduser -D -u 10001 -h /app app
+
+WORKDIR /app
+COPY --from=builder /out/easylive-api /app/easylive-api
+COPY --from=builder /src/migrations /app/migrations
+
+# 以非 root 运行：容器逃逸的影响面小得多
+USER app
+
+# 8080 = 信令/HTTP；7881/udp = 单端口媒体 mux；7882/tcp = ICE-TCP 兜底
+EXPOSE 8080 7881/udp 7882/tcp
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+
+ENTRYPOINT ["/app/easylive-api"]
