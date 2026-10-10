@@ -1,0 +1,95 @@
+# easylive 业务接口。
+#
+# 数据来源是刻意分开的两层（见 store/store.go 的包注释）：
+#   - Room / Meeting  → Ent（业务实体、关系、写入）
+#   - RoomMetrics     → sqlc（指标时序的强聚合查询）
+# 一个 GraphQL 接口同时暴露两者，正是混合方案想要的形态：调用方不关心底层用的是什么。
+
+scalar Time
+scalar Long
+
+type Room {
+  id: String!
+  title: String!
+  createdBy: String!
+  createdAt: Time!
+  updatedAt: Time!
+  "为空表示房间仍在服务中"
+  closedAt: Time
+  "该房间的会议记录（按开始时间倒序）"
+  meetings(limit: Int = 10): [Meeting!]!
+  "历史会议聚合统计（Ent 聚合，不走指标表）"
+  meetingStats: RoomMeetingStats!
+}
+
+type Meeting {
+  id: String!
+  roomId: String!
+  startedAt: Time!
+  endedAt: Time
+  durationSec: Int!
+  peakParticipants: Int!
+  peakTracks: Int!
+}
+
+type RoomMeetingStats {
+  meetings: Int!
+  totalDurationSec: Long!
+  peakParticipants: Long!
+  peakTracks: Long!
+}
+
+# 来自 metric_samples（sqlc 聚合），是评测章节的数据出口
+type RoomMetrics {
+  sampleCount: Long!
+  avgParticipants: Float!
+  peakParticipants: Long!
+  avgTracks: Float!
+  peakTracks: Long!
+  avgRttMs: Float!
+  avgLossRate: Float!
+  totalBytes: Long!
+  avgInKbps: Float!
+  avgOutKbps: Float!
+}
+
+type SampleBucket {
+  bucket: Time!
+  avgParticipants: Float!
+  avgTracks: Float!
+  avgRttMs: Float!
+  avgLossRate: Float!
+  totalBytes: Long!
+}
+
+type Query {
+  "房间列表（按创建时间倒序）"
+  rooms(limit: Int = 20, offset: Int = 0): [Room!]!
+  "按房间号查询"
+  room(id: String!): Room
+  "某房间最近一段时间的指标聚合（sqlc）"
+  roomMetrics(roomId: String!, sinceMinutes: Int = 60): RoomMetrics!
+  "某房间的指标曲线（按时间桶折叠，sqlc）"
+  roomMetricBuckets(roomId: String!, sinceMinutes: Int = 60, bucketSeconds: Int = 60): [SampleBucket!]!
+}
+
+type Mutation {
+  "创建或更新房间（幂等）"
+  createRoom(id: String!, title: String, createdBy: String): Room!
+  "关闭房间，并收尾其未结束的会议记录"
+  closeRoom(id: String!): Room!
+  "写入一条指标样本（评测脚本与后台采样用）"
+  recordMetricSample(input: MetricSampleInput!): Boolean!
+}
+
+input MetricSampleInput {
+  roomId: String!
+  participants: Int!
+  tracks: Int!
+  packets: Long!
+  bytes: Long!
+  rttMs: Int!
+  lossRate: Float!
+  outKbps: Int!
+  inKbps: Int!
+}

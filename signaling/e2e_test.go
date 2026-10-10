@@ -100,7 +100,7 @@ func startServerFull(t *testing.T, grace time.Duration, authMode, jwtSecret, app
 
 	manager := sfu.NewManager(engine, cfg.RoomMaxParticipants, cfg.ResumeGrace)
 	hub := signaling.NewHub(manager, cfg)
-	srv := server.New(cfg, manager, hub)
+	srv := server.New(cfg, manager, hub, nil) // nil store：测试不依赖数据库
 
 	go func() { _ = srv.App().Listen("127.0.0.1:" + cfg.AppPort) }()
 	t.Cleanup(func() { _ = srv.App().Shutdown() })

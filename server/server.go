@@ -3,7 +3,6 @@ package server
 
 import (
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -20,9 +19,14 @@ import (
 
 	"easylive-api/auth"
 	"easylive-api/config"
+	"easylive-api/graph"
 	"easylive-api/sfu"
 	"easylive-api/signaling"
+	"easylive-api/store"
 	"easylive-api/turn"
+
+	"github.com/99designs/gqlgen/graphql/handler"
+	"github.com/99designs/gqlgen/graphql/playground"
 )
 
 type Server struct {
@@ -30,11 +34,13 @@ type Server struct {
 	app     *fiber.App
 	hub     *signaling.Hub
 	manager *sfu.Manager
+	// st 可能为 nil：数据库是可选依赖（连不上不影响开会）
+	st      *store.Store
 	started time.Time
 }
 
-func New(cfg *config.Config, manager *sfu.Manager, hub *signaling.Hub) *Server {
-	s := &Server{cfg: cfg, hub: hub, manager: manager, started: time.Now()}
+func New(cfg *config.Config, manager *sfu.Manager, hub *signaling.Hub, st *store.Store) *Server {
+	s := &Server{cfg: cfg, hub: hub, manager: manager, st: st, started: time.Now()}
 	s.app = s.build()
 	return s
 }
@@ -211,18 +217,19 @@ func (s *Server) build() *fiber.App {
 	// ---- 媒体信令入口：<basePath>/ws ----
 	signaling.Mount(router.Group("/ws"), s.hub)
 
-	// ---- GraphQL（业务接口：创建房间 / 房间列表）----
+	// ---- GraphQL：业务接口（房间 / 会议记录 / 指标聚合）----
 	//
-	// TODO(gqlgen)：接入 gqlgen 只需要替换下面的占位 handler，写法与 egg-api 完全一致：
+	// 数据层是 Ent（业务实体）+ sqlc（指标强聚合）的混合体，两者共用同一个 pgxpool；
+	// resolver 只依赖 store.Store，因此接口层不需要知道某条数据来自哪一套。
 	//
-	//	r.All("", adaptor.HTTPHandler(gqlgenHandler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{Resolvers: &graph.Resolver{}}))))
-	//
-	// 注意：gqlgen 的 handler 是 net/http 的 http.Handler，必须经 adaptor.HTTPHandler 桥接（Fiber 官方支持的方式）。
-	router.All("/graphql", adaptor.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusNotImplemented)
-		_, _ = w.Write([]byte(`{"errors":[{"message":"GraphQL 尚未接入，见 server/server.go 的 TODO(gqlgen)"}]}`))
-	})))
+	// 注意 gqlgen 的 handler 是 net/http 的 http.Handler，必须经 adaptor.HTTPHandler
+	// 桥接到 Fiber（Fiber 官方支持的方式）。
+	gqlSrv := handler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{Resolvers: graph.New(s.st)}))
+	router.All("/graphql", adaptor.HTTPHandler(gqlSrv))
+	// GraphiQL 调试页：只在开发环境挂载，生产暴露它等于把整个 schema 摆出来给人试
+	if cfg.AppEnv == "development" {
+		router.Get("/playground", adaptor.HTTPHandler(playground.Handler("easylive GraphQL", "/graphql")))
+	}
 
 	return app
 }

@@ -57,7 +57,7 @@ func main() {
 	manager := sfu.NewManager(engine, cfg.RoomMaxParticipants, cfg.ResumeGrace)
 	hub := signaling.NewHub(manager, cfg)
 
-	srv := server.New(cfg, manager, hub)
+	srv := server.New(cfg, manager, hub, st)
 	if err := srv.Run(); err != nil {
 		log.Fatalf("main: 服务异常退出: %v", err)
 	}

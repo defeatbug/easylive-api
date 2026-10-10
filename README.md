@@ -7,7 +7,7 @@
 | 媒体面 | Go + Pion WebRTC v4（单端口 UDP mux、RTP 只转发不转码不混流） |
 | HTTP / 信令 | Fiber v2 + `gofiber/contrib/websocket`（沿用 egg-api 的写法） |
 | 业务接口 | gqlgen（当前为占位 handler，见 `server/server.go` 的 `TODO(gqlgen)`） |
-| 数据 | PostgreSQL（pgx）；**不引入 Redis**：会话与媒体状态驻留进程内存 |
+| 数据 | PostgreSQL；业务实体用 **Ent**、指标时序用 **sqlc**（共用同一个 pgxpool）；**不引入 Redis**：会话与媒体状态驻留进程内存 |
 | 开发环境 | Dev Container（`.devcontainer/`，约定与 `egg-api` / `titanium-line-api` 一致） |
 
 ## 部署
@@ -58,9 +58,66 @@ signaling/
   handler.go            /ws 路由 + 协议分发（请求→响应，状态变更→事件）
   e2e_test.go           端到端冒烟测试（不需要浏览器）
 server/server.go        Fiber 装配：recover/logger/cors/limiter、/healthz、/ws、/graphql、优雅关闭
-store/                  pgx 连接池 + 房间元数据读写（数据库不可用时降级，不影响开会）
+store/                 数据访问层：Ent（业务实体）+ sqlc（指标聚合）共用同一个 pgxpool
+store/queries/         sqlc 的查询定义（指标时序的写入与聚合）
+store/sqlcgen/         sqlc 生成代码（勿手改）
+ent/schema/            Ent 实体定义（rooms / meetings），`go generate ./ent` 生成 ent/
+graph/                 gqlgen：schema.graphqls + resolver + 生成代码
+deploy/                生产部署（Dockerfile / compose / Nginx / coturn / 部署指南）
 migrations/001_init.sql 最小表结构
 ```
+
+## 数据层：Ent + sqlc 的混合方案
+
+数据库**不在媒体热路径上**（会话、轨道、订阅全在进程内存里，ADR D8），它只承担两类负载，
+而这两类负载的形状完全不同，所以刻意分成两套访问层：
+
+| 谁 | 管什么 | 为什么 |
+|---|---|---|
+| **Ent** | `rooms` / `meetings`（业务实体、1-N 关系、写入） | 有实体关系与业务规则（upsert 幂等、关闭房间要级联收尾会议），需要 schema 即代码 |
+| **sqlc** | `metric_samples`（指标时序：高写入 + 强聚合） | 查询是"按时间桶 GROUP BY、取均值/峰值"，显式 SQL 最直接；也避免 ORM 的懒加载意外发生在采样协程里 |
+
+三条硬约束：
+
+1. **一张表只有一个写者**。`rooms`/`meetings` 只由 Ent 写，`metric_samples` 只由 sqlc 写。
+2. **共用一个 pgxpool**。Ent 通过 `stdlib.OpenDBFromPool(pool)` 拿到 `database/sql` 视图，
+   sqlc 直接用同一个 pool —— 连接数不会翻倍，也不会出现"两个池各占一半"的坑。
+3. **单一 DDL 事实源**：`migrations/*.sql`。sqlc 直接读它生成类型；Ent schema 与它的一致性
+   由 `store/schema_drift_test.go` 双向校验（Ent 有列而迁移没有、或迁移有列而 Ent 没有，
+   都会让 `go test` 失败 —— 这个守卫做过反证，确认它真的会红）。
+
+代码生成（两者都在本地跑，不需要数据库）：
+
+```bash
+go generate ./ent     # 按 ent/schema 生成 ent/（--feature sql/upsert）
+sqlc generate         # 按 migrations/ + store/queries 生成 store/sqlcgen/
+```
+
+> 有可用 Postgres 的机器上，更推荐用 `atlas migrate diff` 从 Ent schema 反推迁移，
+> 那样连"迁移与 schema 对齐"这件事都不需要人盯。本仓库当前是手写迁移 + 漂移测试兜底。
+
+**GraphQL 接口**（`gqlgen`，替换了原先的 501 占位）：
+
+```graphql
+# 开发环境还提供 /playground 调试页
+{ rooms(limit: 5) { id title createdAt meetingStats { meetings peakTracks } } }
+{ roomMetrics(roomId: "demo-room", sinceMinutes: 60) { avgParticipants peakTracks avgRttMs totalBytes } }
+mutation { createRoom(id: "demo-room", title: "答辩演示", createdBy: "defender") { id createdAt } }
+```
+
+设计取舍：**手写 schema + 手写 resolver，没用 entgql 自动生成**。理由是当前只有
+4 个查询 + 3 个变更，手写更可读、生成物更小；entgql 的价值（自动分页/过滤/N+1 处理）
+要等实体数量和查询复杂度上来才显现。这是明确的取舍，不是不知道有 entgql。
+
+**连库集成测试**（默认跳过，因为"没有数据库"是合法开发状态）：
+
+```bash
+DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/sfu_dev?sslmode=disable' \
+  go test ./store/ -run Integration -v
+```
+
+会先执行 `migrations/*.sql`（幂等），再走完房间 upsert → 会议记录生命周期 →
+指标写入/窗口聚合/时间桶/清理 的完整链路。
 
 ## 信令协议速览
 

@@ -1,0 +1,26 @@
+# sqlc 配置：指标时序的读写层。
+#
+# 两个关键约定：
+#  1. schema 指向 migrations/*.sql —— **与 Ent 共用同一份 DDL**。
+#     这样 sqlc 生成的结构体不可能和实际表结构漂移（Ent 那边由
+#     store/schema_drift_test.go 做同样的事）。
+#  2. sql_package 用 pgx/v5 —— 生成的函数直接接受 *pgxpool.Pool，
+#     因此可以和 Ent 共用同一个连接池，不需要第二个池。
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "store/queries"
+    gen:
+      go:
+        package: "sqlcgen"
+        out: "store/sqlcgen"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        # json 字段名与 Go 字段名解耦，避免以后重命名 Go 结构体时破坏前端契约
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+        overrides:
+          # 指标表的数值列：让生成的结构体用具体类型而不是 interface{}
+          - db_type: "real"
+            go_type: "float32"

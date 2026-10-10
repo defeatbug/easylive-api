@@ -1,0 +1,38 @@
+# gqlgen 配置：GraphQL 接口的定义与代码生成。
+#
+# 设计取向：**schema 手写、resolver 手写**，不用 entgql 自动生成。
+# 理由：本课题只需要 4 个查询 + 2 个变更，手写 schema 可读性更好、生成物更小；
+# 而 entgql 的价值（自动分页/过滤/N+1 处理）在实体数量与查询复杂度上来之后才显现。
+# 这属于明确的取舍，不是不知道有 entgql。
+schema:
+  - graph/*.graphqls
+
+exec:
+  filename: graph/generated.go
+  package: graph
+
+model:
+  filename: graph/model/models_gen.go
+  package: model
+
+resolver:
+  layout: follow-schema
+  dir: graph
+  package: graph
+  filename_template: "{name}.resolvers.go"
+
+# 自动绑定：让 schema 里的类型直接复用 Ent 生成的实体，避免再写一层 DTO
+autobind:
+  - "easylive-api/ent"
+
+models:
+  ID:
+    model:
+      - github.com/99designs/gqlgen/graphql.ID
+  Time:
+    model:
+      - github.com/99designs/gqlgen/graphql.Time
+  # 大整数（字节数会超过 GraphQL Int 的 32 位范围）
+  Long:
+    model:
+      - github.com/99designs/gqlgen/graphql.Int64
