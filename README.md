@@ -64,8 +64,31 @@ store/sqlcgen/         sqlc 生成代码（勿手改）
 ent/schema/            Ent 实体定义（rooms / meetings），`go generate ./ent` 生成 ent/
 graph/                 gqlgen：schema.graphqls + resolver + 生成代码
 deploy/                生产部署（Dockerfile / compose / Nginx / coturn / 部署指南）
+loadtest/              合成压测客户端（只收发 RTP，不编码/解码）
+cmd/loadtest/          压测入口（CLI：路数/码率/时长 → CSV + P50/P95 汇总）
+docs/evaluation.md     评测方法与口径（每个数字怎么来的）
+scripts/matrix.sh      实验矩阵 runner
 migrations/001_init.sql 最小表结构
 ```
+
+## 评测工具链（M6）
+
+四个维度都有明确的测量口径，细节见 **[docs/evaluation.md](docs/evaluation.md)**：
+
+```bash
+go run ./cmd/loadtest -ws ws://127.0.0.1:8080/ws -room bench \
+  -lanes 4 -duration 30s -video-kbps 800 -audio-kbps 64 -subscribe
+# 输出：results/<时间戳>-<tag>/{lanes.csv,server.csv,summary.json,summary.md}
+```
+
+- **为什么用合成客户端**：浏览器压测会被测试机的编解码/渲染能力先卡住，测出来的是"测试机的上限"；
+  合成客户端只收发 RTP，测的是**服务端的转发与信令开销**。主观画质必须另用真实浏览器测。
+- **单向延迟**用自定义 RTP 头扩展携带发送时刻（同一进程时钟），得到"传输 + 服务端转发"的耗时，
+  **不含**采集/编码/解码/渲染——这个边界必须写清楚，否则数字会被误读。
+- **CPU** 用 `/healthz` 的 `cpuSeconds`（`getrusage` 累计值）差分算；`/healthz` 里不自己算百分比，
+  是为了让采样方掌握采样窗口。
+- 两个踩过的坑（都写进文档了）：RTT 必须取**被提名**的候选对（取所有 succeeded 对的最大值会虚高约 500 倍）；
+  单向延迟的两端必须共用**同一个时钟原点**（各用各的启动时刻会算出负数）。
 
 ## 数据层：Ent + sqlc 的混合方案
 

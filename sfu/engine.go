@@ -24,6 +24,10 @@ import (
 	"easylive-api/turn"
 )
 
+// LatencyExtensionURI 是压测专用的 RTP 头扩展（携带发送时刻，毫秒）。
+// 服务端不解析它，只是随包转发——所以它不会进入媒体处理逻辑，也不影响转发性能。
+const LatencyExtensionURI = "urn:easylive:send-timestamp"
+
 type Engine struct {
 	api *webrtc.API
 	cfg *config.Config
@@ -97,6 +101,17 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 		webrtc.RTPCodecTypeAudio,
 	); err != nil {
 		return nil, fmt.Errorf("注册音频电平头扩展失败: %w", err)
+	}
+
+	// 注册压测用的发送时间戳头扩展：服务端**只透传、不解析**。
+	// 存在的意义是让合成压测客户端能测单向延迟（同一台机器上时钟一致，
+	// 收到时间 - 发送时间 = 传输 + 服务端转发的耗时）。
+	// 必须由服务端也注册，否则 answer 里不会有 extmap，两端就协商不起来。
+	if err := m.RegisterHeaderExtension(
+		webrtc.RTPHeaderExtensionCapability{URI: LatencyExtensionURI},
+		webrtc.RTPCodecTypeVideo,
+	); err != nil {
+		return nil, fmt.Errorf("注册延迟测量头扩展失败: %w", err)
 	}
 
 	if err := m.RegisterDefaultCodecs(); err != nil {

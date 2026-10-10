@@ -23,6 +23,7 @@ import (
 	"easylive-api/sfu"
 	"easylive-api/signaling"
 	"easylive-api/store"
+	"easylive-api/sysinfo"
 	"easylive-api/turn"
 
 	"github.com/99designs/gqlgen/graphql/handler"
@@ -114,6 +115,10 @@ func (s *Server) build() *fiber.App {
 			"wsConns":      s.hub.Count(),
 			"goroutines":   runtime.NumGoroutine(),
 			"heapAllocMB":  float64(mem.HeapAlloc) / 1024 / 1024,
+			// cpuSeconds 是**累计值**：评测脚本按两个时刻的差值 ÷ 墙上时间算占用率。
+			// 用它而不是让服务端自己算百分比，是为了让采样方掌握采样窗口
+			// （服务端自己算会引入它自己的定时器误差）。
+			"cpuSeconds": sysinfo.CPUSeconds(),
 		})
 	})
 

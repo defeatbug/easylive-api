@@ -189,9 +189,13 @@ func (p *Participant) HandlePublishOffer(sdp, source string) (string, error) {
 	if err := pc.SetLocalDescription(answer); err != nil {
 		return "", fmt.Errorf("设置本地 answer 失败: %w", err)
 	}
-	<-webrtc.GatheringCompletePromise(pc)
 
-	// 远端描述已就绪，补入此前缓存下来的候选
+	// 这里**刻意不等待** ICE 收集完成（GatheringCompletePromise），而是走 trickle：
+	// 本地描述先发出去，其余候选随后通过 candidate 消息补发（客户端会缓存到远端描述就绪）。
+	//
+	// 原因是踩过的坑：一旦等待收集完成，回答就会被 STUN 服务器的往返时间绑架——
+	// 部署里配了公网 STUN 而它慢或不可达时，"发布"会卡住好几秒甚至直到超时，
+	// 客户端只看到 publish_answer 迟迟不来。信令路径不该依赖 ICE 收集速度。
 	p.flushCandidates(protocol.TargetPub)
 	return pc.LocalDescription().SDP, nil
 }
@@ -331,7 +335,7 @@ func (p *Participant) Subscribe(track *PublishedTrack) (string, error) {
 	if err := pc.SetLocalDescription(offer); err != nil {
 		return "", fmt.Errorf("设置订阅本地描述失败: %w", err)
 	}
-	<-webrtc.GatheringCompletePromise(pc)
+	// 同样走 trickle（见 HandlePublishOffer 里的说明）：候选随后通过 candidate 消息补发
 	return pc.LocalDescription().SDP, nil
 }
 
