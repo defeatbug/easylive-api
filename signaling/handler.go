@@ -105,6 +105,9 @@ func (h *Hub) dispatch(c *Client, msg *protocol.Message) {
 	case protocol.TypeModerate:
 		h.handleModerate(c, msg)
 
+	case protocol.TypeHandState:
+		h.handleHandState(c, msg)
+
 	default:
 		c.fail(msg, protocol.ErrBadRequest, "未知消息类型: "+string(msg.Type))
 	}
@@ -420,6 +423,32 @@ func (h *Hub) handleChat(c *Client, msg *protocol.Message) {
 			TS:       time.Now().UnixMilli(),
 		},
 	}, "")
+}
+
+// handleHandState 处理客户端经**信令面**上报的举手。
+//
+// 为什么举手有两条路：数据面（SCTP）延迟更低，是首选；但数据面依赖发布连接完成协商，
+// 而"没有摄像头 / 权限被拒"的用户可能从未协商过——那两个功能就静默失效了。
+// 举手本质是**状态**（要可靠、要进房间快照、新人要能看到），所以信令面才是它天然的家，
+// 数据面只是更快的同一条语义。两条路最终都调用同一个 Room.SetHand，重复送达幂等。
+func (h *Hub) handleHandState(c *Client, msg *protocol.Message) {
+	roomID, pid, p := c.session()
+	if roomID == "" || p == nil {
+		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
+		return
+	}
+	if msg.Raised == nil {
+		c.fail(msg, protocol.ErrBadRequest, "缺少 raised")
+		return
+	}
+	if !c.requireGrant(msg, c.grants().CanPublishData, "举手") {
+		return
+	}
+	room, ok := h.manager.Get(roomID)
+	if !ok {
+		return
+	}
+	room.SetHand(pid, *msg.Raised)
 }
 
 // handleModerate 是主持人管理入口（强制静音 / 移出房间）。

@@ -29,6 +29,15 @@ type dcPair struct {
 // 这里用一路"不写样本的音频轨"把连接拉起来（不需要真的发媒体）。
 func openDataChannel(t *testing.T, p *peer) *dcPair {
 	t.Helper()
+	return openDataChannelWith(t, p, true)
+}
+
+// openDataChannelWith 同上，但可以**不发布任何媒体**。
+//
+// 这个变体对应一个真实场景：用户没有摄像头 / 拒绝了权限 → 没有本地轨道
+// → 如果"数据通道只在有媒体时才协商"，举手与表情就会静默失效。
+func openDataChannelWith(t *testing.T, p *peer, withMedia bool) *dcPair {
+	t.Helper()
 
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -61,13 +70,15 @@ func openDataChannel(t *testing.T, p *peer) *dcPair {
 		}
 	})
 
-	track, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "audio", "mic")
-	if err != nil {
-		t.Fatalf("[%s] 创建音频轨失败: %v", p.name, err)
-	}
-	if _, err := pc.AddTrack(track); err != nil {
-		t.Fatalf("[%s] AddTrack 失败: %v", p.name, err)
+	if withMedia {
+		track, terr := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "audio", "mic")
+		if terr != nil {
+			t.Fatalf("[%s] 创建音频轨失败: %v", p.name, terr)
+		}
+		if _, aerr := pc.AddTrack(track); aerr != nil {
+			t.Fatalf("[%s] AddTrack 失败: %v", p.name, aerr)
+		}
 	}
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -183,6 +194,93 @@ func TestE2EDataChannel(t *testing.T) {
 			}
 		case <-deadline:
 			t.Fatalf("未收到取消举手事件")
+		}
+	}
+}
+
+// TestE2EDataChannelWithoutMedia 复现用户报的"举手点了没效果"。
+//
+// 场景：用户没有摄像头或拒绝了权限 → 本端没有任何轨道 → 如果发布连接只在"有媒体"时
+// 才协商，数据通道就永远不会打开，举手/表情全部静默失效（按钮能点、什么都不发生）。
+//
+// 契约：不发布任何媒体也能建立起数据通道，并把举手送达服务端。
+func TestE2EDataChannelWithoutMedia(t *testing.T) {
+	url := startServer(t)
+
+	// 观察者：负责接收 hand_state 广播
+	observer := dial(t, url, "observer")
+	defer observer.close()
+	observer.join("room-dc-nomedia", "Observer")
+
+	guest := dial(t, url, "guest")
+	defer guest.close()
+	joinedGuest := guest.join("room-dc-nomedia", "无设备访客")
+	_ = observer.waitType(protocol.TypeParticipantJoin, 5*time.Second)
+
+	// 只建数据通道，不发布任何媒体
+	guestDC := openDataChannelWith(t, guest, false)
+	if err := guestDC.send.SendText(`{"type":"raise_hand","raised":true}`); err != nil {
+		t.Fatalf("发送举手上报失败: %v", err)
+	}
+
+	ev := observer.waitType(protocol.TypeHandState, 10*time.Second)
+	if ev.ParticipantID != joinedGuest.ParticipantID {
+		t.Fatalf("举手应来自无设备访客，实际: %+v", ev)
+	}
+	if ev.Raised == nil || !*ev.Raised {
+		t.Fatalf("应广播 raised=true: %+v", ev)
+	}
+}
+
+// TestE2EHandStateOverWS 覆盖信令面回退路径。
+//
+// 数据面不可用（例如没有媒体、SCTP 未建立）时前端会改用 hand_state 信令上报，
+// 服务端必须走同一个处理逻辑：更新状态 + 广播 + 进快照。
+func TestE2EHandStateOverWS(t *testing.T) {
+	url := startServer(t)
+
+	observer := dial(t, url, "observer-ws")
+	defer observer.close()
+	observer.join("room-hand-ws", "Observer")
+
+	guest := dial(t, url, "guest-ws")
+	defer guest.close()
+	joinedGuest := guest.join("room-hand-ws", "访客")
+
+	raised := true
+	guest.send(&protocol.Message{Type: protocol.TypeHandState, Raised: &raised})
+
+	ev := observer.waitType(protocol.TypeHandState, 5*time.Second)
+	if ev.ParticipantID != joinedGuest.ParticipantID || ev.Raised == nil || !*ev.Raised {
+		t.Fatalf("信令面举手应被广播: %+v", ev)
+	}
+
+	// 状态要进房间快照，保证新入会者也能看到有人举着手
+	newcomer := dial(t, url, "newcomer")
+	defer newcomer.close()
+	joined := newcomer.join("room-hand-ws", "后来者")
+	found := false
+	for _, id := range joined.Room.Hands {
+		if id == joinedGuest.ParticipantID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("房间快照应包含举手者，实际 hands=%v", joined.Room.Hands)
+	}
+
+	// 放下手同样走信令面
+	lowered := false
+	guest.send(&protocol.Message{Type: protocol.TypeHandState, Raised: &lowered})
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case m := <-observer.events:
+			if m.Type == protocol.TypeHandState && m.Raised != nil && !*m.Raised {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("放下手未广播")
 		}
 	}
 }

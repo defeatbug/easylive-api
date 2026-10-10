@@ -26,8 +26,12 @@ const (
 	TypeUnpublish   MsgType = "unpublish"   // {trackId}            停止发布某条轨道（如结束屏幕共享）
 	TypeMute        MsgType = "mute"        // {trackId, muted}
 	TypeChat        MsgType = "chat"        // {text}
-	TypePing        MsgType = "ping"        // {}
-	TypeModerate    MsgType = "moderate"    // {targetId, action}  action: mute | kick（需要 roomAdmin 权限）
+	// TypeHandState 是**双向**消息：
+	//   客户端 → 服务端：{raised} 上报举手（数据面不可用时的信令回退路径）
+	//   服务端 → 客户端：{participantId, raised} 广播状态（并进房间快照，新人可见）
+	TypeHandState MsgType = "hand_state" // 见上方双向说明
+	TypePing      MsgType = "ping"       // {}
+	TypeModerate  MsgType = "moderate"   // {targetId, action}  action: mute | kick（需要 roomAdmin 权限）
 )
 
 // ---------- 服务端 → 客户端 ----------
@@ -42,7 +46,6 @@ const (
 	TypeTrackUnpublished MsgType = "track_unpublished"  // {trackId}
 	TypeTrackMuted       MsgType = "track_muted"        // {trackId, muted}
 	TypeActiveSpeakers   MsgType = "active_speakers"    // {speakers:[{participantId, level}]}  只在集合变化时推送
-	TypeHandState        MsgType = "hand_state"         // {participantId, raised}  举手状态（进房间快照）
 	TypeChatMessage      MsgType = "chat_message"       // {message}
 	TypePong             MsgType = "pong"               // {}
 	TypeForceMute        MsgType = "force_mute"         // {muted}  服务端下发给被强制静音的参与者
