@@ -31,6 +31,16 @@ type Config struct {
 
 	// 数据
 	PostgresDSN string
+	// MigrationsDir 是迁移文件目录（服务启动时按文件名顺序执行，幂等）
+	MigrationsDir string
+	// AutoMigrate 决定启动时是否自动执行迁移。
+	// 默认开启：全新部署若没人手动跑迁移，业务接口会以"表不存在"告终，
+	// 而媒体功能完全正常——这种组合极易被误判成"接口写错了"。
+	AutoMigrate bool
+	// MetricsInterval 指标采样周期（0 表示不采样）
+	MetricsInterval time.Duration
+	// MetricsRetention 指标保留时长（<=0 表示不清理）
+	MetricsRetention time.Duration
 
 	// 信令保护
 	WSMaxConnections    int
@@ -81,6 +91,10 @@ func Load() *Config {
 		ICETCPPort:          getInt("ICE_TCP_PORT", 7882),
 		IncludeLoopback:     getBool("ICE_INCLUDE_LOOPBACK", true),
 		PostgresDSN:         buildDSN(),
+		MigrationsDir:       getStr("MIGRATIONS_DIR", "migrations"),
+		AutoMigrate:         getBool("AUTO_MIGRATE", true),
+		MetricsInterval:     getDuration("METRICS_INTERVAL", 5*time.Second),
+		MetricsRetention:    getDuration("METRICS_RETENTION", 72*time.Hour),
 		WSMaxConnections:    getInt("WS_MAX_CONNECTIONS", 200),
 		HTTPRateLimitPerIP:  getInt("HTTP_RATE_LIMIT_PER_IP", 50),
 		WSHeartbeat:         getDuration("WS_HEARTBEAT_INTERVAL", 30*time.Second),
@@ -113,6 +127,8 @@ func (c *Config) LogSummary() {
 		log.Printf("config: 警告 AUTH_MODE=%s 但未配置 JWT_SECRET，鉴权将降级为不校验", c.AuthMode)
 	}
 	log.Printf("config: auth mode=%s secret=%v tokenTTL=%s", c.AuthMode, c.JWTSecret != "", c.TokenTTL)
+	log.Printf("config: db autoMigrate=%v migrationsDir=%s metricsInterval=%s retention=%s",
+		c.AutoMigrate, c.MigrationsDir, c.MetricsInterval, c.MetricsRetention)
 	log.Printf("config: ws maxConn=%d roomMax=%d heartbeat=%s resumeGrace=%s origins=%v",
 		c.WSMaxConnections, c.RoomMaxParticipants, c.WSHeartbeat, c.ResumeGrace, c.WebOrigins)
 }

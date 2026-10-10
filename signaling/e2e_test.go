@@ -73,9 +73,12 @@ func startServerFull(t *testing.T, grace time.Duration, authMode, jwtSecret, app
 	t.Helper()
 	port := freeTCPPort(t)
 	cfg := &config.Config{
-		AppName:             "easylive-api-test",
-		AppPort:             fmt.Sprint(port),
-		MediaUDPPort:        freeUDPPort(t),
+		AppName:      "easylive-api-test",
+		AppPort:      fmt.Sprint(port),
+		MediaUDPPort: freeUDPPort(t),
+		// 刻意开启 ICE-TCP：这条路径曾经因为日志工厂尚未赋值而必然 panic，
+		// 只测 UDP 路径是发现不了的（ICETCPPort=0 会直接跳过整段代码）
+		ICETCPPort:          freeTCPPort(t),
 		AdvertiseIP:         "127.0.0.1",
 		IncludeLoopback:     true,
 		WSMaxConnections:    32,

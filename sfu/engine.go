@@ -37,6 +37,13 @@ type Engine struct {
 func NewEngine(cfg *config.Config) (*Engine, error) {
 	var se webrtc.SettingEngine
 
+	// 0) 先装日志工厂。**顺序有讲究**：后面的 ICE-TCP mux 要用它建 logger，
+	//    如果放到最后赋值，`se.LoggerFactory.NewLogger(...)` 会对 nil 接口调用方法而 panic——
+	//    而且只在 ICETCPPort>0 时触发（默认就是 7882），等于每次生产启动都会崩。
+	//    Pion 默认（error）会把 "Could not determine PayloadType" 这类**静默丢包**警告吞掉，
+	//    排查"订阅端黑屏"时必开；debug 级别会有逐包日志，所以这里比应用日志低一档。
+	se.LoggerFactory = newLoggerFactory(cfg.LogLevel)
+
 	// 1) 单端口 UDP mux：所有 PeerConnection 共用一个 UDP 端口。
 	mux, err := ice.NewMultiUDPMuxFromPort(cfg.MediaUDPPort,
 		ice.UDPMuxFromPortWithNetworks(ice.NetworkTypeUDP4, ice.NetworkTypeUDP6),
@@ -80,12 +87,7 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 	// 4) 服务端不需要 mDNS 候选
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 
-	// 5) Pion 自身日志。默认（error）会把 "Could not determine PayloadType"、"Failed to set
-	//    codec settings" 这类**静默丢包**警告吞掉，排查"订阅端黑屏"时必开。
-	//    注意：debug 级别会有逐包日志，所以这里比应用日志低一档。
-	se.LoggerFactory = newLoggerFactory(cfg.LogLevel)
-
-	// 6) 默认编解码器与拦截器：NACK（丢包重传）、RTCP Report、TWCC（拥塞反馈）
+	// 5) 默认编解码器与拦截器：NACK（丢包重传）、RTCP Report、TWCC（拥塞反馈）
 	m := &webrtc.MediaEngine{}
 	// 注册 RFC 6464 音频电平头扩展（urn:ietf:params:rtp-hdrext:ssrc-audio-level）。
 	// 浏览器默认会在 offer 里带它；服务端这里注册后 answer 才会确认，

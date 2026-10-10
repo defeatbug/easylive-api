@@ -60,6 +60,20 @@ docker compose -f deploy/compose.prod.yml --env-file deploy/.env.prod up -d --bu
 docker compose -f deploy/compose.prod.yml ps
 ```
 
+## 4.1 迁移与指标采样（服务自己处理）
+
+`api` 启动时会：
+
+1. **自动执行 `migrations/*.sql`**（按文件名顺序、幂等、由 PostgreSQL advisory lock 保证多实例不并发）。
+   不需要手动 `psql -f`。想关掉就设 `AUTO_MIGRATE=false`（那就要自己保证表结构已就绪）。
+2. **启动指标采样**：每 `METRICS_INTERVAL`（默认 5s）把每个房间的在线人数、轨道数、
+   累计包数与字节数写入 `metric_samples`；同时维护 `rooms` / `meetings`
+   （首个参与者进房即开始一条会议记录，房间消失超过宽限期后收尾并写入峰值人数与峰值轨道数）。
+   退出前会把进行中的会议记录收尾，不会留下 `ended_at` 为空的记录。
+
+采样只读内存计数（**不调用 `GetStats()`**），且写库有超时、失败只记日志——
+数据库慢或不可用时媒体转发不受任何影响。
+
 ## 5. 验收清单（逐条都要过）
 
 ```bash
@@ -93,6 +107,8 @@ docker run --rm coturn/coturn:4.6 turnutils_uclient -T -u "$USER" -w "$CRED" -p 
 | 局域网能通、跨网必失败 | TURN 没配好：`/ice` 里 `turnEnabled=false`，或 coturn 的 `static-auth-secret` 与 `TURN_SECRET` 不一致 |
 | 60 秒左右必掉线 | Nginx 的 `proxy_read_timeout` 用了默认值（本配置已设为 3600s） |
 | 入会被拒且提示缺少令牌 | `AUTH_MODE=required` 下前端没取到令牌（检查 `/token` 是否被反代） |
+| GraphQL 报"表不存在" | `AUTO_MIGRATE=false` 且没手动执行 `migrations/*.sql` |
+| `metric_samples` 一直为空 | `METRICS_INTERVAL=0`（采样关闭），或数据库不可用（看启动日志的"数据库不可用"） |
 | 摄像头打不开 | 不是 HTTPS（安全上下文要求），或 `Permissions-Policy` 写错了 |
 
 ## 7. 和评测章节的衔接

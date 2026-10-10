@@ -79,6 +79,42 @@ func (m *Manager) remove(roomID string) {
 	log.Printf("sfu: 回收空房间 room=%s（当前房间数 %d）", roomID, n)
 }
 
+// RoomSnapshot 是单个房间的轻量快照（供采样器与观测使用）。
+type RoomSnapshot struct {
+	ID           string
+	Participants int
+	Tracks       int
+	Packets      uint64
+	Bytes        uint64
+}
+
+// RoomSnapshots 返回所有房间的轻量快照。
+//
+// 刻意做得比 DebugInfo 轻得多：**不调用 PeerConnection.GetStats()**
+// （那是与连接数成正比的耗时操作），只读内存里的原子计数。
+// 采样协程按秒级周期调用它，绝不能对转发造成可观测的影响。
+func (m *Manager) RoomSnapshots() []RoomSnapshot {
+	m.mu.RLock()
+	rooms := make([]*Room, 0, len(m.rooms))
+	for _, r := range m.rooms {
+		rooms = append(rooms, r)
+	}
+	m.mu.RUnlock()
+
+	out := make([]RoomSnapshot, 0, len(rooms))
+	for _, r := range rooms {
+		participants, tracks, packets, bytes := r.Stats()
+		out = append(out, RoomSnapshot{
+			ID:           r.ID,
+			Participants: participants,
+			Tracks:       tracks,
+			Packets:      packets,
+			Bytes:        bytes,
+		})
+	}
+	return out
+}
+
 // Stats 供 /healthz 与评测脚本观测。
 func (m *Manager) Stats() (rooms, participants, tracks int) {
 	m.mu.RLock()

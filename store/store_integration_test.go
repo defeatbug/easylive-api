@@ -13,27 +13,19 @@ package store
 import (
 	"context"
 	"os"
-	"path/filepath"
-	"sort"
 	"testing"
 	"time"
 )
 
+// applyMigrations 直接复用生产代码里的迁移执行器。
+//
+// 这里刻意不再自己拼 SQL：迁移文件是多条语句的，pgx 默认的扩展协议
+// （预编译语句）不允许一个查询里有多条命令，必须走简单协议——
+// 让测试跑生产同一条路径，才能验证这件事真的做对了。
 func applyMigrations(t *testing.T, ctx context.Context, st *Store) {
 	t.Helper()
-	files, err := filepath.Glob("../migrations/*.sql")
-	if err != nil {
-		t.Fatalf("查找迁移失败: %v", err)
-	}
-	sort.Strings(files)
-	for _, f := range files {
-		raw, rerr := os.ReadFile(f)
-		if rerr != nil {
-			t.Fatalf("读取 %s 失败: %v", f, rerr)
-		}
-		if _, eerr := st.Pool.Exec(ctx, string(raw)); eerr != nil {
-			t.Fatalf("执行迁移 %s 失败: %v", filepath.Base(f), eerr)
-		}
+	if err := st.Migrate(ctx, "../migrations"); err != nil {
+		t.Fatalf("执行迁移失败: %v", err)
 	}
 }
 

@@ -156,6 +156,29 @@ func (s *Store) CloseRoom(ctx context.Context, id string) (*ent.Room, error) {
 	return s.Ent.Room.Get(ctx, id)
 }
 
+// ---------- 供采样器使用的薄包装 ----------
+//
+// 这三个方法只是把 Ent 的返回值丢掉。存在的意义是**让 recorder 的 Store 接口
+// 不出现 ent 类型**，从而可以用一个内存假实现给采样逻辑写单测（本机没有 Postgres）。
+
+// EnsureRoom 保证房间行存在（房间号是业务主键，重复调用是幂等的）。
+func (s *Store) EnsureRoom(ctx context.Context, roomID, createdBy string) error {
+	_, err := s.UpsertRoom(ctx, roomID, "", createdBy)
+	return err
+}
+
+// RecordMeetingStart 开始一条会议记录。
+func (s *Store) RecordMeetingStart(ctx context.Context, roomID, meetingID string) error {
+	_, err := s.StartMeeting(ctx, roomID, meetingID)
+	return err
+}
+
+// RecordMeetingEnd 收尾会议记录（写结束时间、时长与两个峰值）。
+func (s *Store) RecordMeetingEnd(ctx context.Context, meetingID string, peakParticipants, peakTracks int) error {
+	_, err := s.EndMeeting(ctx, meetingID, peakParticipants, peakTracks)
+	return err
+}
+
 // ---------- 会议记录（Ent 写路径）----------
 
 // StartMeeting 建一条会议记录。

@@ -1,18 +1,24 @@
 // easylive-api：轻量级 WebRTC 实时音视频会议系统（服务端）
 //
-// 启动装配顺序（与 egg-api 的组织方式保持一致）：
+// 启动装配顺序：
 //
-//	配置 → 数据库（可选）→ Pion 引擎 → 房间管理器 → 信令 Hub → Fiber 服务 → 优雅关闭
+//	配置 → 数据库（可选）→ Pion 引擎 → 房间管理器 → 信令 Hub
+//	     → 迁移与指标采样 → Fiber 服务 → 优雅关闭（采样器 → 连接池 → 引擎）
+//
+// 一条贯穿始终的原则：**数据库是可选依赖，且绝不出现在媒体热路径上**。
+// 连不上库时会议照常进行，只是业务接口（房间/会议/指标）不可用。
 package main
 
 import (
 	"context"
 	"log"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
 
 	"easylive-api/config"
+	"easylive-api/recorder"
 	"easylive-api/server"
 	"easylive-api/sfu"
 	"easylive-api/signaling"
@@ -41,25 +47,74 @@ func main() {
 		st = nil
 	} else {
 		log.Printf("main: 数据库已连接")
-		defer st.Close()
 	}
 
 	engine, err := sfu.NewEngine(cfg)
 	if err != nil {
 		log.Fatalf("main: 初始化媒体引擎失败: %v", err)
 	}
-	defer func() {
-		if err := engine.Close(); err != nil {
-			log.Printf("main: 关闭媒体引擎出错: %v", err)
-		}
-	}()
 
 	manager := sfu.NewManager(engine, cfg.RoomMaxParticipants, cfg.ResumeGrace)
 	hub := signaling.NewHub(manager, cfg)
 
+	// ---- 迁移 + 指标采样（都需要数据库与房间管理器）----
+	var (
+		stopSampler context.CancelFunc
+		samplerDone chan struct{}
+	)
+	if st != nil {
+		if cfg.AutoMigrate {
+			mctx, mcancel := context.WithTimeout(ctx, 60*time.Second)
+			if err := st.Migrate(mctx, cfg.MigrationsDir); err != nil {
+				// 迁移失败不致命：媒体功能不受影响，业务接口会在调用时明确报"表不存在"
+				log.Printf("main: 自动迁移失败（业务接口可能不可用）: %v", err)
+			}
+			mcancel()
+		}
+		if cfg.MetricsInterval > 0 {
+			sampler := recorder.New(st, manager, recorder.Config{
+				Interval:  cfg.MetricsInterval,
+				Retention: cfg.MetricsRetention,
+			})
+			var sctx context.Context
+			sctx, stopSampler = context.WithCancel(ctx)
+			samplerDone = make(chan struct{})
+			go func() {
+				defer close(samplerDone)
+				sampler.Run(sctx)
+			}()
+		}
+	}
+
 	srv := server.New(cfg, manager, hub, st)
-	if err := srv.Run(); err != nil {
-		log.Fatalf("main: 服务异常退出: %v", err)
+	runErr := srv.Run()
+
+	// ---- 优雅关闭：顺序很重要 ----
+	// 1) 先停采样器（它还要往库里写"收尾会议记录"，必须先于连接池关闭）
+	// 2) 再关连接池
+	// 3) 最后关媒体引擎（释放 UDP/TCP 端口）
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if stopSampler != nil {
+		stopSampler()
+		select {
+		case <-samplerDone:
+		case <-shutdownCtx.Done():
+			log.Printf("main: 采样器未在 10s 内退出，继续关闭")
+		}
+	}
+	if st != nil {
+		if err := st.Close(); err != nil {
+			log.Printf("main: 关闭数据库连接池出错: %v", err)
+		}
+	}
+	if err := engine.Close(); err != nil {
+		log.Printf("main: 关闭媒体引擎出错: %v", err)
+	}
+
+	if runErr != nil {
+		log.Fatalf("main: 服务异常退出: %v", runErr)
 	}
 	log.Printf("main: 已安全退出")
 }
