@@ -258,3 +258,52 @@ func TestE2ETokenEndpoint(t *testing.T) {
 		t.Fatalf("X-API-Key 正确时应签发成功，实际 %d: %v", code, out)
 	}
 }
+
+// TestE2EAuthOptional 覆盖第三态：带令牌就按令牌校验身份，不带或令牌无效则降级为匿名。
+//
+// 这个中间态是为灰度上线准备的：新客户端带令牌、老客户端还没升级时不至于全被拒之门外。
+func TestE2EAuthOptional(t *testing.T) {
+	ts := startServerFull(t, 0, "optional", testSecret, "development")
+
+	// 1) 无令牌：放行，身份退化为昵称
+	anon := dial(t, ts.url, "anon")
+	defer anon.close()
+	joined := anon.join("room-opt", "匿名用户")
+	var self *protocol.PeerInfo
+	for _, p := range joined.Room.Participants {
+		if p.ID == joined.ParticipantID {
+			self = p
+		}
+	}
+	if self == nil || self.Name != "匿名用户" {
+		t.Fatalf("无令牌时应放行并以昵称入会: %+v", self)
+	}
+	if self.Identity != "匿名用户" {
+		t.Fatalf("无令牌时 identity 应退化为昵称，实际 %q", self.Identity)
+	}
+
+	// 2) 有效令牌：身份以令牌为准（自报昵称被忽略）
+	tok := issueToken(t, ts.cfg, "u-opt", "令牌里的名字", auth.VideoGrant{
+		RoomJoin: true, Room: "room-opt", CanPublish: true, CanSubscribe: true, CanPublishData: true,
+	})
+	withTok := dial(t, ts.url, "with-token")
+	defer withTok.close()
+	j2 := joinWithToken(withTok, "room-opt", "我要冒名", tok)
+	for _, p := range j2.Room.Participants {
+		if p.ID == j2.ParticipantID {
+			if p.Name != "令牌里的名字" || p.Identity != "u-opt" {
+				t.Fatalf("有令牌时身份应以令牌为准，实际 name=%q identity=%q", p.Name, p.Identity)
+			}
+		}
+	}
+
+	// 3) 无效令牌：降级为匿名而不是拒绝（这是 optional 与 required 的关键差别）
+	bad := dial(t, ts.url, "bad-token")
+	defer bad.close()
+	bad.send(&protocol.Message{
+		Type: protocol.TypeJoin, RoomID: "room-opt", DisplayName: "坏令牌", Token: "not-a-jwt",
+	})
+	if j3 := bad.waitType(protocol.TypeJoined, 5*time.Second); !j3.Resumed && j3.ParticipantID == "" {
+		t.Fatalf("无效令牌在 optional 模式下应降级放行: %+v", j3)
+	}
+}
