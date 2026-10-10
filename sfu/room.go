@@ -239,7 +239,9 @@ func (r *Room) Join(p *Participant) error {
 	r.mu.Lock()
 	if len(r.participants) >= r.maxParticipants() {
 		r.mu.Unlock()
-		return fmt.Errorf("房间已满（上限 %d）", r.maxParticipants())
+		// 提示里点明"含重连中的参与者"：断线宽限期内的身份仍然占位，
+		// 不写清楚的话，用户看到"房间已满"但界面上只有几个人，会以为人数统计错了。
+		return fmt.Errorf("房间已满（上限 %d，含重连中的参与者）", r.maxParticipants())
 	}
 	r.participants[p.ID] = p
 	p.Confirm(r)
