@@ -60,8 +60,8 @@ migrations/001_init.sql 最小表结构
 
 ## 信令协议速览
 
-请求（客户端 → 服务端）：`join`、`leave`、`publish`、`answer`、`candidate`、`subscribe`、`unsubscribe`、`unpublish`、`mute`、`chat`、`ping`
-响应 / 事件（服务端 → 客户端）：`joined`、`publish_answer`、`subscribe_offer`、`participant_joined`、`participant_left`、`participant_state`、`track_published`、`track_unpublished`、`track_muted`、`active_speakers`、`hand_state`、`chat_message`、`pong`、`error`
+请求（客户端 → 服务端）：`join`、`leave`、`publish`、`answer`、`candidate`、`subscribe`、`unsubscribe`、`unpublish`、`mute`、`chat`、`ping`、`moderate`
+响应 / 事件（服务端 → 客户端）：`joined`、`publish_answer`、`subscribe_offer`、`participant_joined`、`participant_left`、`participant_state`、`track_published`、`track_unpublished`、`track_muted`、`active_speakers`、`hand_state`、`chat_message`、`force_mute`、`pong`、`error`
 
 约定：
 - 消息是**扁平结构**，按 `type` 取字段；`id` 是幂等键，响应原样带回（客户端据此匹配）。
@@ -78,6 +78,16 @@ migrations/001_init.sql 最小表结构
 - **活跃说话人**：服务端注册 RFC 6464 音频电平头扩展（`sdp.AudioLevelURI`），在转发热路径上
   解析每个音频包的 `-dBov` 值并做指数平滑，**不解码音频**；房间每 300ms 采样一次，
   **只在说话人集合变化时**广播 `active_speakers`（与 LiveKit 的 `ActiveSpeakersChanged` 同语义）。
+- **准入与权限（Token）**：签发 JWT（HS256），载荷参照 LiveKit 的 `VideoGrant`：
+  `roomJoin` / `room` / `canPublish` / `canSubscribe` / `canPublishData` / `roomAdmin`。
+  `AUTH_MODE` 三态（`off` / `optional` / `required`，默认 `off` 以便本地演示开箱可用）；
+  `POST /token` 发放令牌（非 `development` 环境必须带 `X-API-Key`，生产应替换为自有登录鉴权）。
+  **身份以令牌的 `sub` 为准**，启用鉴权后客户端自报昵称不可信；`publish` / `subscribe` / `chat` /
+  数据面消息逐条校验权限——前端隐藏按钮只是体验，不是安全边界。
+- **主持人管理（`moderate`）**：需要 `roomAdmin` 权限。
+  - `mute` → `Room.ForceMute`：服务端**停止转发**该参与者的音频轨。SFU 不解析媒体，
+    "不转发"才是真正让对方听不见的做法，同时省下行带宽；被静音者会收到 `force_mute` 以更新 UI。
+  - `kick` → 先 `Leave` 再关闭其连接，并把连接标记为"主动离开"——否则被踢者会在恢复宽限期内回来。
 - **数据通道（SCTP 数据面）**：客户端在 pub 连接上创建通道 `easylive`（客户端是该连接的 offerer），
   服务端在 `OnDataChannel` 里接收，并**在同一条 SCTP 关联上反向开一条** `easylive-s2c` 用于推送——
   DCEP OPEN 走带内信令，因此**不需要重新协商**（sub 连接上的 offer 流程很敏感，能不动就不动）。

@@ -493,7 +493,7 @@ func (r *Room) SetTrackMuted(trackID string, muted bool) error {
 	r.mu.Lock()
 	track, ok := r.tracks[trackID]
 	if ok {
-		track.info.Muted = muted
+		track.SetMuted(muted)
 	}
 	targets := make([]*Participant, 0, len(r.participants))
 	for _, p := range r.participants {
@@ -577,6 +577,48 @@ func (r *Room) State() *protocol.RoomState {
 		state.Hands = append(state.Hands, id)
 	}
 	return state
+}
+
+// ParticipantByID 按参与者 ID 查人（主持人管理需要先确认目标存在）。
+func (r *Room) ParticipantByID(participantID string) (*Participant, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.participants[participantID]
+	return p, ok
+}
+
+// ForceMute 由主持人发起：把某参与者的**音频轨**全部静音（服务端停止转发），并广播状态。
+//
+// 为什么服务端能做"真静音"：SFU 虽然不解析媒体，但可以选择不转发——
+// 对房间里其他人来说这就是彻底听不见了。返回被处理的轨道数。
+// 同时给目标客户端下发 force_mute，让它的 UI 如实显示"已被主持人静音"。
+func (r *Room) ForceMute(participantID string, muted bool) int {
+	r.mu.Lock()
+	target, ok := r.participants[participantID]
+	if !ok {
+		r.mu.Unlock()
+		return 0
+	}
+	affected := make([]*PublishedTrack, 0, 2)
+	for _, t := range r.tracks {
+		if t.info.PublisherID == participantID && t.info.Kind == protocol.KindAudio {
+			t.SetMuted(muted)
+			affected = append(affected, t)
+		}
+	}
+	targets := r.allLocked()
+	r.mu.Unlock()
+
+	for _, t := range affected {
+		info := t.Info()
+		for _, p := range targets {
+			p.NotifyTo(&protocol.Message{Type: protocol.TypeTrackMuted, TrackID: info.ID, Muted: &muted})
+		}
+	}
+	// 单独通知被静音者本人：它需要据此更新麦克风按钮状态
+	target.NotifyTo(&protocol.Message{Type: protocol.TypeForceMute, Muted: &muted, TargetID: participantID})
+	log.Printf("sfu: 主持人强制静音 room=%s participant=%s muted=%v 影响轨道 %d 条", r.ID, participantID, muted, len(affected))
+	return len(affected)
 }
 
 // ---------- 数据通道（SCTP 数据面）----------

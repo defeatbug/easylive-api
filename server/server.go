@@ -18,6 +18,7 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 
+	"easylive-api/auth"
 	"easylive-api/config"
 	"easylive-api/sfu"
 	"easylive-api/signaling"
@@ -125,6 +126,67 @@ func (s *Server) build() *fiber.App {
 			})
 		})
 	}
+
+	// ---- 令牌发放：POST <basePath>/token ----
+	//
+	// 生产环境**必须**把这个端点换掉：它应当是你的登录系统的一部分（校验账号密码/SSO 后签发），
+	// 而不是任何人传个 identity 就能拿到令牌。因此这里加了一道闸门：
+	// 非 development 环境下必须带 X-API-Key（由 TOKEN_API_KEY 配置），否则拒绝签发。
+	router.Post("/token", func(c *fiber.Ctx) error {
+		a := s.hub.Authenticator()
+		if !a.Enabled() {
+			return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{
+				"error": "鉴权未启用（AUTH_MODE=off 或未配置 JWT_SECRET），当前无需令牌即可入会",
+			})
+		}
+		if cfg.AppEnv != "development" {
+			if cfg.TokenAPIKey == "" {
+				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+					"error": "服务端未配置 TOKEN_API_KEY，拒绝签发令牌",
+				})
+			}
+			if c.Get("X-API-Key") != cfg.TokenAPIKey {
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "X-API-Key 无效"})
+			}
+		}
+
+		var req struct {
+			RoomID         string `json:"roomId"`
+			Identity       string `json:"identity"`
+			Name           string `json:"name"`
+			CanPublish     *bool  `json:"canPublish"`
+			CanSubscribe   *bool  `json:"canSubscribe"`
+			CanPublishData *bool  `json:"canPublishData"`
+			RoomAdmin      *bool  `json:"roomAdmin"`
+		}
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "请求体不是合法 JSON"})
+		}
+		if req.RoomID == "" || req.Identity == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "roomId 与 identity 必填"})
+		}
+		// 缺省授予发布/订阅/发数据；**主持人权限必须显式申请**（默认不给，避免演示配置手滑变全权）
+		grant := auth.VideoGrant{
+			RoomJoin:       true,
+			Room:           req.RoomID,
+			CanPublish:     req.CanPublish == nil || *req.CanPublish,
+			CanSubscribe:   req.CanSubscribe == nil || *req.CanSubscribe,
+			CanPublishData: req.CanPublishData == nil || *req.CanPublishData,
+			RoomAdmin:      req.RoomAdmin != nil && *req.RoomAdmin,
+		}
+		token, exp, err := a.Issue(req.Identity, req.Name, grant)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		log.Printf("server: 签发令牌 room=%s identity=%s admin=%v", req.RoomID, req.Identity, grant.RoomAdmin)
+		return c.JSON(fiber.Map{
+			"token":     token,
+			"identity":  req.Identity,
+			"roomId":    req.RoomID,
+			"expiresAt": exp.UnixMilli(),
+			"video":     grant,
+		})
+	})
 
 	// ---- 媒体信令入口：<basePath>/ws ----
 	signaling.Mount(router.Group("/ws"), s.hub)

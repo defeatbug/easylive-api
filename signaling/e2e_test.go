@@ -50,20 +50,31 @@ func freeTCPPort(t *testing.T) int {
 	return port
 }
 
+// testServer 是测试用服务器句柄（URL + 配置，鉴权测试需要拿配置签名令牌）。
+type testServer struct {
+	url string
+	cfg *config.Config
+}
+
 // startServer 启动测试服务器（ResumeGrace=0：连接断开即离会，便于测试"立即清理"语义）。
 func startServer(t *testing.T) string {
 	t.Helper()
-	return startServerWithGrace(t, 0)
+	return startServerFull(t, 0, "", "", "test").url
 }
 
 // startServerWithGrace 同上，但可指定断线恢复宽限期（M4 测试用）。
 func startServerWithGrace(t *testing.T, grace time.Duration) string {
 	t.Helper()
+	return startServerFull(t, grace, "", "", "test").url
+}
+
+// startServerFull 允许指定鉴权参数（authMode/jwtSecret/appEnv）。
+func startServerFull(t *testing.T, grace time.Duration, authMode, jwtSecret, appEnv string) *testServer {
+	t.Helper()
 	port := freeTCPPort(t)
 	cfg := &config.Config{
 		AppName:             "easylive-api-test",
 		AppPort:             fmt.Sprint(port),
-		AppEnv:              "test",
 		MediaUDPPort:        freeUDPPort(t),
 		AdvertiseIP:         "127.0.0.1",
 		IncludeLoopback:     true,
@@ -75,6 +86,10 @@ func startServerWithGrace(t *testing.T, grace time.Duration) string {
 		FiberConcurrency:    4096,
 		EnableDebugEndpoint: true,
 		ResumeGrace:         grace,
+		AuthMode:            authMode,
+		JWTSecret:           jwtSecret,
+		TokenTTL:            time.Hour,
+		AppEnv:              appEnv,
 	}
 
 	engine, err := sfu.NewEngine(cfg)
@@ -100,7 +115,7 @@ func startServerWithGrace(t *testing.T, grace time.Duration) string {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return url
+	return &testServer{url: url, cfg: cfg}
 }
 
 // peer 是测试用客户端：一条 WS + 两条 PeerConnection（与真实前端同构）
@@ -113,6 +128,8 @@ type peer struct {
 	subPC *webrtc.PeerConnection
 
 	events chan *protocol.Message
+	// done 在读循环退出（连接关闭/出错）时关闭，用于断言"服务端把连接关掉了"
+	done chan struct{}
 
 	mu          sync.Mutex
 	pendingCand []*protocol.Message
@@ -125,7 +142,7 @@ func dial(t *testing.T, url, name string) *peer {
 	if err != nil {
 		t.Fatalf("[%s] 连接信令失败: %v", name, err)
 	}
-	p := &peer{t: t, conn: conn, name: name, events: make(chan *protocol.Message, 256)}
+	p := &peer{t: t, conn: conn, name: name, events: make(chan *protocol.Message, 256), done: make(chan struct{})}
 	go p.readLoop()
 	return p
 }
@@ -135,6 +152,7 @@ func toInit(c *protocol.Candidate) webrtc.ICECandidateInit {
 }
 
 func (p *peer) readLoop() {
+	defer close(p.done)
 	for {
 		_, data, err := p.conn.ReadMessage()
 		if err != nil {

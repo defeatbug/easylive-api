@@ -9,6 +9,7 @@ import (
 	fiberws "github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 
+	"easylive-api/auth"
 	"easylive-api/protocol"
 	"easylive-api/sfu"
 )
@@ -101,6 +102,9 @@ func (h *Hub) dispatch(c *Client, msg *protocol.Message) {
 	case protocol.TypeChat:
 		h.handleChat(c, msg)
 
+	case protocol.TypeModerate:
+		h.handleModerate(c, msg)
+
 	default:
 		c.fail(msg, protocol.ErrBadRequest, "未知消息类型: "+string(msg.Type))
 	}
@@ -116,10 +120,27 @@ func (h *Hub) handleJoin(c *Client, msg *protocol.Message) {
 		return
 	}
 
+	// ---- 鉴权：身份与权限以令牌为准，客户端自报字段只在无鉴权模式下可信 ----
+	claims, aerr := h.resolveClaims(c, msg)
+	if aerr != nil {
+		c.fail(msg, aerr.code, aerr.reason)
+		return
+	}
+	if claims != nil {
+		if !claims.Video.RoomJoin {
+			c.fail(msg, protocol.ErrForbidden, "令牌未授予入会权限")
+			return
+		}
+		if claims.Video.Room != "" && claims.Video.Room != msg.RoomID {
+			c.fail(msg, protocol.ErrForbidden, "令牌不适用于该房间")
+			return
+		}
+	}
+
 	// 断线恢复：客户端带着上一次 joined 下发的 resumeToken 回来。
 	// 命中则复用**同一个 participantId**，房间内其他人只会收到一次状态切换事件。
 	if msg.ResumeToken != "" {
-		if h.tryResume(c, msg) {
+		if h.tryResume(c, msg, claims) {
 			return
 		}
 		log.Printf("signaling: resumeToken 无效或已过期，按全新入会处理 session=%s room=%s", c.ID, msg.RoomID)
@@ -127,11 +148,26 @@ func (h *Hub) handleJoin(c *Client, msg *protocol.Message) {
 
 	room := h.manager.GetOrCreate(msg.RoomID)
 	pid := newID("p")
+
+	// 身份与显示名：令牌存在时以令牌为准（昵称不可伪造）
+	identity := ""
 	name := msg.DisplayName
+	if claims != nil {
+		identity = claims.Identity()
+		if claims.Name != "" {
+			name = claims.Name
+		} else if name == "" {
+			name = identity
+		}
+	}
 	if name == "" {
 		name = "参与者-" + pid[len(pid)-4:]
 	}
+
 	p := sfu.NewParticipant(pid, name, h.manager.Engine(), c)
+	c.setClaims(claims)
+	p.SetIdentity(identity)
+	p.SetCanPublishData(c.grants().CanPublishData)
 
 	if err := room.Join(p); err != nil {
 		c.fail(msg, protocol.ErrRoomFull, err.Error())
@@ -155,7 +191,7 @@ func (h *Hub) handleJoin(c *Client, msg *protocol.Message) {
 }
 
 // tryResume 处理断线恢复请求，成功时直接下发 joined 并返回 true。
-func (h *Hub) tryResume(c *Client, msg *protocol.Message) bool {
+func (h *Hub) tryResume(c *Client, msg *protocol.Message, claims *auth.Claims) bool {
 	entry, ok := h.takeResume(msg.ResumeToken)
 	if !ok || entry.roomID != msg.RoomID {
 		return false
@@ -168,6 +204,14 @@ func (h *Hub) tryResume(c *Client, msg *protocol.Message) bool {
 	if !ok {
 		return false
 	}
+	// 鉴权开启时，恢复请求的令牌身份必须与原参与者一致：
+	// 否则拿到别人 resumeToken 的人就能顶替其身份（令牌泄漏的影响面会扩大）。
+	if claims != nil && p.Identity() != claims.Identity() {
+		log.Printf("signaling: 恢复请求的令牌身份与原参与者不一致，拒绝 session=%s", c.ID)
+		return false
+	}
+	c.setClaims(claims)
+	p.SetCanPublishData(c.grants().CanPublishData)
 	c.setSession(entry.roomID, entry.participantID, p)
 	c.setResumeToken(msg.ResumeToken) // 令牌延续使用，支持反复断线
 	c.reply(msg, &protocol.Message{
@@ -199,6 +243,9 @@ func (h *Hub) handlePublish(c *Client, msg *protocol.Message) {
 	_, _, p := c.session()
 	if p == nil {
 		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
+		return
+	}
+	if !c.requireGrant(msg, c.grants().CanPublish, "发布媒体") {
 		return
 	}
 	if msg.SDP == "" {
@@ -255,6 +302,9 @@ func (h *Hub) handleSubscribe(c *Client, msg *protocol.Message) {
 		c.fail(msg, protocol.ErrInternal, "房间不存在")
 		return
 	}
+	if !c.requireGrant(msg, c.grants().CanSubscribe, "订阅媒体") {
+		return
+	}
 	track, ok := room.Track(msg.TrackID)
 	if !ok {
 		c.fail(msg, protocol.ErrBadRequest, "轨道不存在: "+msg.TrackID)
@@ -280,6 +330,9 @@ func (h *Hub) handleUnsubscribe(c *Client, msg *protocol.Message) {
 		c.fail(msg, protocol.ErrInternal, "房间不存在")
 		return
 	}
+	if !c.requireGrant(msg, c.grants().CanSubscribe, "订阅媒体") {
+		return
+	}
 	if err := room.Unsubscribe(pid, msg.TrackID); err != nil {
 		c.fail(msg, protocol.ErrInternal, err.Error())
 	}
@@ -290,6 +343,9 @@ func (h *Hub) handleUnpublish(c *Client, msg *protocol.Message) {
 	roomID, pid, _ := c.session()
 	if roomID == "" {
 		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
+		return
+	}
+	if !c.requireGrant(msg, c.grants().CanPublish, "取消发布") {
 		return
 	}
 	if msg.TrackID == "" {
@@ -306,7 +362,7 @@ func (h *Hub) handleUnpublish(c *Client, msg *protocol.Message) {
 }
 
 func (h *Hub) handleMute(c *Client, msg *protocol.Message) {
-	roomID, _, _ := c.session()
+	roomID, pid, _ := c.session()
 	if roomID == "" {
 		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
 		return
@@ -315,9 +371,21 @@ func (h *Hub) handleMute(c *Client, msg *protocol.Message) {
 		c.fail(msg, protocol.ErrBadRequest, "缺少 muted")
 		return
 	}
+	if !c.requireGrant(msg, c.grants().CanPublish, "修改静音状态") {
+		return
+	}
 	room, ok := h.manager.Get(roomID)
 	if !ok {
 		c.fail(msg, protocol.ErrInternal, "房间不存在")
+		return
+	}
+	// 归属校验：只能改自己的轨道。改别人的要走 moderate（需要 roomAdmin）——
+	// 否则任何人只要猜到 trackId 就能把别人静音，这是典型的越权漏洞（IDOR）。
+	if track, ok := room.Track(msg.TrackID); !ok {
+		c.fail(msg, protocol.ErrBadRequest, "轨道不存在: "+msg.TrackID)
+		return
+	} else if info := track.Info(); info.PublisherID != pid && !c.grants().RoomAdmin {
+		c.fail(msg, protocol.ErrForbidden, "无权修改他人的轨道")
 		return
 	}
 	if err := room.SetTrackMuted(msg.TrackID, *msg.Muted); err != nil {
@@ -329,6 +397,9 @@ func (h *Hub) handleChat(c *Client, msg *protocol.Message) {
 	roomID, pid, p := c.session()
 	if roomID == "" || p == nil {
 		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
+		return
+	}
+	if !c.requireGrant(msg, c.grants().CanPublishData, "发送消息") {
 		return
 	}
 	if msg.Text == "" || len(msg.Text) > 2000 {
@@ -349,4 +420,58 @@ func (h *Hub) handleChat(c *Client, msg *protocol.Message) {
 			TS:       time.Now().UnixMilli(),
 		},
 	}, "")
+}
+
+// handleModerate 是主持人管理入口（强制静音 / 移出房间）。
+//
+// 两点设计考虑：
+//  1. 权限在服务端强制校验（roomAdmin），前端隐藏按钮只是体验；
+//  2. 踢人必须先把连接标记为"主动离开"再关闭——否则 Close 会走断线恢复分支，
+//     被踢的人反而能在宽限期内回到房间，那就成了笑话。
+func (h *Hub) handleModerate(c *Client, msg *protocol.Message) {
+	roomID, pid, _ := c.session()
+	if roomID == "" {
+		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
+		return
+	}
+	if !c.requireGrant(msg, c.grants().RoomAdmin, "主持人操作") {
+		return
+	}
+	if msg.TargetID == "" {
+		c.fail(msg, protocol.ErrBadRequest, "缺少 targetId")
+		return
+	}
+	if msg.TargetID == pid {
+		c.fail(msg, protocol.ErrBadRequest, "不能对自己执行该操作")
+		return
+	}
+	room, ok := h.manager.Get(roomID)
+	if !ok {
+		c.fail(msg, protocol.ErrInternal, "房间不存在")
+		return
+	}
+	if _, ok := room.ParticipantByID(msg.TargetID); !ok {
+		c.fail(msg, protocol.ErrBadRequest, "目标参与者不在房间内")
+		return
+	}
+
+	switch msg.Action {
+	case protocol.ActionMute:
+		room.ForceMute(msg.TargetID, true)
+	case protocol.ActionKick:
+		room.Leave(msg.TargetID) // 广播 participant_left 与轨道下线
+		if target := h.clientByParticipant(msg.TargetID); target != nil {
+			target.markLeft() // 关键：不要让它进入恢复宽限期
+			target.Close()
+		} else {
+			log.Printf("signaling: 未找到被踢者的信令连接 target=%s（房间内已移除，但其连接仍存活）", msg.TargetID)
+		}
+		log.Printf("signaling: 主持人移出参与者 room=%s by=%s target=%s", roomID, pid, msg.TargetID)
+	default:
+		c.fail(msg, protocol.ErrBadRequest, "未知的主持人操作: "+msg.Action)
+		return
+	}
+
+	// 回执：前端据此提示"操作成功"（幂等键 id 原样带回）
+	c.reply(msg, &protocol.Message{Type: protocol.TypeModerate, TargetID: msg.TargetID, Action: msg.Action})
 }

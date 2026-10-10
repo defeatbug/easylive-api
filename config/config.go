@@ -50,6 +50,16 @@ type Config struct {
 
 	// 调试端点开关（/debug/stats：各参与者的连接状态与 RTP 计数）
 	EnableDebugEndpoint bool
+
+	// 鉴权（准入与权限模型）
+	//
+	// AuthMode 三态：off（默认，不校验）/ optional（带令牌则校验）/ required（必须带）。
+	// 之所以默认 off：开题与答辩演示常在局域网、无 HTTPS 环境下进行，必须能一键跑通；
+	// 部署到公网时把 AUTH_MODE 改成 required 即可，代码不用动。
+	AuthMode    string
+	JWTSecret   string
+	TokenTTL    time.Duration
+	TokenAPIKey string
 }
 
 func Load() *Config {
@@ -77,6 +87,10 @@ func Load() *Config {
 		FiberReadTimeout:    getDuration("FIBER_READ_TIMEOUT", 0),
 		FiberWriteTimeout:   getDuration("FIBER_WRITE_TIMEOUT", 0),
 		WebOrigins:          getList("WEB_ORIGIN", "http://localhost:5173"),
+		AuthMode:            getStr("AUTH_MODE", "off"),
+		JWTSecret:           getStr("JWT_SECRET", ""),
+		TokenTTL:            getDuration("TOKEN_TTL", 12*time.Hour),
+		TokenAPIKey:         getStr("TOKEN_API_KEY", ""),
 	}
 	c.WebOrigins = append(c.WebOrigins, getList("WEB_EXTRA_ORIGINS", "")...)
 	return c
@@ -86,6 +100,11 @@ func Load() *Config {
 func (c *Config) LogSummary() {
 	log.Printf("config: env=%s port=%s basePath=%q", c.AppEnv, c.AppPort, c.AppBasePath)
 	log.Printf("config: media udp=%d advertiseIP=%q stun=%v turn=%d 个", c.MediaUDPPort, c.AdvertiseIP, c.StunURLs, len(c.TurnURLs))
+	// 只打印"是否配置"，绝不打印密钥本身
+	if c.AuthMode != "off" && c.JWTSecret == "" {
+		log.Printf("config: 警告 AUTH_MODE=%s 但未配置 JWT_SECRET，鉴权将降级为不校验", c.AuthMode)
+	}
+	log.Printf("config: auth mode=%s secret=%v tokenTTL=%s", c.AuthMode, c.JWTSecret != "", c.TokenTTL)
 	log.Printf("config: ws maxConn=%d roomMax=%d heartbeat=%s resumeGrace=%s origins=%v",
 		c.WSMaxConnections, c.RoomMaxParticipants, c.WSHeartbeat, c.ResumeGrace, c.WebOrigins)
 }

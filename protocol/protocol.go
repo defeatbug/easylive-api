@@ -27,6 +27,7 @@ const (
 	TypeMute        MsgType = "mute"        // {trackId, muted}
 	TypeChat        MsgType = "chat"        // {text}
 	TypePing        MsgType = "ping"        // {}
+	TypeModerate    MsgType = "moderate"    // {targetId, action}  action: mute | kick（需要 roomAdmin 权限）
 )
 
 // ---------- 服务端 → 客户端 ----------
@@ -44,6 +45,7 @@ const (
 	TypeHandState        MsgType = "hand_state"         // {participantId, raised}  举手状态（进房间快照）
 	TypeChatMessage      MsgType = "chat_message"       // {message}
 	TypePong             MsgType = "pong"               // {}
+	TypeForceMute        MsgType = "force_mute"         // {muted}  服务端下发给被强制静音的参与者
 	TypeError            MsgType = "error"              // {code, reason, id?}
 )
 
@@ -80,6 +82,9 @@ type Message struct {
 	// ResumeToken 由服务端在 joined 中下发；断线后重连时原样带回，
 	// 用于在宽限期内恢复**同一个参与者身份**（轨道与订阅不中断，对房间内其他人无感）。
 	ResumeToken string `json:"resumeToken,omitempty"`
+	// Token 是鉴权令牌（JWT）。AUTH_MODE=required 时 join 必须携带；
+	// 携带时其声明的身份与权限**优先于**客户端自报字段（昵称无法伪造）。
+	Token string `json:"token,omitempty"`
 	// ResetMedia 与 ResumeToken 配合使用：客户端两条 PeerConnection 已经不可用、
 	// 必须重新发布时置 true。服务端会清掉该参与者的旧轨道与旧连接（**保留身份**），
 	// 否则新连接产生的新 SSRC 会让服务端为同一路媒体再建一条轨道（表现为多出一张卡片）。
@@ -91,6 +96,9 @@ type Message struct {
 	TrackID     string     `json:"trackId,omitempty"`
 	Muted       *bool      `json:"muted,omitempty"`
 	Text        string     `json:"text,omitempty"`
+	// TargetID / Action 用于主持人管理（moderate）
+	TargetID string `json:"targetId,omitempty"`
+	Action   string `json:"action,omitempty"`
 	// Source 声明本次 publish 协商新增媒体的来源：camera / screen / microphone。
 	// 说明：浏览器不允许自定义 MediaStream id（msid），因此无法只靠 SDP 区分摄像头与屏幕，
 	// 这里用"本次协商声明的来源"来标注；更严谨的做法是自定义 RTP 头扩展（可作为后续工作）。
@@ -120,8 +128,11 @@ type Candidate struct {
 }
 
 type PeerInfo struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Identity 是**令牌身份**（跨断线重连保持不变），与 ID（服务端会话内标识）区分开，
+	// 与 LiveKit 的 identity / sid 对应。无鉴权模式下退化为昵称。
+	Identity string `json:"identity,omitempty"`
 	JoinedAt int64  `json:"joinedAt"`
 	// State 见 StateActive / StateReconnecting；空值等价于 active（兼容旧客户端）。
 	State string `json:"state,omitempty"`
@@ -184,6 +195,15 @@ const (
 	ErrRoomFull   = "room_full"
 	ErrServerBusy = "server_at_capacity"
 	ErrInternal   = "internal_error"
+	// 鉴权与权限相关
+	ErrUnauthorized = "unauthorized" // 未带令牌 / 令牌无效或过期
+	ErrForbidden    = "forbidden"    // 令牌有效但权限不足（房间不匹配、不能发布等）
+)
+
+// 主持人管理动作
+const (
+	ActionMute = "mute" // 强制静音某人（服务端停止转发其音频）
+	ActionKick = "kick" // 移出房间
 )
 
 func New(t MsgType) *Message { return &Message{Type: t} }

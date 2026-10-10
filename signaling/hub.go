@@ -5,7 +5,9 @@ import (
 	"sync"
 	"time"
 
+	"easylive-api/auth"
 	"easylive-api/config"
+	"easylive-api/protocol"
 	"easylive-api/sfu"
 )
 
@@ -21,6 +23,7 @@ type resumeEntry struct {
 type Hub struct {
 	manager *sfu.Manager
 	cfg     *config.Config
+	auth    *auth.Authenticator
 
 	mu      sync.RWMutex
 	clients map[string]*Client // sessionID -> client
@@ -33,9 +36,59 @@ func NewHub(manager *sfu.Manager, cfg *config.Config) *Hub {
 	return &Hub{
 		manager: manager,
 		cfg:     cfg,
+		auth:    auth.New(cfg.JWTSecret, cfg.TokenTTL, auth.ParseMode(cfg.AuthMode)),
 		clients: make(map[string]*Client),
 		resumes: make(map[string]resumeEntry),
 	}
+}
+
+// Authenticator 暴露给 HTTP 层用于签发令牌（/token）。
+func (h *Hub) Authenticator() *auth.Authenticator { return h.auth }
+
+// authFailure 是鉴权失败的结构化结果（避免在多层里传 error + code 两个值）。
+type authFailure struct {
+	code   string
+	reason string
+}
+
+// resolveClaims 解析并校验请求里的令牌。
+//
+// 三态语义：
+//   - off：不校验，返回 nil（后续按"全权限"处理）
+//   - optional：有令牌就校验并用它的身份；没有/无效则退化为自报昵称（便于灰度）
+//   - required：必须带有效令牌，否则返回错误
+func (h *Hub) resolveClaims(c *Client, msg *protocol.Message) (*auth.Claims, *authFailure) {
+	a := h.auth
+	if !a.Enabled() {
+		return nil, nil
+	}
+	if msg.Token == "" {
+		if a.Mode() == auth.ModeRequired {
+			return nil, &authFailure{protocol.ErrUnauthorized, "缺少访问令牌（AUTH_MODE=required）"}
+		}
+		return nil, nil
+	}
+	claims, err := a.Verify(msg.Token)
+	if err != nil {
+		if a.Mode() == auth.ModeRequired {
+			return nil, &authFailure{protocol.ErrUnauthorized, err.Error()}
+		}
+		log.Printf("signaling: 令牌无效，但 AUTH_MODE=optional 按匿名处理 session=%s: %v", c.ID, err)
+		return nil, nil
+	}
+	return claims, nil
+}
+
+// clientByParticipant 按参与者 ID 找到其信令连接（主持人踢人时要把连接也关掉）。
+func (h *Hub) clientByParticipant(participantID string) *Client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, cl := range h.clients {
+		if _, pid, _ := cl.session(); pid == participantID {
+			return cl
+		}
+	}
+	return nil
 }
 
 // registerResume 登记一个可恢复的会话（连接断开时调用）。

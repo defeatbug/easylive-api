@@ -11,10 +11,19 @@ import (
 	ws "github.com/fasthttp/websocket"
 	fiberws "github.com/gofiber/contrib/websocket"
 
+	"easylive-api/auth"
 	"easylive-api/config"
 	"easylive-api/protocol"
 	"easylive-api/sfu"
 )
+
+// devGrants 是"鉴权未启用"时的权限集合。
+//
+// 刻意给全权限（含主持人）：开题/答辩演示需要开箱可用，而且启动日志里已经明确告警。
+// 鉴权一旦启用，就绝不会有连接落到这个分支——join 阶段已经被拒绝或写入了令牌权限。
+var devGrants = &auth.VideoGrant{
+	RoomJoin: true, CanPublish: true, CanSubscribe: true, CanPublishData: true, RoomAdmin: true,
+}
 
 const (
 	writeWait     = 10 * time.Second
@@ -47,6 +56,7 @@ type Client struct {
 	participantID string
 	participant   *sfu.Participant
 	resumeToken   string
+	claims        *auth.Claims
 	// left 表示客户端主动发了 leave。主动离开要立刻清理；
 	// 而连接意外断开（网络抖动、标签页休眠）则进入恢复宽限期。
 	left bool
@@ -161,6 +171,14 @@ func (c *Client) Close() {
 			}
 		}
 		c.hub.Unregister(c)
+
+		// 关键：先用"已经过期的读截止时间"把阻塞在 ReadMessage 上的读协程踢醒。
+		//
+		// 为什么不能只调 conn.Close()：fasthttp 的 hijack 连接在 handler 返回**之前**
+		// 不会真正断开底层 TCP —— 直接 Close 会返回 nil，但连接仍然活着，对端毫无感知
+		// （这正是"踢人踢不掉"以及之前那个 SetWriteDeadline 空指针 panic 的同一个根源）。
+		// 让读循环自己退出、handler 返回，连接才会被真正回收。
+		_ = c.conn.SetReadDeadline(time.Now())
 		_ = c.conn.Close()
 	})
 }
@@ -176,6 +194,33 @@ func (c *Client) setResumeToken(token string) {
 	c.mu.Lock()
 	c.resumeToken = token
 	c.mu.Unlock()
+}
+
+func (c *Client) setClaims(cl *auth.Claims) {
+	c.mu.Lock()
+	c.claims = cl
+	c.mu.Unlock()
+}
+
+// grants 返回本连接的权限集合。
+func (c *Client) grants() *auth.VideoGrant {
+	c.mu.RLock()
+	cl := c.claims
+	c.mu.RUnlock()
+	if cl == nil {
+		return devGrants
+	}
+	g := cl.Video
+	return &g
+}
+
+// requireGrant 检查权限；不通过时已经回复了错误，调用方直接 return 即可。
+func (c *Client) requireGrant(req *protocol.Message, ok bool, action string) bool {
+	if ok {
+		return true
+	}
+	c.fail(req, protocol.ErrForbidden, "当前令牌无权限："+action)
+	return false
 }
 
 // session 返回当前会话的房间/参与者状态。

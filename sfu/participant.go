@@ -41,6 +41,10 @@ type Participant struct {
 	// 数据通道（SCTP）：pubDC 是客户端开给服务端的（接收），outDC 是服务端反向开的（推送）
 	pubDC *webrtc.DataChannel
 	outDC *webrtc.DataChannel
+	// identity 是令牌声明的稳定身份（无鉴权模式下退化为昵称）
+	identity string
+	// canPublishData 来自令牌的 canPublishData：数据通道消息（表情/举手）受它约束
+	canPublishData bool
 	// state 见 protocol.StateActive / StateReconnecting
 	state string
 	// resumeToken 在入会时生成，断线重连时凭它恢复同一身份。
@@ -57,6 +61,7 @@ func NewParticipant(id, name string, engine *Engine, notifier Notifier) *Partici
 		published:         make(map[string]*PublishedTrack),
 		pendingCandidates: make(map[string][]protocol.Candidate),
 		state:             protocol.StateActive,
+		canPublishData:    true, // 默认允许；信令层按令牌覆盖
 	}
 }
 
@@ -109,7 +114,44 @@ func (p *Participant) SetResumeToken(t string) {
 }
 
 func (p *Participant) Info() *protocol.PeerInfo {
-	return &protocol.PeerInfo{ID: p.ID, Name: p.Name, JoinedAt: p.JoinedAt, State: p.State()}
+	return &protocol.PeerInfo{
+		ID:       p.ID,
+		Name:     p.Name,
+		Identity: p.Identity(),
+		JoinedAt: p.JoinedAt,
+		State:    p.State(),
+	}
+}
+
+// Identity 返回令牌身份。
+func (p *Participant) Identity() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.identity == "" {
+		return p.Name // 无鉴权模式：身份退化为昵称
+	}
+	return p.identity
+}
+
+// SetIdentity 由信令层在入会时按令牌写入。
+func (p *Participant) SetIdentity(identity string) {
+	p.mu.Lock()
+	p.identity = identity
+	p.mu.Unlock()
+}
+
+// SetCanPublishData 设置数据面权限（来自令牌）。
+func (p *Participant) SetCanPublishData(ok bool) {
+	p.mu.Lock()
+	p.canPublishData = ok
+	p.mu.Unlock()
+}
+
+// CanPublishData 返回数据面权限。
+func (p *Participant) CanPublishData() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.canPublishData
 }
 
 // Confirm 把房间引用交给参与者（在 Room.Join 内部调用）。
@@ -448,6 +490,11 @@ func (p *Participant) handleDataMessage(data []byte) {
 		return
 	}
 	if p.room == nil {
+		return
+	}
+	// 数据面同样受权限约束：表情/举手属于"发布数据"，令牌没给就在这一层拦掉。
+	// 注意这是服务端强制，不是靠前端隐藏按钮。
+	if !p.CanPublishData() {
 		return
 	}
 	switch m.Type {
