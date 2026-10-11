@@ -242,6 +242,24 @@ func (t *PublishedTrack) Pump() {
 			continue
 		}
 
+		// 转发前剥掉发布者带来的 RTP 头扩展。
+		//
+		// 为什么必须剥：**头扩展的 ID 是每条连接各自协商的**（同一个 urn 在发布者那边是 4、
+		// 到订阅者这边可能是 2）。Pion 的 TrackLocalStaticRTP 会重写 SSRC 与 PayloadType，
+		// 但**不会重写扩展 ID**；而 Chrome 在 BUNDLE 下是按 mid 扩展把包分配到 m-line 的，
+		// 收到 mid 对不上自己协商结果的包会**整包静默丢弃**。
+		//
+		// 症状极具迷惑性：订阅端传输层字节数一直涨（≈媒体速率），inbound-rtp 计数与
+		// framesDecoded 却始终为 0——"媒体到了但没被算作任何轨道"。真实浏览器订阅会中招，
+		// 而只按 SSRC 收包的合成客户端不会，所以早期测试全绿也发现不了。
+		//
+		// 服务端自己需要的信息（RFC 6464 音量）已经在上面读完，剥离不影响活跃说话人。
+		// 代价：订阅端拿不到 TWCC/abs-send-time，其接收侧带宽估计会退化——本项目服务端
+		// 不做拥塞控制，这个代价可以接受；要恢复则需要按订阅端重映射扩展 ID。
+		pkt.Header.Extension = false
+		pkt.Header.ExtensionProfile = 0
+		pkt.Header.Extensions = nil
+
 		// TrackLocalStaticRTP 会把包写给所有绑定的订阅者连接；没有订阅者时直接丢弃。
 		if err := t.local.WriteRTP(pkt); err != nil {
 			// 注意：写入失败通常只是某个订阅者的 SRTP 尚未就绪（Pion 在未就绪时静默丢包），

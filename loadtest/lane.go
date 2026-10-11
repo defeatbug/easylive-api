@@ -299,6 +299,8 @@ type laneState struct {
 	senders []*rtpSender
 	// loggedPairs 保证候选对详情只打印一次
 	loggedPairs bool
+	// seenCandidates 去重记录服务端下发的候选（debug 用）
+	seenCandidates map[string]bool
 
 	latency *latencyWindow
 }
@@ -507,8 +509,9 @@ func (l *laneState) publish(ctx context.Context, pc *webrtc.PeerConnection) erro
 	if err := pc.SetLocalDescription(offer); err != nil {
 		return fmt.Errorf("设置本地描述失败: %w", err)
 	}
-	<-webrtc.GatheringCompletePromise(pc)
-
+	// 刻意**不等待** ICE 收集完成：这里曾经写着 <-webrtc.GatheringCompletePromise(pc)，
+	// 结果对着真实公网服务器时，收集要等 STUN 服务器响应（跨境网络下可能几十秒），
+	// 表现为"发布超时"——和服务端曾经犯的错一模一样。候选走 trickle 就够了。
 	l.pubExtID = extIDFromSDP(pc.LocalDescription().SDP, sfu.LatencyExtensionURI)
 
 	resp, err := l.ws.request(ctx, &protocol.Message{
@@ -635,6 +638,12 @@ func (l *laneState) handleEvents(ctx context.Context, selfID string) {
 			case protocol.TypeCandidate:
 				if msg.Candidate == nil {
 					continue
+				}
+				if l.opts.Debug {
+					// 打印服务端下发的候选：排查"连不通"时这里最关键——
+					// 如果候选全是 10.x/192.168.x 内网地址，说明服务端没设对
+					// SFU_ADVERTISE_IP；如果公网地址在列却仍连不通，那才是端口/防火墙问题。
+					l.debugCandidates(msg.Target, msg.Candidate.Candidate)
 				}
 				target := msg.Target
 				l.mu.Lock()
@@ -931,6 +940,22 @@ func (a *rateAccumulator) fill(pubPC, subPC *webrtc.PeerConnection, out *Sample)
 
 // 避免未使用告警（logger 在调试时很有用）
 var _ = log.Printf
+
+// debugCandidates 汇总服务端下发的候选地址（去重，只打印一眼能看懂的部分）。
+func (l *laneState) debugCandidates(target, cand string) {
+	l.mu.Lock()
+	if l.seenCandidates == nil {
+		l.seenCandidates = map[string]bool{}
+	}
+	key := target + " " + cand
+	if l.seenCandidates[key] {
+		l.mu.Unlock()
+		return
+	}
+	l.seenCandidates[key] = true
+	l.mu.Unlock()
+	log.Printf("loadtest[%s]: 服务端候选 target=%s %s", l.identity, target, cand)
+}
 
 // describePairs 列出候选对的状态、协议与 RTT。
 //
