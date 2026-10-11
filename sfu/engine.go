@@ -60,8 +60,16 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 	// 2) 对外广播的候选地址。容器里枚举到的是 Docker 内网 IP（172.x），浏览器连不通，
 	//    所以调试与部署时必须显式指定（宿主机 127.0.0.1 / 局域网 IP / 公网 IP）。
 	if cfg.AdvertiseIP != "" {
-		se.SetNAT1To1IPs([]string{cfg.AdvertiseIP}, webrtc.ICECandidateTypeHost)
-		log.Printf("sfu: 广播 ICE 候选地址 %s（udp/%d）", cfg.AdvertiseIP, cfg.MediaUDPPort)
+		// 支持逗号分隔的多个地址（例如"公网IP,内网IP"）：Pion 需要的是**列表**。
+		// 把整串当成一个 IP 会生成无效的地址改写表，之后每个远端候选都被拒
+		// （invalid address rewrite mapping），所有客户端都连不上——真实事故，见 parseAdvertiseIPs。
+		ips := parseAdvertiseIPs(cfg.AdvertiseIP)
+		if len(ips) == 0 {
+			log.Printf("sfu: SFU_ADVERTISE_IP 只包含空白，将自动枚举本机网卡地址")
+		} else {
+			se.SetNAT1To1IPs(ips, webrtc.ICECandidateTypeHost)
+			log.Printf("sfu: 广播 ICE 候选地址 %v（udp/%d tcp/%d）", ips, cfg.MediaUDPPort, cfg.ICETCPPort)
+		}
 	} else {
 		log.Printf("sfu: 未设置 SFU_ADVERTISE_IP，将自动枚举本机网卡地址（容器内通常连不通，调试请显式设置）")
 	}
@@ -180,4 +188,25 @@ func newLoggerFactory(appLevel string) logging.LoggerFactory {
 		f.DefaultLogLevel = logging.LogLevelError
 	}
 	return f
+}
+
+// parseAdvertiseIPs 把 SFU_ADVERTISE_IP 拆成地址列表。
+//
+// 为什么必须支持逗号分隔：一台服务器往往有多个可达地址（公网 IP + 内网 IP），
+// 而 Pion 的 SetNAT1To1IPs 要的是**列表**。把整串当成一个 IP 传进去会生成一张
+// 无效的地址改写表，之后**每一个**远端候选都会被拒绝，日志里刷
+//
+//	signaling: 添加 ICE 候选失败 ... invalid address rewrite mapping
+//
+// 结果是所有客户端都连不上。这个坑在真实部署上发生过：服务器上有一份未进版本库的
+// 本地补丁做了这件事，从仓库重新构建时丢失，直接导致线上故障。
+func parseAdvertiseIPs(value string) []string {
+	parts := strings.Split(value, ",")
+	ips := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if ip := strings.TrimSpace(part); ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
 }
