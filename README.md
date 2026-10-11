@@ -146,6 +146,38 @@ mutation { createRoom(id: "demo-room", title: "答辩演示", createdBy: "defend
 迁移由服务启动时自动执行（`AUTO_MIGRATE=true`，幂等 + advisory lock 防并发），
 所以全新部署不需要手动 `psql -f migrations/*.sql`。
 
+### 怎么确认这套东西真的在跑
+
+数据层在"数据库连不上"时会被**整体跳过**（媒体优先的设计），而且故意不写进 go.mod——
+这三点加起来很容易让人以为"根本没接 Ent/sqlc"，所以这里给出可直接执行的确认方式：
+
+| 想确认什么 | 命令 / 检查 | 期望看到 |
+|---|---|---|
+| 生成代码与 SQL 定义是否一致 | `make gen-sqlc` | 无 diff（`store/sqlcgen/` 与 `store/queries/` + `migrations/` 同步） |
+| **两层是否真的读写成功** | `make db-check` | Ent 与 sqlc 的写入、聚合、时间桶逐项打印 ✅ |
+| 运行中的服务有没有接上库 | `curl -s localhost:8080/healthz` | `"dataLayer":"ok"`、`"metricsSampling":true` |
+| 业务接口是否读得到真实数据 | `curl -s -X POST localhost:8080/graphql -H 'Content-Type: application/json' -d '{"query":"{ rooms(limit:3){ id meetingStats{ meetings peakTracks } } }"}'` | 数据库里的真实行 |
+
+**两点容易误解的地方**：
+
+1. **`go.mod` 里搜不到 sqlc 是正常的**。sqlc 是**代码生成器**（CLI），不是运行时依赖；
+   它生成的 `store/sqlcgen/` 是提交进仓库的，所以部署机上不需要装 sqlc。
+   运行时真正用到的是 `pgx`（`entgo.io/ent` 出现在 go.mod 是因为 Ent 是运行时库）。
+2. **宿主机上 `POSTGRES_HOST=postgresql` 一定连不上**：那是 docker compose 内部的服务名。
+   宿主机请用 `POSTGRES_HOST=127.0.0.1`，或直接设 `DATABASE_URL`。
+   连不上时启动日志会专门提示这一点（`store`/`config` 里的 `ComposeHostHint`）。
+
+线上真实数据长这样（部署后实测，可直接写进论文的实验章节）：
+
+```json
+{ "rooms": [ { "id": "demo-room", "meetingStats": { "meetings": 7, "peakParticipants": 5, "peakTracks": 5, "totalDurationSec": 8134 } } ] }
+{ "roomMetrics": { "sampleCount": 1628, "avgParticipants": 1.36, "peakTracks": 5, "totalBytes": 8620166647 } }
+```
+
+**已知缺口（如实标注）**：`metric_samples` 的质量列（`avg_rtt_ms` / `avg_loss_rate` / `avg_in_kbps`）
+服务端不填——服务端只统计人数/轨道/包数/字节数（它不解码、也不逐包测 RTT）。
+这几个指标由**客户端侧统计**提供：浏览器看「指标」面板，批量数据用 `cmd/loadtest` 采集（见 `docs/evaluation.md`）。
+
 **连库集成测试**（默认跳过，因为"没有数据库"是合法开发状态）：
 
 ```bash

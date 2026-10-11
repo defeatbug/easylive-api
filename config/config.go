@@ -3,6 +3,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -112,6 +113,32 @@ func Load() *Config {
 	}
 	c.WebOrigins = append(c.WebOrigins, getList("WEB_EXTRA_ORIGINS", "")...)
 	return c
+}
+
+// ComposeHostHint 检查一个很常见、也很难自查的配置错误：
+// 在**宿主机**上跑服务，但 POSTGRES_HOST 填的是 docker compose 的服务名
+// （postgresql / postgres / db）。这个域名只在 compose 网络里能解析，
+// 宿主机上必然连不上——而失败表现只是"数据层被跳过"，看起来就像根本没接数据库。
+//
+// 返回非空字符串表示命中了这种情况，调用方把它打给用户。
+func (c *Config) ComposeHostHint() string {
+	host := strings.ToLower(strings.TrimSpace(os.Getenv("POSTGRES_HOST")))
+	switch host {
+	case "postgres", "postgresql", "db", "database":
+	default:
+		return ""
+	}
+	// 容器内（有 /.dockerenv 或 /.containerenv）这是正确写法，不需要提示
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return ""
+	}
+	if _, err := os.Stat("/.containerenv"); err == nil {
+		return ""
+	}
+	return fmt.Sprintf(
+		"POSTGRES_HOST=%s 只在 docker compose 网络内可解析，看起来你是在宿主机上直接跑。"+
+			"宿主机请改用 POSTGRES_HOST=127.0.0.1（或直接设 DATABASE_URL）。",
+		host)
 }
 
 // LogSummary 打印关键配置（不打印任何密钥），便于容器里一眼确认环境是否正确。

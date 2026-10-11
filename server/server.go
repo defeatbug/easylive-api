@@ -104,6 +104,14 @@ func (s *Server) build() *fiber.App {
 	// ---- 健康检查与运行指标（评测脚本的采集入口）----
 	router.Get("/healthz", func(c *fiber.Ctx) error {
 		rooms, participants, tracks := s.manager.Stats()
+
+		// 数据层状态（Ent + sqlc）。刻意**不在健康检查里 ping 数据库**：
+		// 那会让健康检查的延迟被数据库绑架，而它要反映的是"进程是否活着"。
+		// 这里报告的是启动时确定的状态，够用于回答"我的数据层到底有没有生效"。
+		dataLayer, metricsSampling := "unavailable", false
+		if s.st != nil {
+			dataLayer, metricsSampling = "ok", s.cfg.MetricsInterval > 0
+		}
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
 		return c.JSON(fiber.Map{
@@ -119,6 +127,11 @@ func (s *Server) build() *fiber.App {
 			// 用它而不是让服务端自己算百分比，是为了让采样方掌握采样窗口
 			// （服务端自己算会引入它自己的定时器误差）。
 			"cpuSeconds": sysinfo.CPUSeconds(),
+			// 这两个字段是给"我到底接没接上数据库"这个问题准备的：
+			// 数据层不可用时整层会被跳过（媒体优先的设计），没有这两个字段的话
+			// 从外部完全看不出来，只能靠翻启动日志猜。
+			"dataLayer":       dataLayer,
+			"metricsSampling": metricsSampling,
 		})
 	})
 

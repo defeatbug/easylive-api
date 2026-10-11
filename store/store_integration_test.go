@@ -126,6 +126,69 @@ func TestStoreIntegration(t *testing.T) {
 	}
 }
 
+// TestStoreMeetingStatsDistinctMaxima 锁住一个只会在真实数据库上暴露的坑。
+//
+// 背景：RoomMeetingStats 曾经把两个 MAX 聚合和 count/sum 放在一次查询里，
+// 而 Ent 为聚合生成的 SQL 别名取自函数名——两个 MAX 都映射到键 "max"，
+// 扫描时互相覆盖，"峰值轨道数"于是永远是 0。生产数据里 meetings 的峰值轨道是 0、
+// 而同一份内存计数写进 metric_samples 是 5，两个数据源对不上才发现。
+//
+// 这里刻意用**两个不同的数字**（人数 3、轨道 7）：任何"取错列/被覆盖"的实现
+// 都不可能同时返回 3 和 7，而不是只断言"非零"——那样漏掉覆盖问题。
+func TestStoreMeetingStatsDistinctMaxima(t *testing.T) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		t.Skip("未设置 DATABASE_URL，跳过连库测试（本机没有 Postgres 属正常）")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	applyMigrations(t, ctx, st)
+
+	roomID := "itest-stats-" + time.Now().Format("150405.000")
+	if err := st.EnsureRoom(ctx, roomID, "itest"); err != nil {
+		t.Fatalf("EnsureRoom 失败: %v", err)
+	}
+	// 第一场：峰值 3 人 / 7 轨
+	if err := st.RecordMeetingStart(ctx, roomID, roomID+"-m1"); err != nil {
+		t.Fatalf("开始会议失败: %v", err)
+	}
+	if err := st.RecordMeetingEnd(ctx, roomID+"-m1", 3, 7); err != nil {
+		t.Fatalf("结束会议失败: %v", err)
+	}
+	// 第二场：峰值更低，确认取的是 MAX 而不是"最后一条"
+	if err := st.RecordMeetingStart(ctx, roomID, roomID+"-m2"); err != nil {
+		t.Fatalf("开始第二场会议失败: %v", err)
+	}
+	if err := st.RecordMeetingEnd(ctx, roomID+"-m2", 1, 2); err != nil {
+		t.Fatalf("结束第二场会议失败: %v", err)
+	}
+
+	stats, err := st.RoomMeetingStats(ctx, roomID)
+	if err != nil {
+		t.Fatalf("聚合会议统计失败: %v", err)
+	}
+	if stats.Meetings != 2 {
+		t.Fatalf("会议数应为 2，实际 %d", stats.Meetings)
+	}
+	if stats.PeakParticipants != 3 {
+		t.Fatalf("峰值人数应为 3（max 而非最后一条），实际 %d", stats.PeakParticipants)
+	}
+	if stats.PeakTracks != 7 {
+		t.Fatalf("峰值轨道应为 7，实际 %d —— 若为 0 说明多个 MAX 聚合的别名又撞在一起了", stats.PeakTracks)
+	}
+
+	if _, err := st.Pool.Exec(ctx, "DELETE FROM rooms WHERE id = $1", roomID); err != nil {
+		t.Logf("清理测试房间失败（不影响结论）: %v", err)
+	}
+}
+
 // TestStoreMetricsIntegration 覆盖 sqlc 那一半：写入 + 窗口聚合 + 时间桶 + 保留策略。
 //
 // 与上面的用例分开：它验证的是"指标时序由 sqlc 负责"这条边界，

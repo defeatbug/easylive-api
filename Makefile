@@ -28,8 +28,23 @@ psql: ## [宿主机] 进入数据库
 run: ## [容器内] 运行服务
 	go run .
 
-gen: ## [容器内] 生成 ent / gqlgen 代码
+gen: gen-ent gen-sqlc ## 生成全部代码（Ent + gqlgen + sqlc）
+
+gen-ent: ## 生成 Ent 代码（读 ent/schema）+ gqlgen（读 graph/schema.graphqls）
 	go generate ./...
+
+gen-sqlc: ## 生成 sqlc 代码（读 migrations/*.sql + store/queries/*.sql）
+	@command -v sqlc >/dev/null 2>&1 || { \
+		echo "缺少 sqlc。安装：go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest"; exit 1; }
+	sqlc generate
+	@echo "已生成 store/sqlcgen/（这部分代码是提交进仓库的，运行时不需要 sqlc）"
+
+db-check: ## 连接真实数据库，把 Ent 与 sqlc 的读写各跑一遍并打印结果
+	go run ./cmd/dbcheck
+
+db-test: ## 连库集成测试（需要 DATABASE_URL）
+	@test -n "$$DATABASE_URL" || { echo "用法：DATABASE_URL='postgres://...' make db-test"; exit 1; }
+	go test ./store/ -run Integration -v -count=1
 
 test: ## [容器内] 单元测试
 	go test ./...

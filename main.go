@@ -43,10 +43,15 @@ func main() {
 	// 数据库是"可选依赖"：连不上只告警，不影响开会（媒体面与会话状态都在内存里）。
 	st, err := store.Open(ctx, cfg.PostgresDSN)
 	if err != nil {
-		log.Printf("main: 数据库不可用，跳过持久化: %v", err)
+		log.Printf("main: ❌ 数据库不可用: %v", err)
+		log.Printf("main: 数据层未启用 —— 房间/会议（Ent）与指标样本（sqlc）都不会写入；" +
+			"/graphql 会返回\"数据库不可用\"，/healthz 的 dataLayer 显示 unavailable。媒体功能不受影响。")
+		if hint := cfg.ComposeHostHint(); hint != "" {
+			log.Printf("main: 提示：%s", hint)
+		}
 		st = nil
 	} else {
-		log.Printf("main: 数据库已连接")
+		log.Printf("main: ✅ 数据库已连接（数据层：Ent 管 rooms/meetings，sqlc 管 metric_samples）")
 	}
 
 	engine, err := sfu.NewEngine(cfg)
@@ -72,6 +77,7 @@ func main() {
 			mcancel()
 		}
 		if cfg.MetricsInterval > 0 {
+			log.Printf("main: 指标采样已启用（每 %s 一次 → metric_samples；会议记录 → meetings）", cfg.MetricsInterval)
 			sampler := recorder.New(st, manager, recorder.Config{
 				Interval:  cfg.MetricsInterval,
 				Retention: cfg.MetricsRetention,

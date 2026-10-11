@@ -213,6 +213,25 @@ func (s *Store) EndMeeting(ctx context.Context, meetingID string, peakParticipan
 		Save(ctx)
 }
 
+// maxMeetingField 求某个整型字段在房间内的最大值。
+//
+// 一次只查一个聚合是刻意的：多个 MAX 会撞名（见 RoomMeetingStats 里的说明）。
+func (s *Store) maxMeetingField(ctx context.Context, roomID, field string) (int64, error) {
+	var rows []struct {
+		Max int64 `json:"max"`
+	}
+	if err := s.Ent.Meeting.Query().
+		Where(meeting.RoomID(roomID)).
+		Aggregate(ent.Max(field)).
+		Scan(ctx, &rows); err != nil {
+		return 0, fmt.Errorf("聚合 %s 失败: %w", field, err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Max, nil
+}
+
 // EndOpenMeetings 把所有"还没写结束时间"的会议记录收尾（用于房间关闭/服务重启后的清理）。
 func (s *Store) EndOpenMeetings(ctx context.Context, roomID string) (int, error) {
 	now := time.Now()
@@ -248,31 +267,41 @@ type RoomMeetingStats struct {
 
 // RoomMeetingStats 聚合某房间的历史会议数据。
 func (s *Store) RoomMeetingStats(ctx context.Context, roomID string) (*RoomMeetingStats, error) {
-	var agg []struct {
-		Count     int   `json:"count"`
-		Sum       int64 `json:"sum"`
-		Max       int64 `json:"max"`
-		MaxTracks int64 `json:"max_tracks"`
+	// 这里曾经把 count / sum / 两个 max 放在**一次**聚合查询里，结果生产环境上
+	// "峰值轨道数"永远是 0：Ent 为每个聚合生成的 SQL 别名都取自函数名，
+	// 两个 MAX 于是都映射到同一个键（"max"）上互相覆盖，扫描时后者覆盖前者、
+	// 而 max_tracks 这个键根本不存在。同一份内存计数写进 metric_samples 是 5、
+	// 写进 meetings 读出来却是 0 —— 两个数据源对不上才暴露出来。
+	//
+	// 现在只把别名天然不同的 count / sum 放在一起，两个 MAX 各自单独查：
+	// 多一次往返，但结果不依赖生成 SQL 的别名规则。
+	out := &RoomMeetingStats{}
+
+	var basic []struct {
+		Count int   `json:"count"`
+		Sum   int64 `json:"sum"`
 	}
-	err := s.Ent.Meeting.Query().
+	if err := s.Ent.Meeting.Query().
 		Where(meeting.RoomID(roomID)).
-		Aggregate(
-			ent.Count(),
-			ent.Sum(meeting.FieldDurationSec),
-			ent.Max(meeting.FieldPeakParticipants),
-			ent.Max(meeting.FieldPeakTracks),
-		).
-		Scan(ctx, &agg)
-	if err != nil {
+		Aggregate(ent.Count(), ent.Sum(meeting.FieldDurationSec)).
+		Scan(ctx, &basic); err != nil {
 		return nil, fmt.Errorf("聚合会议统计失败: %w", err)
 	}
-	out := &RoomMeetingStats{}
-	if len(agg) > 0 {
-		out.Meetings = agg[0].Count
-		out.TotalDurationSec = agg[0].Sum
-		out.PeakParticipants = agg[0].Max
-		out.PeakTracks = agg[0].MaxTracks
+	if len(basic) > 0 {
+		out.Meetings = basic[0].Count
+		out.TotalDurationSec = basic[0].Sum
 	}
+
+	peakParts, err := s.maxMeetingField(ctx, roomID, meeting.FieldPeakParticipants)
+	if err != nil {
+		return nil, err
+	}
+	peakTracks, err := s.maxMeetingField(ctx, roomID, meeting.FieldPeakTracks)
+	if err != nil {
+		return nil, err
+	}
+	out.PeakParticipants = peakParts
+	out.PeakTracks = peakTracks
 	return out, nil
 }
 
