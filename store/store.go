@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"time"
 
 	"entgo.io/ent/dialect"
@@ -154,6 +155,40 @@ func (s *Store) CloseRoom(ctx context.Context, id string) (*ent.Room, error) {
 		return nil, err
 	}
 	return s.Ent.Room.Get(ctx, id)
+}
+
+// ---------- 启动辅助 ----------
+
+// OpenWithRetry 在**启动阶段**重试连接数据库，直到成功或超过 wait。
+//
+// 为什么需要：容器编排里数据库几乎总是比 api 晚就绪——postgres 首次启动还要恢复数据目录，
+// 而且 api 可能先于它被拉起。没有重试时，一次启动顺序竞态就会让 api 永久停在
+// "数据层未启用"状态（媒体功能正常、业务接口报数据库不可用），只能靠人工重启恢复。
+// 真实部署上就踩过一次，所以把等待放在启动路径上。
+func OpenWithRetry(ctx context.Context, dsn string, wait time.Duration) (*Store, error) {
+	deadline := time.Now().Add(wait)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		st, err := Open(ctx, dsn)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("store: 数据库已就绪（第 %d 次尝试成功）", attempt)
+			}
+			return st, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return nil, lastErr
+		}
+		if attempt == 1 {
+			log.Printf("store: 数据库尚未就绪，将在 %s 内重试: %v", wait, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, lastErr
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // ---------- 供采样器使用的薄包装 ----------

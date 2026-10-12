@@ -11,6 +11,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB_NAME:-postgres}
+    # 只绑回环地址：宿主机上的 api（以及 host 网络的 api 容器）通过 localhost:5432 连库。
+    # 不写成 5432:5432（那会暴露到所有网卡）；生产环境更推荐 api 与 postgres 同网络、完全不发布端口。
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - ${DOCKER_VOLUMES_ROOT_DIR}/postgresql_volume/data:/var/lib/postgresql/data
     logging:

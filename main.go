@@ -41,7 +41,9 @@ func main() {
 	ctx := context.Background()
 
 	// 数据库是"可选依赖"：连不上只告警，不影响开会（媒体面与会话状态都在内存里）。
-	st, err := store.Open(ctx, cfg.PostgresDSN)
+	// 启动阶段等一下数据库：容器编排里 postgres 常常比 api 晚就绪
+	// （首次启动还要恢复数据目录），没有这段等待就会永久降级到"无数据层"。
+	st, err := store.OpenWithRetry(ctx, cfg.PostgresDSN, 45*time.Second)
 	if err != nil {
 		log.Printf("main: ❌ 数据库不可用: %v", err)
 		log.Printf("main: 数据层未启用 —— 房间/会议（Ent）与指标样本（sqlc）都不会写入；" +
