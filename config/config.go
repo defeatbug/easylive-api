@@ -23,7 +23,16 @@ type Config struct {
 	AdvertiseIP  string
 	StunURLs     []string
 	TurnURLs     []string
-	TurnSecret   string
+	// ExternalTurn* 是可选的**静态凭证**外部 TURN 服务。
+	//
+	// 用途（重要）：本机若是 NAT 型 VPS——公网只放行了 22/80/443、媒体端口无法开放——
+	// 那么"直连候选"对公网访客永远不可达。此时让 SFU 自己以 TURN 客户端身份申请中继候选，
+	// 媒体就变成「客户端 ↔ 公网 TURN ↔ SFU」，**不需要本机开放任何入向端口**。
+	// 客户端也会拿到同一组 TURN（可选），用于它们自己也需要中继的网络。
+	ExternalTurnURLs       []string
+	ExternalTurnUsername   string
+	ExternalTurnCredential string
+	TurnSecret             string
 	// TurnCredTTL 是下发给客户端的 TURN 临时凭证有效期。
 	// 短一点更安全（泄漏窗口小），但要大于一次会议的典型时长，否则中途失效会掉中继。
 	TurnCredTTL     time.Duration
@@ -78,21 +87,24 @@ type Config struct {
 
 func Load() *Config {
 	c := &Config{
-		AppName:         getStr("APP_NAME", "easylive-api"),
-		AppPort:         getStr("APP_PORT", "8080"),
-		AppBasePath:     strings.TrimRight(getStr("APP_BASE_PATH", ""), "/"),
-		AppEnv:          getStr("APP_ENV", "development"),
-		LogLevel:        getStr("LOG_LEVEL", "debug"),
-		MediaUDPPort:    getInt("MEDIA_UDP_PORT", 7881),
-		AdvertiseIP:     getStr("SFU_ADVERTISE_IP", ""),
-		StunURLs:        getList("STUN_URLS", "stun:stun.l.google.com:19302"),
-		TurnURLs:        getList("TURN_URLS", ""),
-		TurnSecret:      getStr("TURN_SECRET", ""),
-		TurnCredTTL:     getDuration("TURN_CRED_TTL", time.Hour),
-		ICETCPPort:      getInt("ICE_TCP_PORT", 7882),
-		IncludeLoopback: getBool("ICE_INCLUDE_LOOPBACK", true),
-		PostgresDSN:     buildDSN(),
-		MigrationsDir:   getStr("MIGRATIONS_DIR", "migrations"),
+		AppName:                getStr("APP_NAME", "easylive-api"),
+		AppPort:                getStr("APP_PORT", "8080"),
+		AppBasePath:            strings.TrimRight(getStr("APP_BASE_PATH", ""), "/"),
+		AppEnv:                 getStr("APP_ENV", "development"),
+		LogLevel:               getStr("LOG_LEVEL", "debug"),
+		MediaUDPPort:           getInt("MEDIA_UDP_PORT", 7881),
+		AdvertiseIP:            getStr("SFU_ADVERTISE_IP", ""),
+		StunURLs:               getList("STUN_URLS", "stun:stun.l.google.com:19302"),
+		TurnURLs:               getList("TURN_URLS", ""),
+		TurnSecret:             getStr("TURN_SECRET", ""),
+		ExternalTurnURLs:       getList("EXTERNAL_TURN_URLS", ""),
+		ExternalTurnUsername:   getStr("EXTERNAL_TURN_USERNAME", ""),
+		ExternalTurnCredential: getStr("EXTERNAL_TURN_CREDENTIAL", ""),
+		TurnCredTTL:            getDuration("TURN_CRED_TTL", time.Hour),
+		ICETCPPort:             getInt("ICE_TCP_PORT", 7882),
+		IncludeLoopback:        getBool("ICE_INCLUDE_LOOPBACK", true),
+		PostgresDSN:            buildDSN(),
+		MigrationsDir:          getStr("MIGRATIONS_DIR", "migrations"),
 		// 诊断端点（/debug/stats）：默认关闭——它会调用 GetStats()，属于"耗时的观测"，
 		// 不该在生产常态开启；需要排查媒体问题时临时打开。
 		// 之前这里漏了赋值，导致端点写了却永远打不开（排查时白折腾了一轮）。
@@ -150,6 +162,9 @@ func (c *Config) LogSummary() {
 	log.Printf("config: env=%s port=%s basePath=%q", c.AppEnv, c.AppPort, c.AppBasePath)
 	log.Printf("config: media udp=%d iceTcp=%d advertiseIP=%q stun=%v turn=%d 个（临时凭证 %s）",
 		c.MediaUDPPort, c.ICETCPPort, c.AdvertiseIP, c.StunURLs, len(c.TurnURLs), c.TurnCredTTL)
+	if len(c.ExternalTurnURLs) > 0 {
+		log.Printf("config: 外部 TURN 已配置 %d 个地址（SFU 与客户端都会用它申请中继候选）", len(c.ExternalTurnURLs))
+	}
 	if len(c.TurnURLs) > 0 && c.TurnSecret == "" {
 		log.Printf("config: 警告 配置了 TURN_URLS 但没有 TURN_SECRET，将不下发 TURN（无凭证的中继只会拖慢建连）")
 	}

@@ -154,7 +154,11 @@ func (e *Engine) Close() error {
 // Configuration 生成 ICE 配置：STUN 直连探测 + TURN 中继兜底（用于对称 NAT）。
 // 凭证生成与下发给浏览器的是同一套实现（turn 包），避免"服务端能用、客户端不能用"的偏差。
 func (e *Engine) Configuration(userID string) webrtc.Configuration {
-	servers := turn.Servers(e.cfg.StunURLs, e.cfg.TurnURLs, e.cfg.TurnSecret, userID, e.cfg.TurnCredTTL)
+	// 末尾追加外部静态 TURN（若配置了）。**SFU 自己用它是这台机器在没有可开放入向端口时的
+	// 唯一出路**：SFU 申请到中继候选后，客户端只需能连上那台公网 TURN 即可，
+	// 媒体走「客户端 ↔ 公网 TURN ↔ SFU」，本机不需要任何入向端口。
+	servers := turn.Servers(e.cfg.StunURLs, e.cfg.TurnURLs, e.cfg.TurnSecret, userID, e.cfg.TurnCredTTL,
+		turn.Static(e.cfg.ExternalTurnURLs, e.cfg.ExternalTurnUsername, e.cfg.ExternalTurnCredential)...)
 	out := make([]webrtc.ICEServer, 0, len(servers))
 	for _, s := range servers {
 		item := webrtc.ICEServer{URLs: s.URLs}

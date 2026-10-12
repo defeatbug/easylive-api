@@ -57,7 +57,7 @@ func Credential(secret, identity string, ttl time.Duration) (username, credentia
 //
 // 注意：没配密钥时**不能**下发不带凭证的 TURN 地址——那会让浏览器一直尝试一个
 // 认证失败的中继，表现为"连接建立很慢甚至失败"，比直接不给更糟。
-func Servers(stunURLs, turnURLs []string, secret, identity string, ttl time.Duration) []Server {
+func Servers(stunURLs, turnURLs []string, secret, identity string, ttl time.Duration, extra ...Server) []Server {
 	out := make([]Server, 0, 2)
 	if len(stunURLs) > 0 {
 		out = append(out, Server{URLs: stunURLs})
@@ -68,7 +68,22 @@ func Servers(stunURLs, turnURLs []string, secret, identity string, ttl time.Dura
 			out = append(out, Server{URLs: turnURLs, Username: user, Credential: cred})
 		}
 	}
+	for _, s := range extra {
+		if len(s.URLs) > 0 {
+			out = append(out, s)
+		}
+	}
 	return out
+}
+
+// Static 构造一组**静态凭证**的 TURN 服务（urls 为空时返回空切片，便于直接展开）。
+//
+// 与 Credential 的 REST 临时凭证方案不同：这里的用户名/口令是服务商给定的固定值。
+func Static(urls []string, username, credential string) []Server {
+	if len(urls) == 0 {
+		return nil
+	}
+	return []Server{{URLs: urls, Username: username, Credential: credential}}
 }
 
 // TTLSeconds 把时长转成秒（HTTP 响应里给客户端看，便于它提前刷新凭证）。

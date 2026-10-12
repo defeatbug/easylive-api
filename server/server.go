@@ -223,12 +223,16 @@ func (s *Server) build() *fiber.App {
 	// 真正的授权边界是"密钥不下发 + 凭证会过期"。
 	router.Get("/ice", func(c *fiber.Ctx) error {
 		identity := c.Query("identity", "anonymous")
-		servers := turn.Servers(cfg.StunURLs, cfg.TurnURLs, cfg.TurnSecret, identity, cfg.TurnCredTTL)
+		servers := turn.Servers(cfg.StunURLs, cfg.TurnURLs, cfg.TurnSecret, identity, cfg.TurnCredTTL,
+			turn.Static(cfg.ExternalTurnURLs, cfg.ExternalTurnUsername, cfg.ExternalTurnCredential)...)
 		return c.JSON(fiber.Map{
-			"iceServers":       servers,
-			"ttlSeconds":       turn.TTLSeconds(cfg.TurnCredTTL),
-			"turnEnabled":      len(cfg.TurnURLs) > 0 && cfg.TurnSecret != "",
-			"credentialScheme": "turn-rest-api", // coturn --use-auth-secret
+			"iceServers":  servers,
+			"ttlSeconds":  turn.TTLSeconds(cfg.TurnCredTTL),
+			"turnEnabled": len(cfg.TurnURLs) > 0 && cfg.TurnSecret != "",
+			// externalTurn=true 表示同时下发了外部 TURN 服务（静态凭证）。
+			// 本机若无法对公网开放媒体端口，就靠它兜底（媒体全程走中继）。
+			"externalTurn":     len(cfg.ExternalTurnURLs) > 0,
+			"credentialScheme": "turn-rest-api", // coturn --use-auth-secret（外部 TURN 用静态凭证）
 		})
 	})
 
