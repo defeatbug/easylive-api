@@ -5,10 +5,10 @@
 | 领域 | 选型 |
 |---|---|
 | 媒体面 | Go + Pion WebRTC v4（单端口 UDP mux、RTP 只转发不转码不混流） |
-| HTTP / 信令 | Fiber v2 + `gofiber/contrib/websocket`（沿用 egg-api 的写法） |
+| HTTP / 信令 | Fiber v2 + `gofiber/contrib/websocket` |
 | 业务接口 | gqlgen（当前为占位 handler，见 `server/server.go` 的 `TODO(gqlgen)`） |
 | 数据 | PostgreSQL；业务实体用 **Ent**、指标时序用 **sqlc**（共用同一个 pgxpool）；**不引入 Redis**：会话与媒体状态驻留进程内存 |
-| 开发环境 | Dev Container（`.devcontainer/`，约定与 `egg-api` / `titanium-line-api` 一致） |
+| 开发环境 | Dev Container |
 
 ## 部署
 
