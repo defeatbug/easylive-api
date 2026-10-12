@@ -18,6 +18,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"easylive-api/config"
+	"easylive-api/mediarec"
 	"easylive-api/recorder"
 	"easylive-api/server"
 	"easylive-api/sfu"
@@ -64,6 +65,20 @@ func main() {
 	manager := sfu.NewManager(engine, cfg.RoomMaxParticipants, cfg.ResumeGrace)
 	hub := signaling.NewHub(manager, cfg)
 
+	// ---- 会议录制（可选）----
+	// 零转码：把已经在转发的视频 RTP 多写一份到磁盘（每轨一个 IVF 文件）。
+	var mediaRec *mediarec.Manager
+	if cfg.RecordEnabled {
+		rec, rerr := mediarec.New(cfg.RecordDir)
+		if rerr != nil {
+			log.Printf("main: 会议录制未能开启: %v", rerr)
+		} else {
+			mediaRec = rec
+			manager.EnableRecording(rec)
+			log.Printf("main: ✅ 会议录制已开启，输出目录 %s", rec.Dir())
+		}
+	}
+
 	// ---- 迁移 + 指标采样（都需要数据库与房间管理器）----
 	var (
 		stopSampler context.CancelFunc
@@ -104,6 +119,10 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	if mediaRec != nil {
+		// 先收尾录制：把每条轨道的写队列 flush 并回填 IVF 帧数，否则文件头里的帧数不准
+		mediaRec.CloseAll()
+	}
 	if stopSampler != nil {
 		stopSampler()
 		select {

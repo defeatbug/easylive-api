@@ -9,6 +9,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"easylive-api/mediarec"
 	"easylive-api/protocol"
 )
 
@@ -299,6 +300,22 @@ func (p *Participant) addPublishedTrack(source string, remote *webrtc.TrackRemot
 	track, err := newPublishedTrack(p.ID, source, remote, pc)
 	if err != nil {
 		return nil, err
+	}
+	// 开启录制时，给视频轨挂一个落盘写入器（零转码：把已经在转发的 RTP 多写一份）。
+	// 音频要等 Ogg/Opus 封装实现（见 mediarec 包说明），当前只录视频轨。
+	if rec := p.room.manager.Recording(); rec != nil && track.info.Kind == protocol.KindVideo {
+		w, werr := rec.Open(p.room.ID, p.ID, source, mediarec.Codec{
+			Name:        "VP8",
+			ClockRate:   90000,
+			PayloadType: uint8(remote.PayloadType()),
+			SSRC:        uint32(remote.SSRC()),
+		})
+		if werr != nil {
+			log.Printf("sfu: 开启录制失败 track=%s: %v", track.info.ID, werr)
+		} else {
+			track.attachRecorder(w)
+			log.Printf("sfu: 录制已开启 track=%s → %s", track.info.ID, w.Path())
+		}
 	}
 	p.mu.Lock()
 	p.published[track.info.ID] = track

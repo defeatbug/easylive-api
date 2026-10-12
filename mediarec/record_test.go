@@ -1,0 +1,217 @@
+package mediarec
+
+import (
+	"bytes"
+	"encoding/binary"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/pion/rtp"
+)
+
+// vp8Keyframe 造一个结构正确的最小 VP8 关键帧：
+// 3 字节帧标签（bit0=0 表示关键帧）+ 起始码 9d 01 2a + 2 字节宽 + 2 字节高 + 载荷。
+func vp8Keyframe(w, h uint16, payloadLen int) []byte {
+	buf := make([]byte, 10+payloadLen)
+	buf[0], buf[1], buf[2] = 0x10, 0x00, 0x00 // 帧标签：keyframe(bit0=0) + 版本 0
+	buf[3], buf[4], buf[5] = 0x9d, 0x01, 0x2a // VP8 起始码
+	binary.LittleEndian.PutUint16(buf[6:8], w)
+	binary.LittleEndian.PutUint16(buf[8:10], h)
+	for i := 10; i < len(buf); i++ {
+		buf[i] = 0x55
+	}
+	return buf
+}
+
+// vp8Interframe 造一个最小非关键帧（bit0=1）。
+func vp8Interframe(payloadLen int) []byte {
+	buf := make([]byte, 3+payloadLen)
+	buf[0], buf[1], buf[2] = 0x11, 0x00, 0x00
+	for i := 3; i < len(buf); i++ {
+		buf[i] = 0x33
+	}
+	return buf
+}
+
+// rtpPacket 把 VP8 帧打包成 RTP：payload descriptor(0x10=S 开始) + 帧数据。
+func rtpPacket(frame []byte, ts uint32, marker bool) *rtp.Packet {
+	return &rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: uint16(ts), Timestamp: ts, SSRC: 1234, Marker: marker},
+		Payload: append([]byte{0x10}, frame...),
+	}
+}
+
+// TestIVFHeaderAndFrames 校验容器结构：魔数、fourcc、时间基、分辨率、帧数与时间戳。
+func TestIVFHeaderAndFrames(t *testing.T) {
+	var buf bytes.Buffer
+	w := &IVFWriter{w: &buf}
+
+	// 关键帧之前的非关键帧必须被丢弃（否则文件开头无法解码）
+	if err := w.WritePacket(rtpPacket(vp8Interframe(20), 100, true)); err != nil {
+		t.Fatal(err)
+	}
+	if w.Frames() != 0 {
+		t.Fatalf("关键帧之前不应写出任何帧，实际 %d", w.Frames())
+	}
+
+	if err := w.WritePacket(rtpPacket(vp8Keyframe(640, 360, 30), 9000, true)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WritePacket(rtpPacket(vp8Interframe(25), 18000, true)); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Frames(); got != 2 {
+		t.Fatalf("应写出 2 帧，实际 %d", got)
+	}
+	if dw, dh := w.Dimensions(); dw != 640 || dh != 360 {
+		t.Fatalf("应从关键帧解析出 640x360，实际 %dx%d", dw, dh)
+	}
+
+	raw := buf.Bytes()
+	if string(raw[0:4]) != "DKIF" {
+		t.Fatalf("IVF 魔数应为 DKIF，实际 %q", raw[0:4])
+	}
+	if string(raw[8:12]) != "VP80" {
+		t.Fatalf("fourcc 应为 VP80，实际 %q", raw[8:12])
+	}
+	if got := binary.LittleEndian.Uint32(raw[20:24]); got != 90000 {
+		t.Fatalf("时间基分母应为 90000（RTP 时钟），实际 %d", got)
+	}
+	if got := binary.LittleEndian.Uint16(raw[12:14]); got != 640 {
+		t.Fatalf("头部宽度应为 640，实际 %d", got)
+	}
+
+	// 第一帧记录：长度 + 时间戳（原样写入 RTP 的 90kHz 时间戳）
+	if got := binary.LittleEndian.Uint32(raw[32:36]); got != uint32(len(vp8Keyframe(640, 360, 30))) {
+		t.Fatalf("第一帧长度记录不正确: %d", got)
+	}
+	if got := binary.LittleEndian.Uint64(raw[36:44]); got != 9000 {
+		t.Fatalf("第一帧时间戳应为 9000，实际 %d", got)
+	}
+}
+
+// TestFFprobeAcceptsIVF 用真实 ffprobe 验证产物能被识别为 VP8 流。
+// 没有 ffprobe 时跳过（CI/服务器上可能没装）——这是**真实**验证，不是"文件非空"。
+func TestFFprobeAcceptsIVF(t *testing.T) {
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("未安装 ffprobe，跳过真实容器校验")
+	}
+	path := filepath.Join(t.TempDir(), "out.ivf")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &IVFWriter{w: f}
+	ts := uint32(0)
+	if err := w.WritePacket(rtpPacket(vp8Keyframe(1280, 720, 200), ts, true)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		ts += 3000
+		if err := w.WritePacket(rtpPacket(vp8Interframe(120), ts, true)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	out, err := exec.Command(ffprobe, "-v", "error",
+		"-show_entries", "stream=codec_name,width,height",
+		"-of", "default=noprint_wrappers=1", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("ffprobe 无法读取录制文件: %v\n%s", err, out)
+	}
+	s := string(out)
+	for _, want := range []string{"codec_name=vp8", "width=1280", "height=720"} {
+		if !bytes.Contains(out, []byte(want)) {
+			t.Fatalf("ffprobe 输出里应包含 %q，实际:\n%s", want, s)
+		}
+	}
+}
+
+// TestWriterNeverBlocks 钉住"绝不阻塞转发"这条铁律：
+// 队列满时丢弃并计数，而不是阻塞调用方。
+func TestWriterNeverBlocks(t *testing.T) {
+	w := &Writer{frames: make(chan *rtp.Packet, 2)} // 刻意不启动写协程，模拟磁盘卡住
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 10; i++ {
+			w.Write(&rtp.Packet{})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-timeAfter(t):
+		t.Fatal("Write 阻塞了——这会拖住媒体转发")
+	}
+	if w.Dropped() != 8 {
+		t.Fatalf("队列容量 2、写入 10 个，应丢弃 8 个，实际 %d", w.Dropped())
+	}
+}
+
+// TestManagerLifecycle 覆盖文件命名、目录创建与关闭。
+func TestManagerLifecycle(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rec")
+	m, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := m.Open("room/1", "p:abc", "screen", Codec{Name: "VP8", ClockRate: 90000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Active() != 1 {
+		t.Fatalf("进行中的录制应为 1，实际 %d", m.Active())
+	}
+	// 文件名必须落在录制目录内，且不含路径分隔符
+	if filepath.Dir(w.Path()) != m.Dir() {
+		t.Fatalf("录制文件应位于录制目录内，实际 %s", w.Path())
+	}
+	if !bytes.HasSuffix([]byte(w.Path()), []byte(".ivf")) {
+		t.Fatalf("VP8 轨应写 .ivf，实际 %s", w.Path())
+	}
+	if err := w.ivf.WritePacket(rtpPacket(vp8Keyframe(320, 240, 10), 0, true)); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	m.CloseAll()
+	if m.Active() != 0 {
+		t.Fatalf("关闭后不应有进行中的录制")
+	}
+	if _, err := os.Stat(w.Path()); err != nil {
+		t.Fatalf("录制文件应存在: %v", err)
+	}
+}
+
+func TestSanitize(t *testing.T) {
+	// 断言"属性"而不是具体字符串：真正要保证的是**产物无法逃出录制目录**。
+	for _, in := range []string{"room/1", "p:abc", "../../etc", "..", "/", "", "a/../../b"} {
+		got := sanitize(in)
+		if got == "" {
+			t.Fatalf("sanitize(%q) 不应为空", in)
+		}
+		if strings.ContainsAny(got, "/\\") || strings.Contains(got, "..") {
+			t.Fatalf("sanitize(%q) = %q 仍含路径分隔符或 ..，可能写到目录外", in, got)
+		}
+		// 拼成路径后必须仍在同一目录内
+		dir := t.TempDir()
+		full := filepath.Join(dir, got+".ivf")
+		if filepath.Dir(full) != dir {
+			t.Fatalf("sanitize(%q) 拼出的路径逃出了录制目录: %s", in, full)
+		}
+	}
+	if got := sanitize("room/1"); got != "room_1" {
+		t.Fatalf("普通房间号应只把 / 换成 _，实际 %q", got)
+	}
+}
+
+// timeAfter 给"绝不阻塞"的断言一个宽松上限。
+func timeAfter(_ *testing.T) <-chan time.Time { return time.After(2 * time.Second) }

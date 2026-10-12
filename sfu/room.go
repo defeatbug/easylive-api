@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"easylive-api/mediarec"
 	"easylive-api/protocol"
 )
 
@@ -23,9 +24,26 @@ type Manager struct {
 	engine          *Engine
 	maxParticipants int
 	resumeGrace     time.Duration
+	// recorder 非 nil 时开启录制：每条轨道多写一份到磁盘（见 mediarec 包）。
+	// 它对转发是"旁路"：写队列满就丢帧，绝不阻塞媒体。
+	recorder *mediarec.Manager
 
 	mu    sync.RWMutex
 	rooms map[string]*Room
+}
+
+// EnableRecording 打开会议录制（传 nil 表示关闭）。
+func (m *Manager) EnableRecording(rec *mediarec.Manager) {
+	m.mu.Lock()
+	m.recorder = rec
+	m.mu.Unlock()
+}
+
+// Recording 返回当前录制器（可能为 nil）。
+func (m *Manager) Recording() *mediarec.Manager {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.recorder
 }
 
 // NewManager 创建房间管理器。resumeGrace 是断线后保留参与者身份的宽限期（0 表示立即离会）。

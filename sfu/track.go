@@ -13,6 +13,7 @@ import (
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 
+	"easylive-api/mediarec"
 	"easylive-api/protocol"
 )
 
@@ -75,6 +76,10 @@ type PublishedTrack struct {
 	// muted 用原子量而不是直接改 info.Muted：转发热路径会读它，
 	// 直接读写 info 会与信令协程构成数据竞争。
 	muted atomic.Bool
+
+	// rec 是这条视频轨的录制写入器（未开启录制时为 nil）。
+	// 它的 Write 是**非阻塞**的：队列满就丢帧，绝不能拖住转发。
+	rec *mediarec.Writer
 
 	// 音频电平（活跃说话人检测用）。float64 拆成位存进 atomic，避免给热路径加锁。
 	audioLevelExtID uint8
@@ -209,10 +214,16 @@ func (t *PublishedTrack) NudgeKeyframe() {
 	}()
 }
 
+// attachRecorder 挂上录制写入器（由 participant 在 OnTrack 时调用）。
+func (t *PublishedTrack) attachRecorder(w *mediarec.Writer) { t.rec = w }
+
 // Pump 从发布者读取 RTP 并转发给所有订阅者，直到发布者停止。
 // 这是整个媒体面唯一的"热路径"，也是评测 CPU / 带宽的观测点。
 func (t *PublishedTrack) Pump() {
 	defer func() {
+		if t.rec != nil {
+			_ = t.rec.Close() // flush + 回填 IVF 帧数
+		}
 		log.Printf("sfu: 轨道转发结束 track=%s packets=%d bytes=%d", t.info.ID, t.packets.Load(), t.bytes.Load())
 		// 关键：必须通知房间回收这条轨道，否则客户端会永远留着一个"最后一帧"的瓦片，
 		// 重新共享时还会多出第二个瓦片。
@@ -228,6 +239,12 @@ func (t *PublishedTrack) Pump() {
 		}
 		t.packets.Add(1)
 		t.bytes.Add(uint64(len(pkt.Payload)))
+
+		// 录制：在**转发之前**落盘，录到的是"发布者实际发出的内容"。
+		// 它挂在热路径上，所以 Write 必须是非阻塞的（队列满则丢帧并计数）。
+		if t.rec != nil {
+			t.rec.Write(pkt)
+		}
 
 		// 活跃说话人：顺手从包头扩展取电平，不额外读一遍包、不解码
 		if t.info.Kind == protocol.KindAudio {

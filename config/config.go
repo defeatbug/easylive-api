@@ -47,6 +47,11 @@ type Config struct {
 	// 默认开启：全新部署若没人手动跑迁移，业务接口会以"表不存在"告终，
 	// 而媒体功能完全正常——这种组合极易被误判成"接口写错了"。
 	AutoMigrate bool
+	// RecordEnabled 打开会议录制：把每条视频轨的 RTP **原样落盘**（IVF/VP8，零转码）。
+	// 默认关闭——录制要写磁盘，是否开启属于部署决策。
+	RecordEnabled bool
+	// RecordDir 录制文件输出目录
+	RecordDir string
 	// MetricsInterval 指标采样周期（0 表示不采样）
 	MetricsInterval time.Duration
 	// MetricsRetention 指标保留时长（<=0 表示不清理）
@@ -110,6 +115,8 @@ func Load() *Config {
 		// 之前这里漏了赋值，导致端点写了却永远打不开（排查时白折腾了一轮）。
 		EnableDebugEndpoint: getBool("ENABLE_DEBUG_ENDPOINT", false),
 		AutoMigrate:         getBool("AUTO_MIGRATE", true),
+		RecordEnabled:       getBool("RECORD_ENABLED", false),
+		RecordDir:           getStr("RECORD_DIR", "recordings"),
 		MetricsInterval:     getDuration("METRICS_INTERVAL", 5*time.Second),
 		MetricsRetention:    getDuration("METRICS_RETENTION", 72*time.Hour),
 		WSMaxConnections:    getInt("WS_MAX_CONNECTIONS", 200),
@@ -173,6 +180,9 @@ func (c *Config) LogSummary() {
 		log.Printf("config: 警告 AUTH_MODE=%s 但未配置 JWT_SECRET，鉴权将降级为不校验", c.AuthMode)
 	}
 	log.Printf("config: auth mode=%s secret=%v tokenTTL=%s", c.AuthMode, c.JWTSecret != "", c.TokenTTL)
+	if c.RecordEnabled {
+		log.Printf("config: 会议录制已开启，输出目录 %s（每轨一个 IVF 文件，零转码）", c.RecordDir)
+	}
 	log.Printf("config: db autoMigrate=%v migrationsDir=%s metricsInterval=%s retention=%s",
 		c.AutoMigrate, c.MigrationsDir, c.MetricsInterval, c.MetricsRetention)
 	log.Printf("config: ws maxConn=%d roomMax=%d heartbeat=%s resumeGrace=%s origins=%v",
