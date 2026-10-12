@@ -303,13 +303,22 @@ func (p *Participant) addPublishedTrack(source string, remote *webrtc.TrackRemot
 	}
 	// 开启录制时，给视频轨挂一个落盘写入器（零转码：把已经在转发的 RTP 多写一份）。
 	// 音频要等 Ogg/Opus 封装实现（见 mediarec 包说明），当前只录视频轨。
-	if rec := p.room.manager.Recording(); rec != nil && track.info.Kind == protocol.KindVideo {
-		w, werr := rec.Open(p.room.ID, p.ID, source, mediarec.Codec{
+	if rec := p.room.manager.Recording(); rec != nil {
+		codec := mediarec.Codec{
 			Name:        "VP8",
 			ClockRate:   90000,
 			PayloadType: uint8(remote.PayloadType()),
 			SSRC:        uint32(remote.SSRC()),
-		})
+		}
+		if track.info.Kind == protocol.KindAudio {
+			codec = mediarec.Codec{
+				Name:        "opus",
+				ClockRate:   48000,
+				PayloadType: uint8(remote.PayloadType()),
+				SSRC:        uint32(remote.SSRC()),
+			}
+		}
+		w, werr := rec.Open(p.room.ID, p.ID, source, codec)
 		if werr != nil {
 			log.Printf("sfu: 开启录制失败 track=%s: %v", track.info.ID, werr)
 		} else {

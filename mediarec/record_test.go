@@ -215,3 +215,136 @@ func TestSanitize(t *testing.T) {
 
 // timeAfter 给"绝不阻塞"的断言一个宽松上限。
 func timeAfter(_ *testing.T) <-chan time.Time { return time.After(2 * time.Second) }
+
+// TestIVFDropsCorruptFrames 钉住"丢包时不写残缺帧"：
+// 丢一个包（或帧结束包）会让当前帧残缺；若直接写出，播放器会在该帧报错，
+// 而且下一帧的数据会被拼进残缺帧里（表现为花屏）。
+func TestIVFDropsCorruptFrames(t *testing.T) {
+	var buf bytes.Buffer
+	w := &IVFWriter{w: &buf}
+
+	// seq=1：关键帧（整帧一个包）
+	if err := w.WritePacket(withSeq(rtpPacket(vp8Keyframe(320, 240, 40), 0, true), 1)); err != nil {
+		t.Fatal(err)
+	}
+	if w.Frames() != 1 {
+		t.Fatalf("关键帧应写出，实际帧数 %d", w.Frames())
+	}
+
+	// seq=2、3：一帧拆两个包，完整 → 写出
+	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(30), 3000, false), 2))
+	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(30), 3000, true), 3))
+	if w.Frames() != 2 {
+		t.Fatalf("完整的分片帧应写出，实际帧数 %d", w.Frames())
+	}
+
+	// seq=4、6（丢了 5）：残缺 → 必须丢弃
+	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(30), 6000, false), 4))
+	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(30), 6000, true), 6))
+	if w.Frames() != 2 {
+		t.Fatalf("残缺帧不应写出，实际帧数 %d", w.Frames())
+	}
+	if w.CorruptFrames() != 1 {
+		t.Fatalf("应记录 1 个因丢包丢弃的帧，实际 %d", w.CorruptFrames())
+	}
+
+	// seq=7：间隙之后的完整帧仍应正常写出
+	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(30), 9000, true), 7))
+	if w.Frames() != 3 {
+		t.Fatalf("间隙之后应恢复录制，实际帧数 %d", w.Frames())
+	}
+}
+
+// TestOggStructureAndCRC 校验 Ogg 页结构：魔数、页序号递增、**每页 CRC 自校验**。
+// CRC 用错（比如用了常见 IEEE CRC32）播放器会整条流拒绝，所以必须验证。
+func TestOggStructureAndCRC(t *testing.T) {
+	var buf bytes.Buffer
+	o := newOggWriter(&buf, 2, 0x1234)
+	for i := 0; i < 5; i++ {
+		o.WritePacket([]byte{0xfc, byte(i), 0x11, 0x22}, uint32(i*960))
+	}
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := buf.Bytes()
+	if string(raw[0:4]) != "OggS" {
+		t.Fatalf("Ogg 魔数应为 OggS，实际 %q", raw[0:4])
+	}
+	// 逐页解析：检查页序号递增，并重算 CRC 与页头里存的值比对
+	pages, seq := 0, uint32(0)
+	for off := 0; off+27 <= len(raw); {
+		if string(raw[off:off+4]) != "OggS" {
+			t.Fatalf("第 %d 页偏移 %d 处不是 OggS", pages, off)
+		}
+		stored := binary.LittleEndian.Uint32(raw[off+22 : off+26])
+		pageSeq := binary.LittleEndian.Uint32(raw[off+18 : off+22])
+		if pageSeq != seq {
+			t.Fatalf("页序号应为 %d，实际 %d", seq, pageSeq)
+		}
+		nsegs := int(raw[off+26])
+		size := 27 + nsegs
+		for i := 0; i < nsegs; i++ {
+			size += int(raw[off+27+i])
+		}
+		if size <= 0 || off+size > len(raw) {
+			t.Fatalf("第 %d 页长度异常: %d", pages, size)
+		}
+		page := make([]byte, size)
+		copy(page, raw[off:off+size])
+		binary.LittleEndian.PutUint32(page[22:26], 0) // CRC 字段参与计算时为 0
+		if got := oggCRC(page); got != stored {
+			t.Fatalf("第 %d 页 CRC 不匹配：页内 %08x，重算 %08x（CRC 算法用错了？）", pages, stored, got)
+		}
+		off += size
+		pages++
+		seq++
+	}
+	if pages < 3 {
+		t.Fatalf("应有 OpusHead/OpusTags/数据页 至少 3 页，实际 %d", pages)
+	}
+}
+
+// TestFFprobeAcceptsOgg 用真实 ffprobe 验证音频容器的头部可被识别为 Opus。
+func TestFFprobeAcceptsOgg(t *testing.T) {
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("未安装 ffprobe，跳过真实容器校验")
+	}
+	path := filepath.Join(t.TempDir(), "out.ogg")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := newOggWriter(f, 2, 42)
+	// 合成的 Opus 包（内容不是真实 Opus，但容器结构必须是合法的）
+	for i := 0; i < 60; i++ {
+		pkt := make([]byte, 40)
+		for j := range pkt {
+			pkt[j] = byte(i + j)
+		}
+		o.WritePacket(pkt, uint32(i*960))
+	}
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	out, err := exec.Command(ffprobe, "-v", "error",
+		"-show_entries", "stream=codec_name,channels,sample_rate",
+		"-of", "default=noprint_wrappers=1", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("ffprobe 无法读取 Ogg 录制: %v\n%s", err, out)
+	}
+	for _, want := range []string{"codec_name=opus", "channels=2", "sample_rate=48000"} {
+		if !bytes.Contains(out, []byte(want)) {
+			t.Fatalf("ffprobe 输出应含 %q，实际:\n%s", want, string(out))
+		}
+	}
+}
+
+// withSeq 设置 RTP 序列号（间隙检测依赖它）。
+func withSeq(p *rtp.Packet, seq uint16) *rtp.Packet {
+	p.SequenceNumber = seq
+	return p
+}

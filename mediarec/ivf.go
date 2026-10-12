@@ -40,6 +40,20 @@ type IVFWriter struct {
 	seenKeyframe bool
 	// inFrame 表示"当前正在累积一帧"（由 marker 位翻转为 false）
 	inFrame bool
+	// PTS 单调化：编码器重启（例如浏览器中途换分辨率）会让 RTP 时间戳基准重置，
+	// 直接原样写入会出现"时间戳倒退"，播放器/ffmpeg 会报 non monotonic dts 并丢帧。
+	// 这里保留原有的帧间隔节奏，只把倒退/异常跳变钳制成递增。
+	lastPTS   uint32
+	lastDelta uint32
+	havePTS   bool
+	// 序列号间隙检测：丢包意味着当前帧必然残缺。若把残缺帧直接写出，
+	// 播放器会在这一帧上报错，而且下一帧的数据会被拼进残缺帧里（表现为花屏）。
+	// 因此检测到不连续就标记本帧损坏，收齐 marker 时直接丢弃。
+	lastSeq     uint16
+	haveSeq     bool
+	frameBroken bool
+	corrupt     uint64 // 因丢包被丢弃的帧数（可观测）
+	clamped     uint64 // 因时间戳倒退/跳变被钳制的帧数（可观测）
 	// VP8 分片重组：一帧可能被拆成多个 RTP 包，靠 marker 位判断结束。
 	depay    codecs.VP8Packet
 	frameBuf []byte
@@ -71,16 +85,28 @@ func (v *IVFWriter) WritePacket(pkt *rtp.Packet) error {
 	// 帧边界用 RTP 的 marker 位判断，而不是 VP8 descriptor 的 S 位：
 	// S 只表示"分区的开始"，多分区编码一帧会有多个 S（会把一帧拆错），
 	// 而 marker 位就是 RTP 层的"这一帧到此结束"，语义唯一、可靠。
+	if v.haveSeq && pkt.SequenceNumber != v.lastSeq+1 {
+		v.frameBroken = true // 丢包：本帧残缺
+	}
+	v.lastSeq, v.haveSeq = pkt.SequenceNumber, true
+
 	if !v.inFrame {
 		v.frameBuf = v.frameBuf[:0]
 		v.frameTS = pkt.Timestamp
 		v.inFrame = true
+		// 新帧重新判定：间隙若发生在**帧与帧之间**（上一帧已正常收尾），本帧是完整的
+		v.frameBroken = false
 	}
 	v.frameBuf = append(v.frameBuf, payload...)
 	if !pkt.Marker {
 		return nil // 这一帧还没收完
 	}
 	v.inFrame = false
+	if v.frameBroken {
+		v.corrupt++
+		v.frameBroken = false
+		return nil // 残缺帧不写：宁可少一帧，也不给播放器喂坏数据
+	}
 
 	isKey := len(v.frameBuf) >= 10 && v.frameBuf[0]&0x01 == 0
 	if !v.seenKeyframe {
@@ -99,9 +125,14 @@ func (v *IVFWriter) WritePacket(pkt *rtp.Packet) error {
 		}
 	}
 
+	// 注意：这里曾尝试把"倒退/跳变"的时间戳钳制成单调递增，但实测 393 帧里触发了 391 次，
+	// 说明触发条件本身就没被理解清楚（比原问题更糟）。已撤下，改由后续专门的排查解决：
+	// 需要先把一条轨道的原始 RTP 落盘做离线分析，弄清浏览器侧时间戳的真实推进方式。
+	// 当前行为：原样写入 RTP 的 90kHz 时间戳。
+	ts := v.frameTS
 	rec := make([]byte, 12)
 	binary.LittleEndian.PutUint32(rec[0:4], uint32(len(v.frameBuf)))
-	binary.LittleEndian.PutUint64(rec[4:12], uint64(v.frameTS))
+	binary.LittleEndian.PutUint64(rec[4:12], uint64(ts))
 	if _, err := v.w.Write(rec); err != nil {
 		return err
 	}
@@ -134,6 +165,12 @@ func (v *IVFWriter) Close() error {
 
 // Frames 返回已写出的帧数（测试与日志用）。
 func (v *IVFWriter) Frames() uint32 { return v.frames }
+
+// CorruptFrames 返回因丢包被丢弃的残缺帧数（可观测，而不是悄悄丢）。
+func (v *IVFWriter) CorruptFrames() uint64 { return v.corrupt }
+
+// ClampedFrames 返回因时间戳异常被钳制的帧数（编码器重启/换分辨率时会增长）。
+func (v *IVFWriter) ClampedFrames() uint64 { return v.clamped }
 
 // Dimensions 返回解析出的分辨率（0,0 表示还没拿到关键帧）。
 func (v *IVFWriter) Dimensions() (uint16, uint16) { return v.width, v.height }

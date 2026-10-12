@@ -68,8 +68,12 @@ func (m *Manager) Open(roomID, participantID, source string, c Codec) (*Writer, 
 		frames: make(chan *rtp.Packet, queueSize),
 		done:   make(chan struct{}),
 	}
-	if strings.EqualFold(c.Name, "VP8") {
+	switch {
+	case strings.EqualFold(c.Name, "VP8"):
 		w.ivf = &IVFWriter{w: f}
+	case strings.EqualFold(c.Name, "opus"):
+		// 音频写 Ogg Opus：ffmpeg / VLC / 浏览器可直接播放
+		w.ogg = newOggWriter(f, 2, uint32(time.Now().UnixNano()))
 	}
 	go w.run()
 	m.active[path] = w
@@ -104,6 +108,7 @@ type Writer struct {
 	file  *os.File
 	codec Codec
 	ivf   *IVFWriter
+	ogg   *oggWriter
 
 	frames chan *rtp.Packet
 	done   chan struct{}
@@ -150,19 +155,45 @@ func (w *Writer) run() {
 				logf("录制回填帧数失败 file=%s: %v", filepath.Base(w.path), err)
 			}
 		}
+		if w.ogg != nil {
+			w.ogg.Flush()
+			if err := w.ogg.Close(); err != nil {
+				logf("录制收尾 Ogg 失败 file=%s: %v", filepath.Base(w.path), err)
+			}
+		}
 		_ = w.file.Close()
-		frames, dropped := uint64(0), w.dropped.Load()
+		frames, dropped, corrupt := uint64(0), w.dropped.Load(), uint64(0)
 		if w.ivf != nil {
 			frames = uint64(w.ivf.Frames())
+			corrupt = w.ivf.CorruptFrames()
 		}
-		logf("录制结束 file=%s 帧=%d 丢=%d 编码=%s", filepath.Base(w.path), frames, dropped, w.codec)
+		if w.ogg != nil {
+			frames = w.written.Load()
+		}
+		clamped := uint64(0)
+		if w.ivf != nil {
+			clamped = w.ivf.ClampedFrames()
+		}
+		logf("录制结束 file=%s 帧=%d 队列丢弃=%d 残缺丢弃=%d 时间戳钳制=%d 编码=%s",
+			filepath.Base(w.path), frames, dropped, corrupt, clamped, w.codec)
 	}()
 
 	for pkt := range w.frames {
-		if w.ivf == nil {
-			continue // 音频（Opus）在下一轮实现，先如实跳过
+		var err error
+		switch {
+		case w.ivf != nil:
+			err = w.ivf.WritePacket(pkt)
+		case w.ogg != nil:
+			// 空载荷包（padding/RTX 等）不是有效的 Opus 包，写进去会让 demuxer 直接报错
+			if len(pkt.Payload) == 0 {
+				continue
+			}
+			w.ogg.WritePacket(pkt.Payload, pkt.Timestamp)
+			err = nil
+		default:
+			continue
 		}
-		if err := w.ivf.WritePacket(pkt); err != nil {
+		if err != nil {
 			logf("录制写入失败 file=%s: %v", filepath.Base(w.path), err)
 			return
 		}
@@ -171,10 +202,14 @@ func (w *Writer) run() {
 }
 
 func ext(codec string) string {
-	if strings.EqualFold(codec, "VP8") {
+	switch {
+	case strings.EqualFold(codec, "VP8"):
 		return "ivf"
+	case strings.EqualFold(codec, "opus"):
+		return "ogg"
+	default:
+		return "bin"
 	}
-	return "bin"
 }
 
 // sanitize 把 ID 里的路径分隔符与冒号换成下划线，避免录制文件写到目录外。
