@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -26,14 +27,10 @@ const migrateLockKey int64 = 0x656173796c6976
 // 前提：迁移文件必须幂等（IF NOT EXISTS / ADD COLUMN IF NOT EXISTS），
 // 因为每次启动都会重跑一遍（没有版本表，也就不需要"迁移历史"这套机制）。
 func (s *Store) Migrate(ctx context.Context, dir string) error {
-	files, err := filepath.Glob(filepath.Join(dir, "*.sql"))
+	files, err := migrationFiles(dir)
 	if err != nil {
-		return fmt.Errorf("扫描迁移目录失败: %w", err)
+		return err
 	}
-	if len(files) == 0 {
-		return fmt.Errorf("迁移目录 %s 下没有 .sql 文件", dir)
-	}
-	sort.Strings(files) // 文件名前缀编号决定顺序（001_, 002_, ...）
 
 	// 迁移可能被 ctx 取消（例如启动超时），但绝不能一直持锁
 	lockCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -71,4 +68,33 @@ func (s *Store) Migrate(ctx context.Context, dir string) error {
 	}
 	log.Printf("store: 迁移完成，共执行 %d 个文件（目录 %s）", applied, dir)
 	return nil
+}
+
+// migrationFiles 列出目录下真正的迁移文件（按文件名排序）。
+//
+// 为什么不能直接用 filepath.Glob("*.sql")：
+//   - macOS 往非 APFS 卷复制文件时会生成 "._名字" 形式的 AppleDouble 伴生文件，
+//     它们同样以 .sql 结尾，会被当成迁移执行并报出莫名其妙的
+//     "invalid message format (SQLSTATE 08P01)"——真实部署上就这样失败过一次。
+//   - 编辑器/备份工具留下的临时文件（以 . 或 _ 开头）也应跳过。
+//
+// 单独抽成函数是为了可单测：迁移本身需要真实数据库，这个过滤逻辑不需要。
+func migrationFiles(dir string) ([]string, error) {
+	all, err := filepath.Glob(filepath.Join(dir, "*.sql"))
+	if err != nil {
+		return nil, fmt.Errorf("扫描迁移目录失败: %w", err)
+	}
+	files := make([]string, 0, len(all))
+	for _, f := range all {
+		base := filepath.Base(f)
+		if strings.HasPrefix(base, ".") || strings.HasPrefix(base, "_") {
+			continue
+		}
+		files = append(files, f)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("迁移目录 %s 下没有可用的 .sql 文件（已忽略 . 或 _ 开头的文件）", dir)
+	}
+	sort.Strings(files) // 文件名前缀编号决定顺序（001_, 002_, ...）
+	return files, nil
 }
