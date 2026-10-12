@@ -52,6 +52,9 @@ type Config struct {
 	RecordEnabled bool
 	// RecordDir 录制文件输出目录
 	RecordDir string
+	// RecordRawDump 额外落一份原始 RTP 转储（.rtp），供离线分析录制缺陷用。
+	// 默认关闭：磁盘占用翻倍。
+	RecordRawDump bool
 	// MetricsInterval 指标采样周期（0 表示不采样）
 	MetricsInterval time.Duration
 	// MetricsRetention 指标保留时长（<=0 表示不清理）
@@ -117,6 +120,7 @@ func Load() *Config {
 		AutoMigrate:         getBool("AUTO_MIGRATE", true),
 		RecordEnabled:       getBool("RECORD_ENABLED", false),
 		RecordDir:           getStr("RECORD_DIR", "recordings"),
+		RecordRawDump:       getBool("RECORD_RAW_DUMP", false),
 		MetricsInterval:     getDuration("METRICS_INTERVAL", 5*time.Second),
 		MetricsRetention:    getDuration("METRICS_RETENTION", 72*time.Hour),
 		WSMaxConnections:    getInt("WS_MAX_CONNECTIONS", 200),

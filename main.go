@@ -74,6 +74,10 @@ func main() {
 			log.Printf("main: 会议录制未能开启: %v", rerr)
 		} else {
 			mediaRec = rec
+			if cfg.RecordRawDump {
+				rec.EnableRawDump()
+				log.Printf("main: 原始 RTP 转储已开启（.rtp，供离线分析录制缺陷）")
+			}
 			manager.EnableRecording(rec)
 			log.Printf("main: ✅ 会议录制已开启，输出目录 %s", rec.Dir())
 		}

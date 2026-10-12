@@ -37,11 +37,20 @@ func vp8Interframe(payloadLen int) []byte {
 	return buf
 }
 
-// rtpPacket 把 VP8 帧打包成 RTP：payload descriptor(0x10=S 开始) + 帧数据。
+// rtpPacket 把 VP8 帧打包成 RTP：payload descriptor(0x10=S=1 表示**帧起始**) + 帧数据。
+// 真实抓包证实：帧的起始分片 S=1，续片 S=0（见 mediarec 的离线分析）。
 func rtpPacket(frame []byte, ts uint32, marker bool) *rtp.Packet {
 	return &rtp.Packet{
 		Header:  rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: uint16(ts), Timestamp: ts, SSRC: 1234, Marker: marker},
 		Payload: append([]byte{0x10}, frame...),
+	}
+}
+
+// rtpContinuation 造一个**续片**（S=0）：它不是帧的起点，单独出现时必须被丢弃。
+func rtpContinuation(frame []byte, ts uint32, marker bool) *rtp.Packet {
+	return &rtp.Packet{
+		Header:  rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: uint16(ts), Timestamp: ts, SSRC: 1234, Marker: marker},
+		Payload: append([]byte{0x00}, frame...),
 	}
 }
 
@@ -231,16 +240,16 @@ func TestIVFDropsCorruptFrames(t *testing.T) {
 		t.Fatalf("关键帧应写出，实际帧数 %d", w.Frames())
 	}
 
-	// seq=2、3：一帧拆两个包，完整 → 写出
+	// seq=2、3：一帧拆两个包（起始 S=1 + 续片 S=0），完整 → 写出
 	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(30), 3000, false), 2))
-	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(30), 3000, true), 3))
+	_ = w.WritePacket(withSeq(rtpContinuation(vp8Interframe(30), 3000, true), 3))
 	if w.Frames() != 2 {
 		t.Fatalf("完整的分片帧应写出，实际帧数 %d", w.Frames())
 	}
 
 	// seq=4、6（丢了 5）：残缺 → 必须丢弃
 	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(30), 6000, false), 4))
-	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(30), 6000, true), 6))
+	_ = w.WritePacket(withSeq(rtpContinuation(vp8Interframe(30), 6000, true), 6))
 	if w.Frames() != 2 {
 		t.Fatalf("残缺帧不应写出，实际帧数 %d", w.Frames())
 	}
@@ -347,4 +356,90 @@ func TestFFprobeAcceptsOgg(t *testing.T) {
 func withSeq(p *rtp.Packet, seq uint16) *rtp.Packet {
 	p.SequenceNumber = seq
 	return p
+}
+
+// TestIVFIgoresOrphanFragments 钉住线上真实成因：
+// 大帧被分片后，若**起始分片丢失**，剩下的中间残片仍然带 marker 位。
+// 早期实现按 marker 定帧，于是把 0xaa a3 b6... 这种帧中间数据当成整帧写出去，
+// 解码器报 "Invalid profile 5"。现在帧起点由 S 位决定，这类残片必须被丢弃。
+func TestIVFIgoresOrphanFragments(t *testing.T) {
+	var buf bytes.Buffer
+	w := &IVFWriter{w: &buf}
+
+	// 先来一个正常关键帧（让文件头/尺寸就位）
+	_ = w.WritePacket(withSeq(rtpPacket(vp8Keyframe(640, 360, 50), 0, true), 1))
+	if w.Frames() != 1 {
+		t.Fatalf("关键帧应写出，实际 %d", w.Frames())
+	}
+
+	// 只收到"中间残片"（S=0）并带 marker：绝不能当成一帧写出
+	for seq := uint16(2); seq <= 6; seq++ {
+		_ = w.WritePacket(withSeq(rtpContinuation(vp8Interframe(40), uint32(seq)*3000, true), seq))
+	}
+	if w.Frames() != 1 {
+		t.Fatalf("孤残片不应写出任何帧，实际帧数 %d（正是线上垃圾帧的成因）", w.Frames())
+	}
+	if w.OrphanFragments() != 5 {
+		t.Fatalf("应记录 5 个孤残片，实际 %d", w.OrphanFragments())
+	}
+
+	// 之后正常的完整帧仍应写出（录制能自愈）
+	_ = w.WritePacket(withSeq(rtpPacket(vp8Interframe(40), 21000, true), 7))
+	if w.Frames() != 2 {
+		t.Fatalf("恢复后应继续写出，实际帧数 %d", w.Frames())
+	}
+}
+
+// TestRealCaptureRegression 用**真实抓包的夹具**做回归。
+//
+// 为什么不用手造数据：手造的关键帧能过单元测试，却过不了真解码——
+// 这次的两个真实缺陷（帧中间残片被当成整帧、Ogg 收尾写出空包页）
+// 都只有真实数据才暴露得出来。夹具取自一次真实浏览器会话（testdata/）。
+//
+// 断言三件事：装配出的每一帧都是合法 VP8、没有残缺/孤残片造成的坏帧、
+// 且 ffmpeg 能**完整解码**重放结果（有解码错误就失败）。
+func TestRealCaptureRegression(t *testing.T) {
+	const dumpPath = "testdata/real-vp8-camera.rtp"
+	h, packets, _, err := ReadRawDump(dumpPath)
+	if err != nil {
+		t.Fatalf("读取夹具失败: %v", err)
+	}
+	if h.Codec != "VP8" || len(packets) == 0 {
+		t.Fatalf("夹具元信息异常: %+v", h)
+	}
+
+	out := filepath.Join(t.TempDir(), "replay.ivf")
+	stats, err := AnalyzeDump(dumpPath, out)
+	if err != nil {
+		t.Fatalf("重放失败: %v", err)
+	}
+	if stats.Written == 0 {
+		t.Fatalf("重放没有写出任何帧: %+v", stats)
+	}
+	// 装配后不应再有"关键帧却缺起始码"的坏帧——这正是修好的缺陷
+	if stats.KeyHeaderBad != 0 {
+		t.Fatalf("装配出的关键帧仍有 %d 个缺起始码（帧起点判断错了）", stats.KeyHeaderBad)
+	}
+	if stats.InterHeaderBad != 0 {
+		t.Fatalf("有 %d 个非关键帧首字节非法", stats.InterHeaderBad)
+	}
+
+	// 真实数据里必然存在"起始分片丢失、只剩中间残片"的包；它们必须被丢弃而不是写出
+	if stats.OrphanFragments == 0 {
+		t.Log("本次夹具里没有出现孤残片（不影响结论）")
+	}
+
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("未安装 ffmpeg，跳过完整解码校验")
+	}
+	cmd := exec.Command(ffmpeg, "-v", "error", "-i", out, "-f", "null", "-")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("ffmpeg 解码失败: %v\n%s", err, stderr.String())
+	}
+	if stderr.Len() > 0 {
+		t.Fatalf("ffmpeg 报告了解码错误（说明帧装配仍有问题）:\n%s", stderr.String())
+	}
 }

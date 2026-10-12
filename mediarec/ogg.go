@@ -96,8 +96,11 @@ func (o *oggWriter) Close() error {
 		o.writePageMulti(o.buf, o.granule, 0x04)
 		o.buf = o.buf[:0]
 	} else {
-		// 没有待写数据时也要发一个 EOS 页，播放器才知道流正常结束
-		o.writePage(nil, o.granule, 0x04)
+		// 没有待写数据时，发一个**不含任何段**的 EOS 页。
+		// 曾经这里写成 writePage(nil,...)，那会产生"一个长度为 0 的包"——
+		// 空包不是合法 Opus 包，ffmpeg 会直接报
+		// "Packet processing failed: Invalid data found"，整条流 demux 失败。
+		o.writePageMulti(nil, o.granule, 0x04)
 	}
 	return o.err
 }

@@ -40,20 +40,19 @@ type IVFWriter struct {
 	seenKeyframe bool
 	// inFrame 表示"当前正在累积一帧"（由 marker 位翻转为 false）
 	inFrame bool
-	// PTS 单调化：编码器重启（例如浏览器中途换分辨率）会让 RTP 时间戳基准重置，
-	// 直接原样写入会出现"时间戳倒退"，播放器/ffmpeg 会报 non monotonic dts 并丢帧。
-	// 这里保留原有的帧间隔节奏，只把倒退/异常跳变钳制成递增。
-	lastPTS   uint32
-	lastDelta uint32
-	havePTS   bool
-	// 序列号间隙检测：丢包意味着当前帧必然残缺。若把残缺帧直接写出，
-	// 播放器会在这一帧上报错，而且下一帧的数据会被拼进残缺帧里（表现为花屏）。
-	// 因此检测到不连续就标记本帧损坏，收齐 marker 时直接丢弃。
-	lastSeq     uint16
-	haveSeq     bool
-	frameBroken bool
-	corrupt     uint64 // 因丢包被丢弃的帧数（可观测）
-	clamped     uint64 // 因时间戳倒退/跳变被钳制的帧数（可观测）
+	// frameStart / frameParts：帧内**按序列号装配**的部件表。
+	//
+	// 为什么不能"按到达顺序追加"：真实链路上会重复（15 秒里 7 个）和乱序（2 个）到达，
+	// 顺序追加会把重复包算两次、把乱序包放到错误位置，整帧因此损坏——离线分析显示
+	// 6 个关键帧里有 4 个起始码被拼坏，这正是画面花屏与解码报错的来源。
+	frameStart      uint16
+	frameParts      map[uint16][]byte
+	corrupt         uint64 // 因缺包被丢弃的整帧数（可观测）
+	duplicates      uint64 // 帧内重复包数（可观测）
+	orphanFragments uint64 // 起始分片已丢、只剩中间残片而被丢弃的包数（可观测）
+	outOfOrder      uint64 // 时间戳倒退而被丢弃的整帧数（可观测）
+	lastPTS         uint32
+	havePTS         bool
 	// VP8 分片重组：一帧可能被拆成多个 RTP 包，靠 marker 位判断结束。
 	depay    codecs.VP8Packet
 	frameBuf []byte
@@ -85,28 +84,79 @@ func (v *IVFWriter) WritePacket(pkt *rtp.Packet) error {
 	// 帧边界用 RTP 的 marker 位判断，而不是 VP8 descriptor 的 S 位：
 	// S 只表示"分区的开始"，多分区编码一帧会有多个 S（会把一帧拆错），
 	// 而 marker 位就是 RTP 层的"这一帧到此结束"，语义唯一、可靠。
-	if v.haveSeq && pkt.SequenceNumber != v.lastSeq+1 {
-		v.frameBroken = true // 丢包：本帧残缺
-	}
-	v.lastSeq, v.haveSeq = pkt.SequenceNumber, true
-
-	if !v.inFrame {
-		v.frameBuf = v.frameBuf[:0]
+	// **帧的起点由描述符的 S 位决定，不是 marker**。
+	//
+	// 离线分析真实抓包后发现：浏览器把大帧分片成多个 RTP 包，而**分片丢失后，
+	// 剩下的中间分片仍然带 marker 位**。只按 marker 定帧，就会把"帧中间的残片"
+	// 当成完整帧写出去（表现为 0xaa a3 b6... 这种垃圾帧与 "Invalid profile 5"）。
+	// S=1 表示"这是分区的开始"=一帧的起点；S=0 说明它属于前面某一帧。
+	startFrame := func() {
 		v.frameTS = pkt.Timestamp
+		v.frameStart = pkt.SequenceNumber
 		v.inFrame = true
-		// 新帧重新判定：间隙若发生在**帧与帧之间**（上一帧已正常收尾），本帧是完整的
-		v.frameBroken = false
+		if v.frameParts == nil {
+			v.frameParts = make(map[uint16][]byte, 8)
+		}
+		for k := range v.frameParts {
+			delete(v.frameParts, k)
+		}
 	}
-	v.frameBuf = append(v.frameBuf, payload...)
+	switch {
+	case !v.inFrame:
+		if v.depay.S != 1 {
+			// 起始分片没收到，这只是一帧的中间残片：不能当成帧
+			v.orphanFragments++
+			return nil
+		}
+		startFrame()
+	case v.depay.S == 1:
+		// 上一帧还没等到 marker，新帧的起始包就到了 → 上一帧残缺，丢弃重开
+		v.corrupt++
+		startFrame()
+	}
+	if _, dup := v.frameParts[pkt.SequenceNumber]; dup {
+		v.duplicates++ // 重复包只保留一份（真实链路上 15 秒就有 7 个）
+	} else {
+		part := make([]byte, len(payload))
+		copy(part, payload)
+		v.frameParts[pkt.SequenceNumber] = part
+	}
 	if !pkt.Marker {
 		return nil // 这一帧还没收完
 	}
 	v.inFrame = false
-	if v.frameBroken {
-		v.corrupt++
-		v.frameBroken = false
-		return nil // 残缺帧不写：宁可少一帧，也不给播放器喂坏数据
+
+	// 按序列号顺序装配整帧；[帧起始序号..marker 序号] 区间内缺任何一个包，整帧丢弃。
+	// 之前的实现是"按到达顺序追加"，重复包会被算两次、乱序包会落到错误位置，
+	// 离线分析显示 6 个关键帧里有 4 个起始码被拼坏——这就是画面花屏/解码报错的来源。
+	v.frameBuf = v.frameBuf[:0]
+	complete := true
+	for seq := v.frameStart; ; seq++ {
+		part, ok := v.frameParts[seq]
+		if !ok {
+			complete = false
+			break
+		}
+		v.frameBuf = append(v.frameBuf, part...)
+		if seq == pkt.SequenceNumber {
+			break
+		}
 	}
+	if !complete {
+		v.corrupt++ // 缺包：宁可少一帧，也不给播放器喂残缺数据
+		return nil
+	}
+
+	// 时间戳倒退的整帧丢弃。
+	// 真实链路上会有帧起始包乱序到达（15 秒里 2 次），若照写会让 PTS 倒退，
+	// ffmpeg 报 "non monotonically increasing dts" 并可能丢帧。
+	// 这类帧内容虽完整，但保持时间线单调更重要——代价约 0.7%。
+	// 必须**严格**递增：相等也会被 ffmpeg 判为 non monotonic dts 并告警
+	if v.havePTS && v.frameTS <= v.lastPTS {
+		v.outOfOrder++
+		return nil
+	}
+	v.lastPTS, v.havePTS = v.frameTS, true
 
 	isKey := len(v.frameBuf) >= 10 && v.frameBuf[0]&0x01 == 0
 	if !v.seenKeyframe {
@@ -169,8 +219,14 @@ func (v *IVFWriter) Frames() uint32 { return v.frames }
 // CorruptFrames 返回因丢包被丢弃的残缺帧数（可观测，而不是悄悄丢）。
 func (v *IVFWriter) CorruptFrames() uint64 { return v.corrupt }
 
-// ClampedFrames 返回因时间戳异常被钳制的帧数（编码器重启/换分辨率时会增长）。
-func (v *IVFWriter) ClampedFrames() uint64 { return v.clamped }
+// DuplicatePackets 返回帧内被去重的重复包数（真实链路一定会出现）。
+func (v *IVFWriter) DuplicatePackets() uint64 { return v.duplicates }
+
+// OrphanFragments 返回"起始分片丢失、只剩中间残片"而被丢弃的包数。
+func (v *IVFWriter) OrphanFragments() uint64 { return v.orphanFragments }
+
+// OutOfOrderFrames 返回因时间戳倒退被丢弃的整帧数。
+func (v *IVFWriter) OutOfOrderFrames() uint64 { return v.outOfOrder }
 
 // Dimensions 返回解析出的分辨率（0,0 表示还没拿到关键帧）。
 func (v *IVFWriter) Dimensions() (uint16, uint16) { return v.width, v.height }

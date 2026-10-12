@@ -25,6 +25,23 @@ type Manager struct {
 	mu     sync.Mutex
 	active map[string]*Writer
 	closed bool
+	// rawDump 打开后，每条轨道额外落一份**原始 RTP 转储**（.rtp），
+	// 供离线分析/复盘使用。默认关闭：它会让磁盘占用翻倍。
+	rawDump bool
+}
+
+// EnableRawDump 打开原始 RTP 转储（调试/离线分析用）。
+func (m *Manager) EnableRawDump() {
+	m.mu.Lock()
+	m.rawDump = true
+	m.mu.Unlock()
+}
+
+// RawDumpEnabled 报告是否开启了原始转储。
+func (m *Manager) RawDumpEnabled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rawDump
 }
 
 // New 创建录制管理器；dir 不存在会自动创建。
@@ -68,6 +85,22 @@ func (m *Manager) Open(roomID, participantID, source string, c Codec) (*Writer, 
 		frames: make(chan *rtp.Packet, queueSize),
 		done:   make(chan struct{}),
 	}
+	// 原始转储（可选）：把每个包原样另存一份，供离线复盘录制缺陷
+	if m.rawDump {
+		kind := "video"
+		if strings.EqualFold(c.Name, "opus") {
+			kind = "audio"
+		}
+		d, derr := newRawDump(path+".rtp", rawDumpHeader{
+			Codec: c.Name, ClockRate: c.ClockRate, PayloadType: c.PayloadType, SSRC: c.SSRC,
+			Room: roomID, Participant: participantID, Source: source, Kind: kind,
+		})
+		if derr == nil {
+			w.dump = d
+		} else {
+			logf("原始转储创建失败: %v", derr)
+		}
+	}
 	switch {
 	case strings.EqualFold(c.Name, "VP8"):
 		w.ivf = &IVFWriter{w: f}
@@ -109,6 +142,7 @@ type Writer struct {
 	codec Codec
 	ivf   *IVFWriter
 	ogg   *oggWriter
+	dump  *rawDump
 
 	frames chan *rtp.Packet
 	done   chan struct{}
@@ -156,12 +190,18 @@ func (w *Writer) run() {
 			}
 		}
 		if w.ogg != nil {
-			w.ogg.Flush()
+			// 不在这里 Flush：让 Close 把最后一页（含待写包）作为 EOS 页写出去，
+			// 否则会落到"无待写数据"分支，历史上正是它产生了非法空包页。
 			if err := w.ogg.Close(); err != nil {
 				logf("录制收尾 Ogg 失败 file=%s: %v", filepath.Base(w.path), err)
 			}
 		}
 		_ = w.file.Close()
+		if w.dump != nil {
+			if err := w.dump.Close(); err != nil {
+				logf("原始转储收尾失败: %v", err)
+			}
+		}
 		frames, dropped, corrupt := uint64(0), w.dropped.Load(), uint64(0)
 		if w.ivf != nil {
 			frames = uint64(w.ivf.Frames())
@@ -170,16 +210,19 @@ func (w *Writer) run() {
 		if w.ogg != nil {
 			frames = w.written.Load()
 		}
-		clamped := uint64(0)
+		dup := uint64(0)
 		if w.ivf != nil {
-			clamped = w.ivf.ClampedFrames()
+			dup = w.ivf.DuplicatePackets()
 		}
-		logf("录制结束 file=%s 帧=%d 队列丢弃=%d 残缺丢弃=%d 时间戳钳制=%d 编码=%s",
-			filepath.Base(w.path), frames, dropped, corrupt, clamped, w.codec)
+		logf("录制结束 file=%s 帧=%d 队列丢弃=%d 缺包丢帧=%d 重复包去重=%d 编码=%s",
+			filepath.Base(w.path), frames, dropped, corrupt, dup, w.codec)
 	}()
 
 	for pkt := range w.frames {
 		var err error
+		if w.dump != nil {
+			w.dump.write(pkt) // 原始包先落盘，供离线复盘
+		}
 		switch {
 		case w.ivf != nil:
 			err = w.ivf.WritePacket(pkt)
