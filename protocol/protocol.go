@@ -12,6 +12,8 @@ package protocol
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 
 	// 引用 auth 是为了让 joined 能下发**服务端实际生效**的权限。
 	// 这不破坏本包"中立"的初衷：中立是为了避免循环依赖，而 auth 不引用任何内部包，
@@ -60,6 +62,11 @@ const (
 	// TypeRecord 由**主持人**发起：{action: start|stop}，服务端校验 roomAdmin 后
 	// 开始/结束一次录制会话，并向全房间广播 TypeRecordingState。
 	TypeRecord MsgType = "record"
+	// TypeWhiteboard 由**任何参会者**发起：{op:{kind, stroke}}。
+	// 服务端做校验/裁剪/编号后广播为 TypeWhiteboardOp，并把它记进房间状态。
+	TypeWhiteboard MsgType = "whiteboard"
+	// TypeWhiteboardOp 服务端广播一条被接受的白板操作：{op:{kind, stroke, by, seq}}
+	TypeWhiteboardOp MsgType = "whiteboard_op"
 	// TypeRecordingState 服务端广播：{recording:{active, sessionId, startedAt, startedBy, files}}
 	// 参会者据此显示"录制中"红点；入会快照 room.recording 也会带上它，
 	// 保证中途进来的人同样看得到。
@@ -118,6 +125,8 @@ type Message struct {
 	Action   string `json:"action,omitempty"`
 	// Recording 是录制状态载荷（record 的广播 / recording_state 消息）
 	Recording *RecordingState `json:"recording,omitempty"`
+	// Op 是白板操作载荷（whiteboard / whiteboard_op 用）
+	Op *WhiteboardOp `json:"op,omitempty"`
 	// Grants 是**服务端实际生效**的权限，随 joined 下发。
 	//
 	// 为什么必须由服务端下发：无鉴权模式（AUTH_MODE=off）下服务端给的是全权限 devGrants，
@@ -171,6 +180,113 @@ type TrackInfo struct {
 	Muted       bool   `json:"muted"`
 }
 
+// 白板操作类型。
+const (
+	WhiteboardStroke = "stroke" // 一笔（含橡皮，用 tool 区分）
+	WhiteboardClear  = "clear"  // 清空
+	WhiteboardUndo   = "undo"   // 撤销上一笔
+)
+
+// 白板工具（服务端只做白名单校验，不解释绘制语义）。
+var whiteboardTools = map[string]bool{
+	"pen": true, "eraser": true, "line": true, "rect": true, "ellipse": true,
+}
+
+// WhiteboardOp 是一条白板操作。
+type WhiteboardOp struct {
+	Kind   string  `json:"kind"`             // stroke | clear | undo
+	Stroke *Stroke `json:"stroke,omitempty"` // kind=stroke 时存在
+	// By/Seq 由**服务端**填写：参与者 ID 与房间内递增序号。
+	// 客户端提交时带的值一律被覆盖（不能自报身份，也不能自定顺序）。
+	By  string `json:"by,omitempty"`
+	Seq uint64 `json:"seq,omitempty"`
+}
+
+// Stroke 是一笔画。
+//
+// 坐标**归一化到 0..1**：参会者窗口大小各不相同，用设备像素会导致"我画的圆在别人那里变形"。
+// 归一化后前端按自己的画布尺寸缩放，任何人看到的图形比例都一致。
+type Stroke struct {
+	Tool   string       `json:"tool"`   // pen | eraser | line | rect | ellipse
+	Color  string       `json:"color"`  // #RRGGBB
+	Width  float64      `json:"width"`  // 1..64（归一化坐标下的千分之几，前端按宽度换算）
+	Points [][2]float64 `json:"points"` // [[x,y],...]，x/y ∈ [0,1]
+}
+
+// 白板上限：房间内存上限，也是给客户端的明确边界。
+const (
+	MaxWhiteboardOps       = 600 // 一个房间最多保留多少条操作
+	MaxWhiteboardPoints    = 400 // 单笔最多多少个点
+	MaxWhiteboardOpsPerSec = 30  // 单个连接每秒最多提交多少条（防刷屏）
+)
+
+// Sanitize 校验并**就地纠正**一条客户端提交的白板操作。
+//
+// 为什么在服务端做：客户端不可信——越界坐标会让别人的画布出现画面外的笔迹，
+// 超大 points 数组会拖垮所有人的渲染，而 By/Seq 更是必须由服务端填写。
+func (o *WhiteboardOp) Sanitize() error {
+	switch o.Kind {
+	case WhiteboardClear, WhiteboardUndo:
+		o.Stroke = nil
+		return nil
+	case WhiteboardStroke:
+	default:
+		return fmt.Errorf("未知的白板操作: %q", o.Kind)
+	}
+	s := o.Stroke
+	if s == nil {
+		return fmt.Errorf("stroke 操作缺少 stroke 载荷")
+	}
+	if !whiteboardTools[s.Tool] {
+		return fmt.Errorf("未知的画笔工具: %q", s.Tool)
+	}
+	if !validHexColor(s.Color) {
+		s.Color = "#ff4d4f" // 颜色非法就用默认色，不因此丢用户的一笔
+	}
+	if s.Width <= 0 {
+		s.Width = 3
+	}
+	if s.Width > 64 {
+		s.Width = 64
+	}
+	if len(s.Points) < 1 {
+		return fmt.Errorf("笔画没有点")
+	}
+	if len(s.Points) > MaxWhiteboardPoints {
+		return fmt.Errorf("笔画点数超限（%d > %d）", len(s.Points), MaxWhiteboardPoints)
+	}
+	// 坐标夹到 [0,1]；NaN/Inf 直接判非法（否则会污染整块画布的状态）
+	for i := range s.Points {
+		for j := 0; j < 2; j++ {
+			v := s.Points[i][j]
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return fmt.Errorf("笔画坐标非法")
+			}
+			if v < 0 {
+				v = 0
+			} else if v > 1 {
+				v = 1
+			}
+			s.Points[i][j] = v
+		}
+	}
+	return nil
+}
+
+func validHexColor(s string) bool {
+	if len(s) != 7 || s[0] != '#' {
+		return false
+	}
+	for _, c := range s[1:] {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // RecordingState 是录制状态（广播 + 入会快照都用它）。
 type RecordingState struct {
 	Active    bool   `json:"active"`
@@ -190,6 +306,9 @@ type RoomState struct {
 	// Hands 是已举手参与者的 ID 列表。举手是**状态**而不是瞬时事件，
 	// 因此进快照：新入会者据此也能看到谁举了手。
 	Hands []string `json:"hands,omitempty"`
+	// Whiteboard 是房间当前的白板内容。同样进快照：中途进来的人不该看到一块空白板
+	// （白板存的是操作序列而不是位图，所以这里能完整还原）。
+	Whiteboard []WhiteboardOp `json:"whiteboard,omitempty"`
 }
 
 // ---------- 数据通道消息（SCTP 数据面，与 WebSocket 信令分开）----------

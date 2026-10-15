@@ -108,6 +108,9 @@ func (h *Hub) dispatch(c *Client, msg *protocol.Message) {
 	case protocol.TypeRecord:
 		h.handleRecord(c, msg)
 
+	case protocol.TypeWhiteboard:
+		h.handleWhiteboard(c, msg)
+
 	case protocol.TypeHandState:
 		h.handleHandState(c, msg)
 
@@ -465,6 +468,51 @@ func (h *Hub) handleHandState(c *Client, msg *protocol.Message) {
 //  2. 踢人必须先把连接标记为"主动离开"再关闭——否则 Close 会走断线恢复分支，
 //     被踢的人反而能在宽限期内回到房间，那就成了笑话。
 //
+// handleWhiteboard 处理一条白板操作（**所有参会者**都可以画）。
+//
+// 三件服务端必须做的事：
+//  1. **校验与裁剪**：客户端不可信——越界坐标/超大点数组/非法颜色都在 Sanitize 里纠正或拒绝，
+//     By 与 Seq 由服务端填写（不能自报身份，也不能自定顺序）；
+//  2. **限速**：白板是高频小消息，挡住"按住不放刷满房间状态"；
+//  3. **记入房间状态**：这样中途进来的人能从 joined 快照完整还原画面。
+func (h *Hub) handleWhiteboard(c *Client, msg *protocol.Message) {
+	roomID, pid, _ := c.session()
+	if roomID == "" {
+		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
+		return
+	}
+	if !c.grants().CanPublishData {
+		c.fail(msg, protocol.ErrForbidden, "当前令牌无发布数据权限")
+		return
+	}
+	if msg.Op == nil {
+		c.fail(msg, protocol.ErrBadRequest, "缺少白板操作载荷")
+		return
+	}
+	if !c.allowWhiteboardOp() {
+		c.fail(msg, protocol.ErrBadRequest, "白板操作过于频繁")
+		return
+	}
+	op := *msg.Op
+	if err := op.Sanitize(); err != nil {
+		c.fail(msg, protocol.ErrBadRequest, "白板操作非法: "+err.Error())
+		return
+	}
+	room, ok := h.manager.Get(roomID)
+	if !ok {
+		c.fail(msg, protocol.ErrInternal, "房间不存在")
+		return
+	}
+	accepted, ok := room.AddWhiteboardOp(op, pid)
+	if !ok {
+		// 白板已满 / 无可撤销内容：明确告知，而不是静默丢弃
+		c.fail(msg, protocol.ErrBadRequest, "白板内容已达上限或没有可撤销的内容，可先清空")
+		return
+	}
+	// 广播给所有人（含提交者）：白板是共享状态，不做"仅他人"的差异化
+	room.Broadcast(&protocol.Message{Type: protocol.TypeWhiteboardOp, Op: &accepted}, "")
+}
+
 // handleRecord 是录制开关（仅主持人）。
 //
 // 设计上与 moderate 完全一致：**权限在服务端强制校验**，前端隐藏按钮只是体验。

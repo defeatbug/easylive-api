@@ -51,7 +51,10 @@ type Client struct {
 	once sync.Once
 
 	// mu 保护以下会话字段（由信令处理协程写、writePump/其他协程读）
-	mu            sync.RWMutex
+	mu sync.RWMutex
+	// 白板提交限速（固定窗口）：白板是高频小消息，必须挡住"按住不放刷满房间状态"。
+	wbWindow      time.Time
+	wbCount       int
 	roomID        string
 	participantID string
 	participant   *sfu.Participant
@@ -212,6 +215,18 @@ func (c *Client) grants() *auth.VideoGrant {
 	}
 	g := cl.Video
 	return &g
+}
+
+// allowWhiteboardOp 做每秒提交上限的固定窗口限速。
+func (c *Client) allowWhiteboardOp() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if now.Sub(c.wbWindow) >= time.Second {
+		c.wbWindow, c.wbCount = now, 0
+	}
+	c.wbCount++
+	return c.wbCount <= protocol.MaxWhiteboardOpsPerSec
 }
 
 // requireGrant 检查权限；不通过时已经回复了错误，调用方直接 return 即可。

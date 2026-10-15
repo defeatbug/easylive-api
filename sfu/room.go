@@ -296,6 +296,11 @@ type Room struct {
 	speakerStop chan struct{}
 	// hands 记录举手状态（ID → 是否举手）。进房间快照，新入会者也能看到谁举了手。
 	hands map[string]bool
+	// whiteboard 是房间当前的白板内容（按提交顺序的已校验操作）。
+	// 存"操作序列"而不是位图：数据小、可撤销、也能让中途进来的人完整还原画面。
+	whiteboard []protocol.WhiteboardOp
+	// whiteboardSeq 是白板操作的房间内递增序号（客户端不能自定顺序）
+	whiteboardSeq uint64
 }
 
 func newRoom(id string, m *Manager) *Room {
@@ -765,6 +770,7 @@ func (r *Room) State() *protocol.RoomState {
 	for _, t := range r.tracks {
 		state.Tracks = append(state.Tracks, t.Info())
 	}
+	state.Whiteboard = append([]protocol.WhiteboardOp(nil), r.whiteboard...)
 	for id := range r.hands {
 		state.Hands = append(state.Hands, id)
 	}
@@ -845,6 +851,47 @@ func (r *Room) OnReaction(fromID, emoji string) {
 //
 // 与表情相反，举手是**状态**：必须可靠、断线恢复后仍在、新入会者要能看到，
 // 所以它落在房间状态里（进 RoomState.Hands）并通过信令广播。
+// AddWhiteboardOp 把一条**已校验**的操作记入房间并返回带序号的副本。
+//
+// 上限处理：到达 MaxWhiteboardOps 时拒绝新操作（而不是丢弃最旧的）——
+// 丢弃最旧会让画面莫名少一块，比"告诉用户白板满了"更糟。
+func (r *Room) AddWhiteboardOp(op protocol.WhiteboardOp, by string) (protocol.WhiteboardOp, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch op.Kind {
+	case protocol.WhiteboardUndo:
+		if len(r.whiteboard) == 0 {
+			return op, false // 没东西可撤：不广播空操作
+		}
+		r.whiteboard = r.whiteboard[:len(r.whiteboard)-1]
+		// 撤销也要带序号广播，客户端据此做同样的裁剪
+		r.whiteboardSeq++
+		return protocol.WhiteboardOp{Kind: protocol.WhiteboardUndo, By: by, Seq: r.whiteboardSeq}, true
+	case protocol.WhiteboardClear:
+		if len(r.whiteboard) == 0 {
+			return op, false
+		}
+		r.whiteboard = r.whiteboard[:0]
+		r.whiteboardSeq++
+		return protocol.WhiteboardOp{Kind: protocol.WhiteboardClear, By: by, Seq: r.whiteboardSeq}, true
+	default:
+		if len(r.whiteboard) >= protocol.MaxWhiteboardOps {
+			return op, false
+		}
+		op.By, op.Seq = by, r.whiteboardSeq+1
+		r.whiteboardSeq++
+		r.whiteboard = append(r.whiteboard, op)
+		return op, true
+	}
+}
+
+// WhiteboardState 返回房间当前白板内容（快照）。
+func (r *Room) WhiteboardState() []protocol.WhiteboardOp {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]protocol.WhiteboardOp(nil), r.whiteboard...)
+}
+
 func (r *Room) SetHand(participantID string, raised bool) {
 	r.mu.Lock()
 	if raised {
