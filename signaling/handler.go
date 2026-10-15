@@ -105,6 +105,9 @@ func (h *Hub) dispatch(c *Client, msg *protocol.Message) {
 	case protocol.TypeModerate:
 		h.handleModerate(c, msg)
 
+	case protocol.TypeRecord:
+		h.handleRecord(c, msg)
+
 	case protocol.TypeHandState:
 		h.handleHandState(c, msg)
 
@@ -190,6 +193,9 @@ func (h *Hub) handleJoin(c *Client, msg *protocol.Message) {
 		ParticipantID: pid,
 		ResumeToken:   token,
 		Room:          room.State(),
+		// 把**服务端生效的权限**随 joined 下发（无鉴权模式是 devGrants 全权限）。
+		// 前端据此显示/隐藏主持人功能；只从令牌推断会与无鉴权模式不一致。
+		Grants: c.grants(),
 	})
 }
 
@@ -224,6 +230,7 @@ func (h *Hub) tryResume(c *Client, msg *protocol.Message, claims *auth.Claims) b
 		Resumed:       true,
 		ResumeToken:   msg.ResumeToken,
 		Room:          room.State(),
+		Grants:        c.grants(),
 	})
 	return true
 }
@@ -457,6 +464,47 @@ func (h *Hub) handleHandState(c *Client, msg *protocol.Message) {
 //  1. 权限在服务端强制校验（roomAdmin），前端隐藏按钮只是体验；
 //  2. 踢人必须先把连接标记为"主动离开"再关闭——否则 Close 会走断线恢复分支，
 //     被踢的人反而能在宽限期内回到房间，那就成了笑话。
+//
+// handleRecord 是录制开关（仅主持人）。
+//
+// 设计上与 moderate 完全一致：**权限在服务端强制校验**，前端隐藏按钮只是体验。
+// 录制是"转发即录制"（零转码），所以启停都是即时的：
+// 开始 = 给房间里**已经在发布**的轨道挂上写入器；停止 = 摘掉并收尾清单。
+func (h *Hub) handleRecord(c *Client, msg *protocol.Message) {
+	roomID, pid, _ := c.session()
+	if roomID == "" {
+		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
+		return
+	}
+	if !c.requireGrant(msg, c.grants().RoomAdmin, "录制操作") {
+		return
+	}
+
+	switch msg.Action {
+	case protocol.ActionRecordStart:
+		if _, err := h.manager.StartRecording(roomID, pid); err != nil {
+			c.fail(msg, protocol.ErrInternal, "开始录制失败: "+err.Error())
+			return
+		}
+		log.Printf("signaling: 录制开始 room=%s by=%s", roomID, pid)
+	case protocol.ActionRecordStop:
+		if sess := h.manager.StopRecording(); sess != nil {
+			log.Printf("signaling: 录制结束 room=%s by=%s session=%s 文件=%d", roomID, pid, sess.ID, len(sess.Files))
+		}
+	default:
+		c.fail(msg, protocol.ErrBadRequest, "未知的录制动作: "+msg.Action)
+		return
+	}
+
+	// 广播给**所有人**（含操作者自己）：红点是所有人都该看到的房间状态，
+	// 不是操作者的私人反馈。
+	st := h.manager.RecordingState()
+	if room, ok := h.manager.Get(roomID); ok {
+		room.Broadcast(&protocol.Message{Type: protocol.TypeRecordingState, Recording: st, TargetID: msg.TargetID}, "")
+	}
+	c.reply(msg, &protocol.Message{Type: protocol.TypeRecord, Action: msg.Action, Recording: st})
+}
+
 func (h *Hub) handleModerate(c *Client, msg *protocol.Message) {
 	roomID, pid, _ := c.session()
 	if roomID == "" {

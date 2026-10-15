@@ -25,6 +25,10 @@ type Manager struct {
 	mu     sync.Mutex
 	active map[string]*Writer
 	closed bool
+	// session/sessionDir：当前录制会话（见 session.go）。为空时说明没在录，
+	// 此时 Open 仍可写文件（用于启动即录的旧行为），只是不登记到清单里。
+	session    *Session
+	sessionDir string
 	// rawDump 打开后，每条轨道额外落一份**原始 RTP 转储**（.rtp），
 	// 供离线分析/复盘使用。默认关闭：它会让磁盘占用翻倍。
 	rawDump bool
@@ -69,22 +73,39 @@ func (m *Manager) Open(roomID, participantID, source string, c Codec) (*Writer, 
 	if m.closed {
 		return nil, fmt.Errorf("录制已停止")
 	}
+	dir := m.dir
+	if m.sessionDir != "" {
+		dir = m.sessionDir
+	}
+	// 同一会话里按毫秒区分，避免同名参与者多次发布会话内重名覆盖
 	name := fmt.Sprintf("%s-%s-%s-%s.%s",
-		time.Now().Format("20060102-150405"),
+		time.Now().Format("150405.000"),
 		sanitize(roomID), sanitize(participantID), sanitize(source), ext(c.Name))
-	path := filepath.Join(m.dir, name)
+	path := filepath.Join(dir, name)
 
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, fmt.Errorf("创建录制文件失败: %w", err)
 	}
-	w := &Writer{
-		path:   path,
-		file:   f,
-		codec:  c,
-		frames: make(chan *rtp.Packet, queueSize),
-		done:   make(chan struct{}),
+	kind := "video"
+	if strings.EqualFold(c.Name, "opus") {
+		kind = "audio"
 	}
+	w := &Writer{
+		path:      path,
+		file:      f,
+		codec:     c,
+		frames:    make(chan *rtp.Packet, queueSize),
+		done:      make(chan struct{}),
+		clockRate: c.ClockRate,
+		onClosed: func(frames, dropped, corrupt uint64, dur time.Duration) {
+			m.updateFile(name, frames, dropped, corrupt, dur)
+		},
+	}
+	m.registerFileLocked(FileInfo{
+		Name: name, Kind: kind, Source: source, Participant: participantID,
+		FfmpegHint: muxHint(&FileInfo{Name: name, Kind: kind}),
+	})
 	// 原始转储（可选）：把每个包原样另存一份，供离线复盘录制缺陷
 	if m.rawDump {
 		kind := "video"
@@ -115,6 +136,10 @@ func (m *Manager) Open(roomID, participantID, source string, c Codec) (*Writer, 
 
 // CloseAll 结束所有录制（服务退出或录制被关闭时调用）。
 func (m *Manager) CloseAll() {
+	// 先正常收尾当前会话（写清单、回填统计），再关掉残余写入器
+	if m.Recording() {
+		m.StopSession()
+	}
 	m.mu.Lock()
 	m.closed = true
 	writers := make([]*Writer, 0, len(m.active))
@@ -152,6 +177,15 @@ type Writer struct {
 
 	dropped atomic.Uint64
 	written atomic.Uint64
+
+	// 时长统计：用 RTP 时间戳的跨度换算，不需要额外解码
+	clockRate uint32
+	firstTS   uint32
+	lastTS    uint32
+	haveTS    bool
+
+	// onClosed 在文件收尾后被调用，用于把真实统计刷进会话清单
+	onClosed func(frames, dropped, corrupt uint64, dur time.Duration)
 }
 
 // Write 把包交给后台写协程。**永不阻塞**：队列满时丢包并计数。
@@ -214,12 +248,23 @@ func (w *Writer) run() {
 		if w.ivf != nil {
 			dup = w.ivf.DuplicatePackets()
 		}
-		logf("录制结束 file=%s 帧=%d 队列丢弃=%d 缺包丢帧=%d 重复包去重=%d 编码=%s",
-			filepath.Base(w.path), frames, dropped, corrupt, dup, w.codec)
+		var dur time.Duration
+		if w.haveTS && w.clockRate > 0 {
+			dur = time.Duration(float64(w.lastTS-w.firstTS)/float64(w.clockRate)*1000) * time.Millisecond
+		}
+		logf("录制结束 file=%s 帧=%d 队列丢弃=%d 缺包丢帧=%d 重复包去重=%d 时长=%s 编码=%s",
+			filepath.Base(w.path), frames, dropped, corrupt, dup, dur.Round(time.Millisecond), w.codec)
+		if w.onClosed != nil {
+			w.onClosed(frames, dropped, corrupt, dur)
+		}
 	}()
 
 	for pkt := range w.frames {
 		var err error
+		if !w.haveTS {
+			w.firstTS, w.haveTS = pkt.Timestamp, true
+		}
+		w.lastTS = pkt.Timestamp
 		if w.dump != nil {
 			w.dump.write(pkt) // 原始包先落盘，供离线复盘
 		}

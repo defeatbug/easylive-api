@@ -10,7 +10,14 @@
 //  3. 会话与连接解耦：sessionId 由服务端下发，重连后仍可恢复（见 M4）。
 package protocol
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	// 引用 auth 是为了让 joined 能下发**服务端实际生效**的权限。
+	// 这不破坏本包"中立"的初衷：中立是为了避免循环依赖，而 auth 不引用任何内部包，
+	// 依赖方向是单向的（protocol ← signaling/auth）。权限形状本身就是线上协议的一部分。
+	"easylive-api/auth"
+)
 
 type MsgType string
 
@@ -50,6 +57,13 @@ const (
 	TypePong             MsgType = "pong"               // {}
 	TypeForceMute        MsgType = "force_mute"         // {muted}  服务端下发给被强制静音的参与者
 	TypeError            MsgType = "error"              // {code, reason, id?}
+	// TypeRecord 由**主持人**发起：{action: start|stop}，服务端校验 roomAdmin 后
+	// 开始/结束一次录制会话，并向全房间广播 TypeRecordingState。
+	TypeRecord MsgType = "record"
+	// TypeRecordingState 服务端广播：{recording:{active, sessionId, startedAt, startedBy, files}}
+	// 参会者据此显示"录制中"红点；入会快照 room.recording 也会带上它，
+	// 保证中途进来的人同样看得到。
+	TypeRecordingState MsgType = "recording_state"
 )
 
 // 媒体连接目标：发布者连接 或 订阅者连接（每个参与者各持一条，避免重复协商/glare）
@@ -102,6 +116,14 @@ type Message struct {
 	// TargetID / Action 用于主持人管理（moderate）
 	TargetID string `json:"targetId,omitempty"`
 	Action   string `json:"action,omitempty"`
+	// Recording 是录制状态载荷（record 的广播 / recording_state 消息）
+	Recording *RecordingState `json:"recording,omitempty"`
+	// Grants 是**服务端实际生效**的权限，随 joined 下发。
+	//
+	// 为什么必须由服务端下发：无鉴权模式（AUTH_MODE=off）下服务端给的是全权限 devGrants，
+	// 而前端无法从"没有令牌"推断出这一点——于是服务端允许的操作（例如主持人录制）
+	// 在界面上被藏掉。让服务端把生效权限说清楚，界面就不必猜。
+	Grants *auth.VideoGrant `json:"grants,omitempty"`
 	// Source 声明本次 publish 协商新增媒体的来源：camera / screen / microphone。
 	// 说明：浏览器不允许自定义 MediaStream id（msid），因此无法只靠 SDP 区分摄像头与屏幕，
 	// 这里用"本次协商声明的来源"来标注；更严谨的做法是自定义 RTP 头扩展（可作为后续工作）。
@@ -149,10 +171,22 @@ type TrackInfo struct {
 	Muted       bool   `json:"muted"`
 }
 
+// RecordingState 是录制状态（广播 + 入会快照都用它）。
+type RecordingState struct {
+	Active    bool   `json:"active"`
+	SessionID string `json:"sessionId,omitempty"`
+	StartedAt int64  `json:"startedAt,omitempty"`
+	StartedBy string `json:"startedBy,omitempty"`
+	// Files 是当前会话已登记的文件数（"录了几路"），便于前端显示
+	Files int `json:"files,omitempty"`
+}
+
 type RoomState struct {
-	RoomID       string       `json:"roomId"`
-	Participants []*PeerInfo  `json:"participants"`
-	Tracks       []*TrackInfo `json:"tracks"`
+	// Recording 指示当前房间是否正在录制（入会快照携带，中途进来的也能看到红点）
+	Recording    *RecordingState `json:"recording,omitempty"`
+	RoomID       string          `json:"roomId"`
+	Participants []*PeerInfo     `json:"participants"`
+	Tracks       []*TrackInfo    `json:"tracks"`
 	// Hands 是已举手参与者的 ID 列表。举手是**状态**而不是瞬时事件，
 	// 因此进快照：新入会者据此也能看到谁举了手。
 	Hands []string `json:"hands,omitempty"`
@@ -205,8 +239,12 @@ const (
 
 // 主持人管理动作
 const (
-	ActionMute = "mute" // 强制静音某人（服务端停止转发其音频）
-	ActionKick = "kick" // 移出房间
+	// 强制静音某人（服务端停止转发其音频）
+	ActionMute = "mute"
+	// 录制动作（与 moderate 复用同一个 action 字段，避免再加一层结构）
+	ActionRecordStart = "start"
+	ActionRecordStop  = "stop"
+	ActionKick        = "kick" // 移出房间
 )
 
 func New(t MsgType) *Message { return &Message{Type: t} }

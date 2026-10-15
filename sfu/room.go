@@ -46,6 +46,114 @@ func (m *Manager) Recording() *mediarec.Manager {
 	return m.recorder
 }
 
+// ---------- 运行时录制控制（主持人触发）----------
+
+// ErrRecordingDisabled 表示服务端没有开启录制能力。
+var ErrRecordingDisabled = fmt.Errorf("服务端未开启录制（RECORD_ENABLED=false）")
+
+// StartRecording 开始录制一个房间。
+//
+// 关键点：**已经在发布的轨道也要挂上**——主持人是会中才点录制的，
+// 那时候摄像头/麦克风早就在推流了，只给"之后发布的轨道"挂写入器会漏掉所有人的画面。
+func (m *Manager) StartRecording(roomID, startedBy string) (*mediarec.Session, error) {
+	rec := m.Recording()
+	if rec == nil {
+		return nil, ErrRecordingDisabled
+	}
+	if rec.Recording() {
+		return rec.CurrentSession(), nil // 已在录：幂等
+	}
+	sess, err := rec.StartSession(roomID, startedBy)
+	if err != nil {
+		return nil, err
+	}
+	if r, ok := m.Get(roomID); ok {
+		r.attachRecorders()
+	}
+	return sess, nil
+}
+
+// StopRecording 结束当前录制并返回会话（没有在录时返回 nil）。
+func (m *Manager) StopRecording() *mediarec.Session {
+	// 先把房间里的写入器摘掉，再收会话：让每条轨道在清单落盘前完成收尾
+	m.mu.RLock()
+	rooms := make([]*Room, 0, len(m.rooms))
+	for _, r := range m.rooms {
+		rooms = append(rooms, r)
+	}
+	m.mu.RUnlock()
+	for _, r := range rooms {
+		r.detachRecorders()
+	}
+	if rec := m.Recording(); rec != nil {
+		return rec.StopSession()
+	}
+	return nil
+}
+
+// RecordingSession 返回当前录制会话（没有则 nil）。
+func (m *Manager) RecordingSession() *mediarec.Session {
+	if rec := m.Recording(); rec != nil {
+		return rec.CurrentSession()
+	}
+	return nil
+}
+
+// attachRecorders 给房间里已经在发布的每条轨道挂上录制写入器。
+func (r *Room) attachRecorders() {
+	rec := r.manager.Recording()
+	if rec == nil {
+		return
+	}
+	r.mu.RLock()
+	tracks := make([]*PublishedTrack, 0, len(r.tracks))
+	for _, t := range r.tracks {
+		tracks = append(tracks, t)
+	}
+	r.mu.RUnlock()
+	for _, t := range tracks {
+		if t.recording() {
+			continue
+		}
+		codec := mediarec.Codec{
+			Name: "VP8", ClockRate: 90000,
+			PayloadType: uint8(t.remote.PayloadType()), SSRC: uint32(t.remote.SSRC()),
+		}
+		if t.info.Kind == protocol.KindAudio {
+			codec = mediarec.Codec{
+				Name: "opus", ClockRate: 48000,
+				PayloadType: uint8(t.remote.PayloadType()), SSRC: uint32(t.remote.SSRC()),
+			}
+		}
+		w, err := rec.Open(r.ID, t.info.PublisherID, t.info.Source, codec)
+		if err != nil {
+			log.Printf("sfu: 中途开始录制时挂载轨道失败 track=%s: %v", t.info.ID, err)
+			continue
+		}
+		t.attachRecorder(w)
+		// 主动索要一个关键帧：录制器要等第一个关键帧才开始写文件，
+		// 不请求的话"开始录制"之后可能好几秒里文件都是 0 字节（真人实测踩到过）。
+		// 这与"新订阅者上线要回 PLI"是同一个道理。
+		t.RequestKeyframe()
+		log.Printf("sfu: 录制已挂载 track=%s（中途开始）→ %s", t.info.ID, w.Path())
+	}
+}
+
+// detachRecorders 摘掉并关闭房间里所有轨道的录制写入器。
+func (r *Room) detachRecorders() {
+	r.mu.RLock()
+	tracks := make([]*PublishedTrack, 0, len(r.tracks))
+	for _, t := range r.tracks {
+		tracks = append(tracks, t)
+	}
+	r.mu.RUnlock()
+	for _, t := range tracks {
+		if w := t.detachRecorder(); w != nil {
+			_ = w.Close()
+		}
+	}
+}
+
 // NewManager 创建房间管理器。resumeGrace 是断线后保留参与者身份的宽限期（0 表示立即离会）。
 func NewManager(engine *Engine, maxParticipants int, resumeGrace time.Duration) *Manager {
 	return &Manager{
@@ -95,6 +203,31 @@ func (m *Manager) remove(roomID string) {
 	n := len(m.rooms)
 	m.mu.Unlock()
 	log.Printf("sfu: 回收空房间 room=%s（当前房间数 %d）", roomID, n)
+
+	// 房间没了就没人可录：自动收尾当前会话。
+	// 必须放在解锁之后——StopRecording 自己也要拿 m.mu，锁内调用会死锁。
+	if rec := m.Recording(); rec != nil && rec.Recording() {
+		if sess := rec.CurrentSession(); sess != nil && sess.RoomID == roomID {
+			m.StopRecording()
+			log.Printf("sfu: 房间回收，录制会话已自动收尾 room=%s session=%s", roomID, sess.ID)
+		}
+	}
+}
+
+// RecordingState 把录制会话映射成给客户端的录制状态（信令层广播与入会快照都用它）。
+func (m *Manager) RecordingState() *protocol.RecordingState {
+	rec := m.Recording()
+	if rec == nil || !rec.Recording() {
+		return &protocol.RecordingState{Active: false}
+	}
+	sess := rec.CurrentSession()
+	if sess == nil {
+		return &protocol.RecordingState{Active: false}
+	}
+	return &protocol.RecordingState{
+		Active: true, SessionID: sess.ID,
+		StartedAt: sess.StartedAt.UnixMilli(), StartedBy: sess.StartedBy, Files: len(sess.Files),
+	}
 }
 
 // RoomSnapshot 是单个房间的轻量快照（供采样器与观测使用）。
@@ -622,6 +755,9 @@ func (r *Room) State() *protocol.RoomState {
 		RoomID:       r.ID,
 		Participants: make([]*protocol.PeerInfo, 0, len(r.participants)),
 		Tracks:       make([]*protocol.TrackInfo, 0, len(r.tracks)),
+		// 带上录制状态：中途入会的人也要能立刻看到"录制中"红点，
+		// 而不是等到下一次广播（否则"有人在录我"这件事对新来者不可见）
+		Recording: r.manager.RecordingState(),
 	}
 	for _, p := range r.participants {
 		state.Participants = append(state.Participants, p.Info())

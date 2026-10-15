@@ -53,6 +53,14 @@ type IVFWriter struct {
 	outOfOrder      uint64 // 时间戳倒退而被丢弃的整帧数（可观测）
 	lastPTS         uint32
 	havePTS         bool
+	// baseTS 是**第一个真正写出的帧**的 RTP 时间戳；写入的 PTS 一律减去它，从 0 起算。
+	//
+	// 为什么必须归零：RTP 时间戳是随机的 32 位值（实测约 1.09e9），IVF 时间基是 1/90000，
+	// 于是 PTS 约 3.6 小时；再转封装成 WebM/MP4（毫秒时间基）会**溢出**，
+	// 表现为合流后时长为 9223372036854 这种垃圾值。归零只改起点、不改帧间隔，
+	// 所以节奏与总时长都不受影响。
+	baseTS   uint32
+	haveBase bool
 	// VP8 分片重组：一帧可能被拆成多个 RTP 包，靠 marker 位判断结束。
 	depay    codecs.VP8Packet
 	frameBuf []byte
@@ -67,8 +75,14 @@ func (v *IVFWriter) header(w io.Writer) error {
 	copy(hdr[8:12], "VP80")                     // fourcc
 	binary.LittleEndian.PutUint16(hdr[12:14], v.width)
 	binary.LittleEndian.PutUint16(hdr[14:16], v.height)
-	binary.LittleEndian.PutUint32(hdr[16:20], 1)     // timebase numerator
-	binary.LittleEndian.PutUint32(hdr[20:24], 90000) // timebase denominator（RTP 时钟）
+	// IVF 头的 rate/scale 决定每个时间刻度多长：timebase = scale/rate 秒。
+	// 我们的 PTS 直接用 RTP 的 90kHz 时间戳，所以必须写成 rate=90000、scale=1（timebase=1/90000）。
+	//
+	// 曾经写反（rate=1、scale=90000），后果很隐蔽：ffprobe 报 r_frame_rate=1/90000，
+	// 单轨转封装成 WebM 后时长会变成 720000 秒这种垃圾值（8 帧 × 90000 秒）；
+	// 而**合流**时会重新计时，看起来反而正常。是靠实测转封装链路才抓出来的。
+	binary.LittleEndian.PutUint32(hdr[16:20], 90000) // rate
+	binary.LittleEndian.PutUint32(hdr[20:24], 1)     // scale
 	binary.LittleEndian.PutUint32(hdr[24:28], 0)     // frame count（先占位）
 	binary.LittleEndian.PutUint32(hdr[28:32], 0)     // unused
 	_, err := w.Write(hdr)
@@ -180,9 +194,12 @@ func (v *IVFWriter) WritePacket(pkt *rtp.Packet) error {
 	// 需要先把一条轨道的原始 RTP 落盘做离线分析，弄清浏览器侧时间戳的真实推进方式。
 	// 当前行为：原样写入 RTP 的 90kHz 时间戳。
 	ts := v.frameTS
+	if !v.haveBase {
+		v.baseTS, v.haveBase = ts, true
+	}
 	rec := make([]byte, 12)
 	binary.LittleEndian.PutUint32(rec[0:4], uint32(len(v.frameBuf)))
-	binary.LittleEndian.PutUint64(rec[4:12], uint64(ts))
+	binary.LittleEndian.PutUint64(rec[4:12], uint64(ts-v.baseTS))
 	if _, err := v.w.Write(rec); err != nil {
 		return err
 	}

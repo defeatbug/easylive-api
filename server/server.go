@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"fmt"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -234,6 +235,62 @@ func (s *Server) build() *fiber.App {
 			"externalTurn":     len(cfg.ExternalTurnURLs) > 0,
 			"credentialScheme": "turn-rest-api", // coturn --use-auth-secret（外部 TURN 用静态凭证）
 		})
+	})
+
+	// ---- 录制：会话列表与文件下载 ----
+	//
+	// 录制文件就是会议的音视频内容，属于敏感数据，所以访问控制与 /token 一致：
+	// 非 development 环境必须带 X-API-Key（复用同一个运维密钥，少一个配置项）。
+	recordKeyOK := func(c *fiber.Ctx) bool {
+		if cfg.AppEnv == "development" || cfg.TokenAPIKey == "" {
+			return true // 开发环境或未配置密钥时不拦（与 /token 的既有行为保持一致）
+		}
+		return c.Get("X-API-Key") == cfg.TokenAPIKey
+	}
+
+	router.Get("/recordings", func(c *fiber.Ctx) error {
+		if !recordKeyOK(c) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "X-API-Key 无效"})
+		}
+		rec := s.manager.Recording()
+		if rec == nil {
+			// 没开启录制能力：明确返回 enabled=false，前端据此隐藏入口而不是报错
+			return c.JSON(fiber.Map{
+				"enabled":   false,
+				"recording": fiber.Map{"active": false},
+				"sessions":  []any{},
+			})
+		}
+		sessions, err := rec.ListSessions()
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{
+			"enabled":   true,
+			"recording": s.manager.RecordingState(),
+			"sessions":  sessions,
+			"dir":       rec.Dir(),
+		})
+	})
+
+	router.Get("/recordings/:session/:file", func(c *fiber.Ctx) error {
+		if !recordKeyOK(c) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "X-API-Key 无效"})
+		}
+		rec := s.manager.Recording()
+		if rec == nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "服务端未开启录制"})
+		}
+		// 路径穿越防护：只用白名单字符，并拒绝 ..
+		path, ok := rec.SessionPath(c.Params("session"), c.Params("file"))
+		if !ok {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "非法文件名"})
+		}
+		if _, err := os.Stat(path); err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "文件不存在"})
+		}
+		c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("attachment; filename=%q", c.Params("file")))
+		return c.SendFile(path)
 	})
 
 	// ---- 媒体信令入口：<basePath>/ws ----

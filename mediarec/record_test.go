@@ -87,8 +87,14 @@ func TestIVFHeaderAndFrames(t *testing.T) {
 	if string(raw[8:12]) != "VP80" {
 		t.Fatalf("fourcc 应为 VP80，实际 %q", raw[8:12])
 	}
-	if got := binary.LittleEndian.Uint32(raw[20:24]); got != 90000 {
-		t.Fatalf("时间基分母应为 90000（RTP 时钟），实际 %d", got)
+	// rate/scale 决定时间基：timebase = scale/rate = 1/90000（与 RTP 的 90kHz 时钟一致）。
+	// 曾经写反成 rate=1/scale=90000，后果是转封装后时长变成 720000 秒这种垃圾值
+	// （8 帧 × 90000 秒），所以两个字段都钉住。
+	if got := binary.LittleEndian.Uint32(raw[16:20]); got != 90000 {
+		t.Fatalf("IVF rate 应为 90000，实际 %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(raw[20:24]); got != 1 {
+		t.Fatalf("IVF scale 应为 1，实际 %d", got)
 	}
 	if got := binary.LittleEndian.Uint16(raw[12:14]); got != 640 {
 		t.Fatalf("头部宽度应为 640，实际 %d", got)
@@ -98,8 +104,14 @@ func TestIVFHeaderAndFrames(t *testing.T) {
 	if got := binary.LittleEndian.Uint32(raw[32:36]); got != uint32(len(vp8Keyframe(640, 360, 30))) {
 		t.Fatalf("第一帧长度记录不正确: %d", got)
 	}
-	if got := binary.LittleEndian.Uint64(raw[36:44]); got != 9000 {
-		t.Fatalf("第一帧时间戳应为 9000，实际 %d", got)
+	// PTS 从 0 起算（见 IVFWriter.baseTS 的注释：原始 RTP 时间戳会让转封装溢出）
+	if got := binary.LittleEndian.Uint64(raw[36:44]); got != 0 {
+		t.Fatalf("第一帧 PTS 应为 0，实际 %d", got)
+	}
+	// 第二帧的 PTS 应等于两帧 RTP 时间戳之差（帧间隔必须原样保留）
+	second := 32 + 12 + len(vp8Keyframe(640, 360, 30))
+	if got := binary.LittleEndian.Uint64(raw[second+4 : second+12]); got != 9000 {
+		t.Fatalf("第二帧 PTS 应为 9000（保持帧间隔），实际 %d", got)
 	}
 }
 
