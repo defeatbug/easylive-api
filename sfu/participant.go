@@ -46,6 +46,11 @@ type Participant struct {
 	identity string
 	// canPublishData 来自令牌的 canPublishData：数据通道消息（表情/举手）受它约束
 	canPublishData bool
+	// avatarURL 是解析出来的头像地址（展示用，失败为空）。
+	// 用 sync.Once 惰性解析：无论"身份何时写入、房间快照何时构建"都能拿到，
+	// 而缓存保证每次广播快照不会都去查一次数据库。
+	avatarURL  string
+	avatarOnce sync.Once
 	// state 见 protocol.StateActive / StateReconnecting
 	state string
 	// resumeToken 在入会时生成，断线重连时凭它恢复同一身份。
@@ -116,12 +121,31 @@ func (p *Participant) SetResumeToken(t string) {
 
 func (p *Participant) Info() *protocol.PeerInfo {
 	return &protocol.PeerInfo{
-		ID:       p.ID,
-		Name:     p.Name,
-		Identity: p.Identity(),
-		JoinedAt: p.JoinedAt,
-		State:    p.State(),
+		ID:        p.ID,
+		Name:      p.Name,
+		Identity:  p.Identity(),
+		JoinedAt:  p.JoinedAt,
+		State:     p.State(),
+		AvatarURL: p.avatar(),
 	}
+}
+
+// avatar 返回该参与者的头像地址（惰性解析并缓存一次）。
+//
+// 为什么不用"在 SetIdentity 里解析"：那样依赖"先设身份、后建快照"这个顺序，
+// 一旦顺序变了（比如参与者先入房、身份稍后写入），头像就会静默为空。
+// 惰性 + Once 让顺序不再重要，代价是第一次调用时查一次库。
+func (p *Participant) avatar() string {
+	// **身份为空时绝不能缓存**：入会早期快照可能在写入身份之前就调用过这里，
+	// sync.Once 会把"空身份 → 空头像"永久记住，之后即使身份写好了也再不会解析。
+	// 这个坑很隐蔽：日志、接口、数据库全都正常，只有会议室里头像不显示。
+	if p.Identity() == "" {
+		return ""
+	}
+	p.avatarOnce.Do(func() {
+		p.avatarURL = resolveAvatar(p.Identity())
+	})
+	return p.avatarURL
 }
 
 // Identity 返回令牌身份。
@@ -518,6 +542,9 @@ func (p *Participant) PublishedTracks() []*PublishedTrack {
 	return out
 }
 
+// maxFlashTextRunes 是弹幕文字的字符上限（超出截断，不丢弃）。
+const maxFlashTextRunes = 60
+
 // handleDataMessage 处理数据通道上的消息。
 //
 // 分流原则：**瞬时事件走数据面中继，状态变更走信令广播**。
@@ -541,7 +568,18 @@ func (p *Participant) handleDataMessage(data []byte) {
 		if m.Emoji == "" || len([]rune(m.Emoji)) > 4 {
 			return // 防御：不允许超长"表情"变成刷屏载荷
 		}
-		p.room.OnReaction(p.ID, m.Emoji)
+		// 弹幕文字：**截断而不是丢弃**——用户打了一长句，不该整个消失。
+		text := m.Text
+		if r := []rune(text); len(r) > maxFlashTextRunes {
+			text = string(r[:maxFlashTextRunes])
+		}
+		// 只认识两种 kind：空（表情浮层）与 action（互动动效）。未知值归零，
+		// 免得客户端随便塞个字符串就造出前端不认识的分支。
+		kind := m.Kind
+		if kind != "" && kind != protocol.ReactionKindAction {
+			kind = ""
+		}
+		p.room.OnReaction(p.ID, m.Emoji, text, kind)
 	case protocol.DataRaiseHand:
 		if m.Raised == nil {
 			return

@@ -838,11 +838,22 @@ func (r *Room) ForceMute(participantID string, muted bool) int {
 //
 // 服务端不保存表情：它是瞬时事件，丢了无所谓，属于数据面语义。
 // 之所以走数据通道而不是信令，是因为表情可能很频繁，塞进信令会挤占重连快照、心跳这些关键消息。
-func (r *Room) OnReaction(fromID, emoji string) {
+func (r *Room) OnReaction(fromID, emoji, text, kind string) {
+	// 发送者名字同样由服务端填：弹幕要显示"谁说的"，
+	// 让客户端自报名字等于允许任何人冒充别人发言。
+	fromName := ""
+	r.mu.RLock()
+	if p := r.participants[fromID]; p != nil {
+		fromName = p.Name
+	}
+	r.mu.RUnlock()
 	payload, err := json.Marshal(&protocol.DataMessage{
-		Type:   protocol.DataReaction,
-		Emoji:  emoji,
-		FromID: fromID, // 身份由服务端填，客户端无法伪造
+		Type:     protocol.DataReaction,
+		Emoji:    emoji,
+		Text:     text,
+		Kind:     kind,
+		FromID:   fromID, // 身份由服务端填，客户端无法伪造
+		FromName: fromName,
 	})
 	if err != nil {
 		return

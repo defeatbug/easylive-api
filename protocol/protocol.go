@@ -170,6 +170,9 @@ type PeerInfo struct {
 	JoinedAt int64  `json:"joinedAt"`
 	// State 见 StateActive / StateReconnecting；空值等价于 active（兼容旧客户端）。
 	State string `json:"state,omitempty"`
+	// AvatarURL 是该参与者的头像地址；为空表示没设置头像，前端回落成首字母。
+	// 由**服务端**按令牌身份查库填充，客户端无法自报——否则任何人都能挂别人的头像。
+	AvatarURL string `json:"avatarUrl,omitempty"`
 }
 
 type TrackInfo struct {
@@ -317,8 +320,18 @@ type RoomState struct {
 // 数据通道是**数据面**——低延迟、瞬时事件（表情、举手意图）丢了也无所谓。
 // 二者混用会让重连快照、心跳这些关键消息被表情淹没。
 const (
-	DataReaction  = "reaction"   // {emoji}
+	DataReaction = "reaction" // {emoji, text?, kind?}
+	// DataReaction 的两种用法：
+	//   · 只带 emoji            → 原来的表情浮层（有人在角落里冒个表情）
+	//   · emoji + text          → **弹幕**：底栏上方滚一条"谁：说了什么"
+	//   · kind="action"         → **互动**：小红花之类从底栏往上弹一下
+	// 都走 DataReaction 而不是各开一种类型：它们的载荷形状一样、频率特征一样
+	// （瞬时、可丢），多开类型只会让中继与限流各写一遍。
 	DataRaiseHand = "raise_hand" // {raised}
+
+	// ReactionKindAction 表示这条 reaction 是**互动动效**（小红花之类的底部弹起），
+	// 而不是角落里的表情浮层。空串等价于普通表情。
+	ReactionKindAction = "action"
 )
 
 // DataMessage 是数据通道上的消息（与信令 Message 结构无关，单独一套）。
@@ -326,6 +339,14 @@ type DataMessage struct {
 	Type   string `json:"type"`
 	Emoji  string `json:"emoji,omitempty"`
 	Raised *bool  `json:"raised,omitempty"`
+	// Text 是表情附带的一句话（弹幕用）。服务端会截断到 60 字**而不是丢弃**：
+	// 用户的输入不该因为超长就整个消失，截断是更友好的降级。
+	Text string `json:"text,omitempty"`
+	// Kind 区分"表情浮层"与"互动动效"：空 = 表情，action = 互动（小红花等）。
+	Kind string `json:"kind,omitempty"`
+	// FromName 由服务端在中继时填（和 FromID 一样，客户端无法伪造）。
+	// 弹幕要显示"谁发的"，而名字必须是**服务端认定的那个**，否则任何人都能冒充别人发言。
+	FromName string `json:"fromName,omitempty"`
 	// FromID 由服务端在**中继时**填充：客户端不需要（也不应该）自己声明身份。
 	FromID string `json:"fromId,omitempty"`
 }

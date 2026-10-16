@@ -66,8 +66,8 @@ func userJSON(u *store.User) fiber.Map {
 		"displayName": u.DisplayName,
 		"role":        u.Role,
 	}
-	if u.AvatarUpdatedAt != nil {
-		out["avatarUrl"] = "/auth/avatar/" + strconv.FormatInt(u.ID, 10) + "?v=" + strconv.FormatInt(u.AvatarUpdatedAt.Unix(), 10)
+	if url := avatarURLFor(u); url != "" {
+		out["avatarUrl"] = url
 	}
 	return out
 }
@@ -288,4 +288,16 @@ func (s *Server) handleRegister(c *fiber.Ctx) error {
 	}
 	log.Printf("server: 注册成功 user=%s role=member ip=%s（注册即登录）", u.Username, c.IP())
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"user": userJSON(u)})
+}
+
+// avatarURLFor 生成头像地址；没设置头像时返回空串。
+//
+// 抽出来是因为它有两处用法：HTTP 接口的响应，以及**会议内**参与者的头像
+// （服务端按令牌身份查库后填进 PeerInfo）。两处必须完全一致，
+// 否则会出现"个人资料里有头像、会议里却没有"这种不一致。
+func avatarURLFor(u *store.User) string {
+	if u == nil || u.AvatarUpdatedAt == nil {
+		return ""
+	}
+	return "/auth/avatar/" + strconv.FormatInt(u.ID, 10) + "?v=" + strconv.FormatInt(u.AvatarUpdatedAt.Unix(), 10)
 }

@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/signal"
@@ -42,6 +43,26 @@ type Server struct {
 }
 
 func New(cfg *config.Config, manager *sfu.Manager, hub *signaling.Hub, st *store.Store) *Server {
+	// 会议内的头像：把"按身份查头像地址"的能力注入 sfu。
+	// sfu 不认识数据库，依赖方向必须是 server → sfu（见 sfu/avatar.go 的说明）。
+	if st != nil {
+		sfu.SetAvatarResolver(func(identity string) string {
+			u, err := st.UserByUsername(context.Background(), identity)
+			if err != nil {
+				// 查不到就没有头像，前端回落首字母——不是错误，但要看得出"查过但没查到"
+				log.Printf("server: 头像解析 identity=%q 查不到用户: %v", identity, err)
+				return ""
+			}
+			url := avatarURLFor(u)
+			if url == "" {
+				log.Printf("server: 头像解析 identity=%q 用户存在但未设置头像", identity)
+			} else {
+				log.Printf("server: 头像解析 identity=%q → %s", identity, url)
+			}
+			return url
+		})
+	}
+
 	s := &Server{cfg: cfg, hub: hub, manager: manager, st: st, started: time.Now()}
 	s.app = s.build()
 	return s
