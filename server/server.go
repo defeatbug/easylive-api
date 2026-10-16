@@ -77,9 +77,12 @@ func (s *Server) build() *fiber.App {
 		Output:     os.Stdout,
 	}))
 	app.Use(cors.New(cors.Config{
-		AllowOrigins:     strings.Join(cfg.WebOrigins, ","),
-		AllowMethods:     "GET, POST, OPTIONS",
-		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
+		AllowOrigins: strings.Join(cfg.WebOrigins, ","),
+		// 账号资料接口用到 PATCH（改资料）与 DELETE（移除头像）：
+		// 漏掉它们时前端走同源反代没问题，但任何直连后端的调用都会在预检处被挡下。
+		AllowMethods: "GET, POST, PATCH, DELETE, OPTIONS",
+		// X-API-Key 供评测脚本/运维直连 /token 与 /recordings 使用（服务端到服务端）。
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-API-Key",
 		AllowCredentials: true,
 		MaxAge:           86400,
 	}))
