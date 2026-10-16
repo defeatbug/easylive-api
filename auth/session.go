@@ -23,11 +23,16 @@ var ErrBadSession = errors.New("会话无效或已过期")
 //     对毕设的演示规模够用；要支持"强制下线"就得加会话表并存储随机 ID。
 //     这一取舍写在这里，避免以后有人误以为登出等于吊销。
 //
-// 结构：base64url(userID|expUnix|HMAC-SHA256(userID|expUnix))。
+// 结构：base64url(userID|sessionVersion|expUnix|HMAC-SHA256(前面三段))。
+//
 // 权限**不放进 Cookie**：角色每次请求都从数据库读，改一下用户角色立刻生效，
 // 也避免"Cookie 里写着 host 就永远是 host"这种越权。
-func SignSession(secret []byte, userID int64, exp time.Time) string {
-	payload := fmt.Sprintf("%d|%d", userID, exp.Unix())
+//
+// sessionVersion 是"同一账号只允许一处在线"的开关：登录成功会把库里的版本 +1，
+// 于是**之前签发的所有会话 Cookie 立即失效**（版本对不上）。签名方案本身没法吊销会话，
+// 这个自增版本就是一个不需要会话表的最小吊销机制。
+func SignSession(secret []byte, userID, sessionVersion int64, exp time.Time) string {
+	payload := fmt.Sprintf("%d|%d|%d", userID, sessionVersion, exp.Unix())
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(payload))
 	sig := mac.Sum(nil)
@@ -35,39 +40,44 @@ func SignSession(secret []byte, userID int64, exp time.Time) string {
 		base64.RawURLEncoding.EncodeToString(sig)
 }
 
-// VerifySession 校验签名与有效期，返回用户 ID。
-func VerifySession(secret []byte, value string, now time.Time) (int64, error) {
+// VerifySession 校验签名与有效期，返回用户 ID 与会话版本。
+// 调用方必须再拿版本和数据库里的当前版本比对，否则"旧会话失效"不会生效。
+func VerifySession(secret []byte, value string, now time.Time) (int64, int64, error) {
 	dot := strings.LastIndex(value, ".")
 	if dot <= 0 {
-		return 0, ErrBadSession
+		return 0, 0, ErrBadSession
 	}
 	payloadRaw, err := base64.RawURLEncoding.DecodeString(value[:dot])
 	if err != nil {
-		return 0, ErrBadSession
+		return 0, 0, ErrBadSession
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(value[dot+1:])
 	if err != nil {
-		return 0, ErrBadSession
+		return 0, 0, ErrBadSession
 	}
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(payloadRaw)
 	if !hmac.Equal(sig, mac.Sum(nil)) {
-		return 0, ErrBadSession
+		return 0, 0, ErrBadSession
 	}
 	parts := strings.Split(string(payloadRaw), "|")
-	if len(parts) != 2 {
-		return 0, ErrBadSession
+	if len(parts) != 3 {
+		return 0, 0, ErrBadSession
 	}
 	userID, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		return 0, ErrBadSession
+		return 0, 0, ErrBadSession
 	}
-	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	version, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		return 0, ErrBadSession
+		return 0, 0, ErrBadSession
+	}
+	exp, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return 0, 0, ErrBadSession
 	}
 	if now.After(time.Unix(exp, 0)) {
-		return 0, ErrBadSession
+		return 0, 0, ErrBadSession
 	}
-	return userID, nil
+	return userID, version, nil
 }

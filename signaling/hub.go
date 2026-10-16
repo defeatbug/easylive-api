@@ -177,6 +177,33 @@ func (h *Hub) Unregister(c *Client) {
 	}
 }
 
+// KickIdentity 关闭某个身份的所有在线连接，返回被断开的数量。
+//
+// "同一账号只允许一处在线"需要两步：会话版本让旧 Cookie 失效（auth 层），
+// 而**已经连上的 WebSocket 不会自己断开**——旧设备会继续开会、继续推流。
+// 登录成功时调用它，才算真正把旧设备请下线。
+func (h *Hub) KickIdentity(identity, exceptSessionID string) int {
+	if identity == "" {
+		return 0
+	}
+	h.mu.RLock()
+	targets := make([]*Client, 0, 2)
+	for id, c := range h.clients {
+		if id == exceptSessionID {
+			continue
+		}
+		if who := c.identity(); who != "" && who == identity {
+			targets = append(targets, c)
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range targets {
+		c.fail(nil, "session_replaced", "该账号已在其他地方登录，当前连接已断开")
+		c.Close()
+	}
+	return len(targets)
+}
+
 func (h *Hub) Count() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

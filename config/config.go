@@ -59,6 +59,8 @@ type Config struct {
 	SessionSecret string
 	// SessionTTL 是登录会话有效期。
 	SessionTTL time.Duration
+	// SignupEnabled 是否开放自助注册（默认关闭）。
+	SignupEnabled bool
 	// AdminUsername/AdminPassword 用于**引导**第一个主持人账号（仅当该用户不存在时创建）。
 	// 它是"第一次怎么进门"的答案：没有它，启用鉴权后没有任何账号能登录。
 	AdminUsername string
@@ -132,6 +134,9 @@ func Load() *Config {
 		RecordEnabled:       getBool("RECORD_ENABLED", false),
 		SessionSecret:       sessionSecret(getStr("SESSION_SECRET", ""), getStr("JWT_SECRET", "")),
 		SessionTTL:          getDuration("SESSION_TTL", 12*time.Hour),
+		// 默认**不开放**自助注册：开放注册意味着任何人都能建账号，
+		// 应当由部署方明确打开（SIGNUP_ENABLED=true）。
+		SignupEnabled:       getBool("SIGNUP_ENABLED", false),
 		AdminUsername:       getStr("ADMIN_USERNAME", ""),
 		AdminPassword:       getStr("ADMIN_PASSWORD", ""),
 		RecordDir:           getStr("RECORD_DIR", "recordings"),

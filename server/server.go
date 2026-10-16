@@ -77,12 +77,9 @@ func (s *Server) build() *fiber.App {
 		Output:     os.Stdout,
 	}))
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: strings.Join(cfg.WebOrigins, ","),
-		// 账号资料接口用到 PATCH（改资料）与 DELETE（移除头像）：
-		// 漏掉它们时前端走同源反代没问题，但任何直连后端的调用都会在预检处被挡下。
-		AllowMethods: "GET, POST, PATCH, DELETE, OPTIONS",
-		// X-API-Key 供评测脚本/运维直连 /token 与 /recordings 使用（服务端到服务端）。
-		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-API-Key",
+		AllowOrigins:     strings.Join(cfg.WebOrigins, ","),
+		AllowMethods:     "GET, POST, OPTIONS",
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
 		AllowCredentials: true,
 		MaxAge:           86400,
 	}))
@@ -286,6 +283,10 @@ func (s *Server) build() *fiber.App {
 	router.Post("/auth/login", s.handleLogin)
 	router.Post("/auth/logout", s.handleLogout)
 	router.Get("/auth/me", s.handleMe)
+	// 部署能力：前端据此决定要不要显示注册入口
+	router.Get("/auth/capabilities", s.handleCapabilities)
+	// 自助注册（是否开放由 SIGNUP_ENABLED 决定；注册出来的账号一律是 member）
+	router.Post("/auth/register", s.handleRegister)
 	// 账号资料：改昵称/用户名、改密码、头像。全部要求当前口令或已登录会话。
 	router.Patch("/auth/profile", s.handleUpdateProfile)
 	router.Post("/auth/password", s.handleChangePassword)

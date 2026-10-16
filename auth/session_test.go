@@ -10,13 +10,17 @@ import (
 func TestSessionRoundTrip(t *testing.T) {
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	exp := time.Now().Add(time.Hour)
-	v := SignSession(secret, 42, exp)
-	uid, err := VerifySession(secret, v, time.Now())
+	v := SignSession(secret, 42, 3, exp)
+	uid, ver, err := VerifySession(secret, v, time.Now())
 	if err != nil {
 		t.Fatalf("校验失败: %v", err)
 	}
 	if uid != 42 {
 		t.Fatalf("用户 ID 不符，实际 %d", uid)
+	}
+	// 版本必须一并带回来：调用方要靠它和数据库比对，才能让旧会话失效
+	if ver != 3 {
+		t.Fatalf("会话版本不符，实际 %d", ver)
 	}
 }
 
@@ -26,30 +30,30 @@ func TestSessionRoundTrip(t *testing.T) {
 func TestSessionRejectsTamperAndExpiry(t *testing.T) {
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	other := []byte("ffffffffffffffffffffffffffffffff")
-	v := SignSession(secret, 7, time.Now().Add(time.Hour))
+	v := SignSession(secret, 7, 1, time.Now().Add(time.Hour))
 
 	// 1) 换密钥（等价于伪造签名）
-	if _, err := VerifySession(other, v, time.Now()); err == nil {
+	if _, _, err := VerifySession(other, v, time.Now()); err == nil {
 		t.Fatal("密钥不符应当拒绝")
 	}
 	// 2) 改载荷（把用户 ID 改大）
 	parts := strings.SplitN(v, ".", 2)
-	forged := SignSession(secret, 999, time.Now().Add(time.Hour))
-	if _, err := VerifySession(secret, forged, time.Now()); err != nil {
+	forged := SignSession(secret, 999, 9, time.Now().Add(time.Hour))
+	if _, _, err := VerifySession(secret, forged, time.Now()); err != nil {
 		t.Fatalf("同样密钥签发的合法会话不应失败: %v", err)
 	}
 	tampered := strings.Replace(v, parts[0], parts[0][:len(parts[0])-2]+"AA", 1)
-	if _, err := VerifySession(secret, tampered, time.Now()); err == nil {
+	if _, _, err := VerifySession(secret, tampered, time.Now()); err == nil {
 		t.Fatal("篡改载荷应当拒绝")
 	}
 	// 3) 过期
-	old := SignSession(secret, 7, time.Now().Add(-time.Minute))
-	if _, err := VerifySession(secret, old, time.Now()); err == nil {
+	old := SignSession(secret, 7, 1, time.Now().Add(-time.Minute))
+	if _, _, err := VerifySession(secret, old, time.Now()); err == nil {
 		t.Fatal("过期会话应当拒绝")
 	}
 	// 4) 垃圾输入不能 panic
 	for _, bad := range []string{"", ".", "abc", "abc.", ".def", strings.Repeat("A", 500)} {
-		if _, err := VerifySession(secret, bad, time.Now()); err == nil {
+		if _, _, err := VerifySession(secret, bad, time.Now()); err == nil {
 			t.Fatalf("垃圾输入 %q 应当拒绝", bad)
 		}
 	}
@@ -92,4 +96,23 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestSessionVersionIsCarried 版本号必须原样带回来。
+//
+// "同一账号只允许一处在线"完全依赖这一点：登录会把库里的版本 +1，
+// 调用方拿 Cookie 里的版本与库里的比对，不一致就当作未登录。
+// 如果签名/解析过程中把版本弄丢或算错，这个机制就静默失效了。
+func TestSessionVersionIsCarried(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	for _, want := range []int64{1, 2, 99, 1 << 40} {
+		v := SignSession(secret, 7, want, time.Now().Add(time.Hour))
+		_, got, err := VerifySession(secret, v, time.Now())
+		if err != nil {
+			t.Fatalf("校验失败: %v", err)
+		}
+		if got != want {
+			t.Fatalf("版本应原样带回：want=%d got=%d", want, got)
+		}
+	}
 }

@@ -211,6 +211,17 @@ func (c *Client) setClaims(cl *auth.Claims) {
 }
 
 // grants 返回本连接的权限集合。
+// identity 返回该连接的令牌身份（未鉴权模式或未带令牌时为空串）。
+func (c *Client) identity() string {
+	c.mu.RLock()
+	cl := c.claims
+	c.mu.RUnlock()
+	if cl == nil {
+		return ""
+	}
+	return cl.Identity()
+}
+
 func (c *Client) grants() *auth.VideoGrant {
 	c.mu.RLock()
 	cl := c.claims

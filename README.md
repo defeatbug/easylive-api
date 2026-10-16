@@ -211,9 +211,14 @@ DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/sfu_dev?sslmode=disabl
 - **准入与权限（Token）**：签发 JWT（HS256），载荷参照 LiveKit 的 `VideoGrant`：
   `roomJoin` / `room` / `canPublish` / `canSubscribe` / `canPublishData` / `roomAdmin`。
   `AUTH_MODE` 三态（`off` / `optional` / `required`，默认 `off` 以便本地演示开箱可用）；
-  `POST /token` 发放令牌（非 `development` 环境必须带 `X-API-Key`，生产应替换为自有登录鉴权）。
+  `POST /token` 发放令牌（非 `development` 环境必须带 `X-API-Key`，用于脚本/运维直连）。
   **身份以令牌的 `sub` 为准**，启用鉴权后客户端自报昵称不可信；`publish` / `subscribe` / `chat` /
   数据面消息逐条校验权限——前端隐藏按钮只是体验，不是安全边界。
+- **账号体系**：`POST /auth/login` 用户名+口令登录（argon2id 存哈希，HttpOnly 签名 Cookie 会话），
+  `GET /auth/me` 恢复登录态，`POST /auth/logout` 退出；账号资料（昵称/用户名/密码/头像）见
+  `docs/auth-api.md`。第一个主持人账号由 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 在启动时引导；
+  其余账号可自助注册（`ALLOW_SIGNUP`，默认仅 `development` 开放）或直接写 `users` 表。
+  **新注册账号一律是 `member`**——角色只由服务端判定，接口不接受客户端指定。
 - **主持人管理（`moderate`）**：需要 `roomAdmin` 权限。
   - `mute` → `Room.ForceMute`：服务端**停止转发**该参与者的音频轨。SFU 不解析媒体，
     "不转发"才是真正让对方听不见的做法，同时省下行带宽；被静音者会收到 `force_mute` 以更新 UI。

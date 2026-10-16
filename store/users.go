@@ -23,6 +23,8 @@ type User struct {
 	// 注意**不把头像字节放进这个结构**：User 会在每次请求里被读取（角色要实时），
 	// 顺手带上几百 KB 的图片会让每个请求都白搬一次数据。字节只在头像路由里取。
 	AvatarUpdatedAt *time.Time
+	// SessionVersion 每次登录/注册自增：旧会话 Cookie 里带的版本会对不上而失效。
+	SessionVersion int64
 }
 
 // 为什么 users 表走 pgx 原生查询而不是 Ent/sqlc：
@@ -37,11 +39,11 @@ func hashForStore(password string) (string, error) { return auth.HashPassword(pa
 // ErrUserNotFound 表示用户名不存在。
 var ErrUserNotFound = errors.New("用户不存在")
 
-const userCols = `id, username, display_name, password_hash, role, disabled, avatar_updated_at`
+const userCols = `id, username, display_name, password_hash, role, disabled, avatar_updated_at, session_version`
 
 func scanUser(row pgx.Row) (*User, error) {
 	var u User
-	if err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.Role, &u.Disabled, &u.AvatarUpdatedAt); err != nil {
+	if err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.Role, &u.Disabled, &u.AvatarUpdatedAt, &u.SessionVersion); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
 		}
@@ -183,4 +185,23 @@ func (s *Store) Avatar(ctx context.Context, id int64) (string, []byte, time.Time
 		return "", nil, time.Time{}, ErrUserNotFound
 	}
 	return *mime, data, *at, nil
+}
+
+// BumpSessionVersion 把会话版本 +1 并返回新值。
+//
+// 每次登录/注册都调用它：之前签发的所有会话 Cookie 立刻失效，
+// 从而实现"同一账号只允许一处在线"。用数据库自增而不是应用内存计数，
+// 是为了多实例部署时也成立。
+func (s *Store) BumpSessionVersion(ctx context.Context, id int64) (int64, error) {
+	if s.Pool == nil {
+		return 0, errors.New("数据层不可用")
+	}
+	var version int64
+	err := s.Pool.QueryRow(ctx,
+		`UPDATE users SET session_version = session_version + 1, updated_at = now()
+		 WHERE id = $1 RETURNING session_version`, id).Scan(&version)
+	if err != nil {
+		return 0, fmt.Errorf("更新会话版本失败: %w", err)
+	}
+	return version, nil
 }
