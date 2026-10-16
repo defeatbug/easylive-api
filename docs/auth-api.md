@@ -1,0 +1,109 @@
+# 登录与令牌接口契约（前端对接用）
+
+> 这份文档是**前后端的唯一约定**。前端只需要这三条登录接口 + 一条令牌接口，
+> 不需要、也不应该接触任何签名密钥。
+
+## 0. 一句话流程
+
+```
+① 用户填用户名/密码 → POST /auth/login         （服务端下发 HttpOnly 会话 Cookie）
+② 入会前            → POST /token {roomId}     （服务端按会话签发**房间级**令牌）
+③ 用令牌连 WebSocket → ws /ws 消息 join{roomId, displayName, token}
+④ 需要判断"我是谁/能不能当主持人" → GET /auth/me
+⑤ 退出登录          → POST /auth/logout
+```
+
+**会话 Cookie 是 HttpOnly 的**：浏览器 JS 读不到，也不要试图读。
+所有请求都必须带 Cookie —— 用 `fetch` 时加 `credentials: 'include'`
+（同源直接调时可以省略，但显式写上更稳妥）。
+
+---
+
+## 1. POST /auth/login
+
+请求：
+
+```json
+{ "username": "teacher", "password": "……" }
+```
+
+成功 `200`：
+
+```json
+{
+  "user": { "id": 1, "username": "teacher", "displayName": "teacher", "role": "host" },
+  "expiresAt": 1792175428240
+}
+```
+
+同时 `Set-Cookie: easylive_session=…; HttpOnly; Path=/; SameSite=Lax`（生产环境带 `Secure`）。
+
+失败：
+
+| 状态 | 含义 | 界面建议 |
+|---|---|---|
+| `400` | `username`/`password` 为空或请求体不是 JSON | 提示补全 |
+| `401` | 用户名或密码错误（**刻意不区分两者**，避免枚举账号） | 提示"用户名或密码错误" |
+| `403` | 账号已停用 | 提示联系管理员 |
+| `429` | 尝试过于频繁（同一 IP+用户名 每分钟 10 次） | 提示稍后再试 |
+| `501` | 服务端未启用鉴权（`AUTH_MODE=off`）—— 此时**不需要登录**，直接入会 | 隐藏/跳过登录页 |
+| `503` | 数据层不可用（未配数据库） | 提示服务暂不可用 |
+
+## 2. GET /auth/me
+
+已登录 `200`：`{ "user": { …同上… } }`；未登录 `401`：`{ "error": "未登录" }`。
+
+用途：刷新页面后恢复登录态；据此决定"显示昵称还是登录按钮"。
+**不要**用 `role` 在前端做安全判断——真正的判定在服务端，前端只用来决定界面。
+
+## 3. POST /auth/logout
+
+`204`，并清除 Cookie。
+
+⚠️ 语义说明：这是**签名 Cookie** 方案，登出只是让浏览器丢弃 Cookie，
+服务端无法单方面吊销某个会话（要支持"强制下线"需要引入会话表）。
+
+## 4. POST /token
+
+请求：`{ "roomId": "…" }`（已登录时 `identity`/`name`/`roomAdmin` **会被忽略**）
+
+成功 `200`：
+
+```json
+{
+  "token": "eyJ…",
+  "identity": "teacher",
+  "roomId": "r1",
+  "expiresAt": 1792175428240,
+  "video": { "roomJoin": true, "room": "r1", "canPublish": true, "canSubscribe": true,
+             "canPublishData": true, "roomAdmin": true }
+}
+```
+
+**主持人权限由服务端按账号角色判定**：`role=host` 才会得到 `roomAdmin: true`。
+前端**不要**在请求体里传 `roomAdmin`（传了也不生效），更不要自己伪造权限位。
+
+失败：`401`（无会话且无运维密钥）、`403`（服务端未配置密钥）、`501`（未启用鉴权，无需令牌）。
+注意：`501` 是**正常状态**——此时前端应继续以"无令牌"方式入会，而不是报错。
+把它和 `401/403` 区分开，是本项目踩过的坑（以前一律当成"无需令牌"，导致有鉴权时
+用户进入一个没权限、也没有任何提示的会议）。
+
+## 5. 运维/脚本路径（前端不要用）
+
+`POST /token` 与 `GET /recordings`、`/graphql` 在非 development 环境下也接受
+`X-API-Key: <TOKEN_API_KEY>`。这是给评测脚本与运维用的**服务端到服务端**凭据，
+**绝不能**放进浏览器（那就等于把令牌签发权公开）。
+
+## 6. 启用登录需要哪些环境变量
+
+| 变量 | 说明 |
+|---|---|
+| `AUTH_MODE=required` | 打开鉴权（非开发环境未设置时会**默认按 required**） |
+| `JWT_SECRET` | 令牌密钥；同时作为会话密钥的兜底（≥16 字符，否则**拒绝启动**） |
+| `SESSION_SECRET` | 可选：单独指定会话签名密钥 |
+| `SESSION_TTL` | 会话有效期，默认 `12h` |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | **引导第一个主持人账号**（仅当该用户名不存在时创建；绝不覆盖已有口令） |
+| `DATABASE_URL` | 数据库（`users` 表在 `migrations/004_users.sql`） |
+
+首次启动后即可用该账号登录；之后再要加人，直接在 `users` 表插一行
+（`password_hash` 用 argon2id，`role` 取 `host` 或 `member`）。

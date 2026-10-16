@@ -18,6 +18,15 @@ import (
 // sqlcOwnedTables 是由 sqlc 负责、**故意不在 Ent 里定义**的表。
 // 混合方案的边界写在 store.go 的包注释里，这里用代码再钉一遍：
 // 出现在迁移里却不属于 Ent 的表，必须是显式登记的 sqlc 表。
+// pgxOwnedTables 是"由 store 直接用 pgx 读写、**故意**不经过 Ent/sqlc 代码生成"的表。
+//
+// 目前只有 users：登录路径一共三条查询（按名取、按 ID 取、插入），
+// 为它跑一轮 codegen 不值得。项目真正的铁律是"同一张表只有一个写者"，
+// 这一点没有让步——users 表的写入只发生在 store/users.go。
+var pgxOwnedTables = map[string]bool{
+	"users": true,
+}
+
 var sqlcOwnedTables = map[string]bool{
 	// 指标时序表：高写入 + 强聚合，由 sqlc 用显式 SQL 处理（下一步接入）
 	"metric_samples": true,
@@ -105,7 +114,7 @@ func TestMigrationMatchesEntSchema(t *testing.T) {
 
 	// 方向二：迁移有、Ent 没有 → 要么漏写 schema，要么是废弃列没清理
 	for table, cols := range fromSQL {
-		if sqlcOwnedTables[table] {
+		if sqlcOwnedTables[table] || pgxOwnedTables[table] {
 			continue // 该表由 sqlc 负责，故意不在 Ent 里
 		}
 		entCols, ok := fromEnt[table]

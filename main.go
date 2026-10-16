@@ -101,6 +101,24 @@ func main() {
 				log.Printf("main: 自动迁移失败（业务接口可能不可用）: %v", err)
 			}
 			mcancel()
+			// 引导第一个主持人账号：没有它，启用鉴权后**没有任何账号能登录**（先有鸡还是先有蛋）。
+			// 只在用户不存在时创建，绝不覆盖已有口令——否则每次重启都会把人工改过的密码打回去。
+			if cfg.AdminUsername != "" && cfg.AdminPassword != "" {
+				// 必须用**独立** context：上面的 mctx 在迁移结束时已经被 cancel，
+				// 拿它去建账号只会拿到 "context canceled"（第一版就是这么写的，
+				// 表现为"迁移成功、表也在，但登录始终 401"）。
+				bctx, bcancel := context.WithTimeout(ctx, 30*time.Second)
+				created, err := st.EnsureUser(bctx, cfg.AdminUsername, cfg.AdminUsername, cfg.AdminPassword, "host")
+				bcancel()
+				switch {
+				case err != nil:
+					log.Printf("main: 引导管理员账号失败（不影响启动，可稍后手动处理）: %v", err)
+				case created:
+					log.Printf("main: 已创建主持人账号 username=%s（口令来自 ADMIN_PASSWORD，未记录明文）", cfg.AdminUsername)
+				default:
+					log.Printf("main: 主持人账号已存在 username=%s（未改动其口令）", cfg.AdminUsername)
+				}
+			}
 		}
 		if cfg.MetricsInterval > 0 {
 			log.Printf("main: 指标采样已启用（每 %s 一次 → metric_samples；会议记录 → meetings）", cfg.MetricsInterval)

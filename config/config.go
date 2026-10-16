@@ -52,6 +52,17 @@ type Config struct {
 	RecordEnabled bool
 	// RecordDir 录制文件输出目录
 	RecordDir string
+
+	// SessionSecret 是登录会话 Cookie 的签名密钥。
+	// 未单独配置时回落到 JWT_SECRET（同一条密钥管令牌与会话，少一个配置项），
+	// 两者都缺且启用了鉴权时启动会被 config.Validate 拦下。
+	SessionSecret string
+	// SessionTTL 是登录会话有效期。
+	SessionTTL time.Duration
+	// AdminUsername/AdminPassword 用于**引导**第一个主持人账号（仅当该用户不存在时创建）。
+	// 它是"第一次怎么进门"的答案：没有它，启用鉴权后没有任何账号能登录。
+	AdminUsername string
+	AdminPassword string
 	// RecordRawDump 额外落一份原始 RTP 转储（.rtp），供离线分析录制缺陷用。
 	// 默认关闭：磁盘占用翻倍。
 	RecordRawDump bool
@@ -119,6 +130,10 @@ func Load() *Config {
 		EnableDebugEndpoint: getBool("ENABLE_DEBUG_ENDPOINT", false),
 		AutoMigrate:         getBool("AUTO_MIGRATE", true),
 		RecordEnabled:       getBool("RECORD_ENABLED", false),
+		SessionSecret:       sessionSecret(getStr("SESSION_SECRET", ""), getStr("JWT_SECRET", "")),
+		SessionTTL:          getDuration("SESSION_TTL", 12*time.Hour),
+		AdminUsername:       getStr("ADMIN_USERNAME", ""),
+		AdminPassword:       getStr("ADMIN_PASSWORD", ""),
 		RecordDir:           getStr("RECORD_DIR", "recordings"),
 		RecordRawDump:       getBool("RECORD_RAW_DUMP", false),
 		MetricsInterval:     getDuration("METRICS_INTERVAL", 5*time.Second),
@@ -237,6 +252,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("未知的 AUTH_MODE=%q（可选 off / optional / required）", c.AuthMode)
 	}
 	return nil
+}
+
+// sessionSecret 选取会话签名密钥：优先 SESSION_SECRET，其次 JWT_SECRET。
+//
+// 为什么允许回落：令牌和会话都只需要"一条足够强的对称密钥"，
+// 分开配只是更清晰，不分开也不该因为少配一个变量就起不来。
+func sessionSecret(session, jwt string) string {
+	if v := strings.TrimSpace(session); v != "" {
+		return v
+	}
+	return strings.TrimSpace(jwt)
 }
 
 func getBool(key string, def bool) bool {

@@ -276,6 +276,14 @@ func (s *Server) build() *fiber.App {
 	// 生产环境**必须**把这个端点换掉：它应当是你的登录系统的一部分（校验账号密码/SSO 后签发），
 	// 而不是任何人传个 identity 就能拿到令牌。因此这里加了一道闸门：
 	// 非 development 环境下必须带 X-API-Key（由 TOKEN_API_KEY 配置），否则拒绝签发。
+	// ---- 登录：POST /auth/login、POST /auth/logout、GET /auth/me ----
+	//
+	// 这三条是"谁在开会"的入口：前端拿到的会话 Cookie 是 HttpOnly 的，
+	// 令牌签名密钥永远不下发到浏览器。
+	router.Post("/auth/login", s.handleLogin)
+	router.Post("/auth/logout", s.handleLogout)
+	router.Get("/auth/me", s.handleMe)
+
 	router.Post("/token", func(c *fiber.Ctx) error {
 		a := s.hub.Authenticator()
 		if !a.Enabled() {
@@ -283,7 +291,15 @@ func (s *Server) build() *fiber.App {
 				"error": "鉴权未启用（AUTH_MODE=off 或未配置 JWT_SECRET），当前无需令牌即可入会",
 			})
 		}
-		if cfg.AppEnv != "development" {
+		// 授权顺序很重要：**先看登录会话**，再看运维密钥。
+		// 会话是普通用户（前端）的凭据；X-API-Key 是脚本/运维的凭据，两者并列而不是二选一。
+		// 曾经把密钥闸门放在前面，于是"已登录的用户"依然被 403 拦下——
+		// 那种情况下登录界面永远拿不到令牌，闭环是断的。
+		var sessUserEarly *store.User
+		if u := s.sessionUser(c); u != nil {
+			sessUserEarly = u
+		}
+		if cfg.AppEnv != "development" && sessUserEarly == nil {
 			if cfg.TokenAPIKey == "" {
 				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 					"error": "服务端未配置 TOKEN_API_KEY，拒绝签发令牌",
@@ -293,6 +309,11 @@ func (s *Server) build() *fiber.App {
 				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "X-API-Key 无效"})
 			}
 		}
+
+		// **会话优先**：有登录会话时，身份与主持人权限由服务端决定，
+		// 请求体里的 identity/roomAdmin 一律忽略（否则前端自报就能当主持人）。
+		// 没有会话时走原来的 X-API-Key/开发环境路径（评测脚本与本地演示用）。
+		sessUser := sessUserEarly
 
 		var req struct {
 			RoomID         string `json:"roomId"`
@@ -306,6 +327,17 @@ func (s *Server) build() *fiber.App {
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "请求体不是合法 JSON"})
 		}
+		if sessUser != nil {
+			// 登录用户的身份来自会话：用户名即身份，显示名优先取用户的 displayName
+			req.Identity = sessUser.Username
+			if req.Name == "" {
+				if sessUser.DisplayName != "" {
+					req.Name = sessUser.DisplayName
+				} else {
+					req.Name = sessUser.Username
+				}
+			}
+		}
 		if req.RoomID == "" || req.Identity == "" {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "roomId 与 identity 必填"})
 		}
@@ -317,6 +349,11 @@ func (s *Server) build() *fiber.App {
 			CanSubscribe:   req.CanSubscribe == nil || *req.CanSubscribe,
 			CanPublishData: req.CanPublishData == nil || *req.CanPublishData,
 			RoomAdmin:      req.RoomAdmin != nil && *req.RoomAdmin,
+		}
+		if sessUser != nil {
+			// 主持人权限**由服务端按角色判定**：role=host 才能拿到 roomAdmin。
+			// 这一行是整个登录体系里最关键的一行——前端说什么都不算数。
+			grant.RoomAdmin = sessUser.Role == "host"
 		}
 		token, exp, err := a.Issue(req.Identity, req.Name, grant)
 		if err != nil {
