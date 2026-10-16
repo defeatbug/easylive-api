@@ -283,6 +283,12 @@ func (s *Server) build() *fiber.App {
 	router.Post("/auth/login", s.handleLogin)
 	router.Post("/auth/logout", s.handleLogout)
 	router.Get("/auth/me", s.handleMe)
+	// 账号资料：改昵称/用户名、改密码、头像。全部要求当前口令或已登录会话。
+	router.Patch("/auth/profile", s.handleUpdateProfile)
+	router.Post("/auth/password", s.handleChangePassword)
+	router.Post("/auth/avatar", s.handleUploadAvatar)
+	router.Delete("/auth/avatar", s.handleDeleteAvatar)
+	router.Get("/auth/avatar/:id", s.handleGetAvatar)
 
 	router.Post("/token", func(c *fiber.Ctx) error {
 		a := s.hub.Authenticator()

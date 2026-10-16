@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,14 +56,20 @@ func loginAllowed(key string) bool {
 	return true
 }
 
-// userJSON 是返回给前端的用户视图：**永不包含口令哈希**。
+// userJSON 是返回给前端的用户视图：**永不包含口令哈希**，也不含头像字节。
+//
+// avatarUrl 带 ?v=<更新时间>：换头像后 URL 变化，浏览器不会用旧缓存。
 func userJSON(u *store.User) fiber.Map {
-	return fiber.Map{
+	out := fiber.Map{
 		"id":          u.ID,
 		"username":    u.Username,
 		"displayName": u.DisplayName,
 		"role":        u.Role,
 	}
+	if u.AvatarUpdatedAt != nil {
+		out["avatarUrl"] = "/auth/avatar/" + strconv.FormatInt(u.ID, 10) + "?v=" + strconv.FormatInt(u.AvatarUpdatedAt.Unix(), 10)
+	}
+	return out
 }
 
 // sessionUser 解析当前会话对应的用户。
@@ -151,6 +158,9 @@ func (s *Server) handleLogin(c *fiber.Ctx) error {
 			auth.DummyVerify(req.Password)
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "用户名或密码错误"})
 		}
+		// 记下底层原因：数据库连不上时会走到这里，只回一句"查询用户失败"是查不出来的
+		// （实测踩过：容器没了，前端只看到 500，服务端日志里什么都没有）。
+		log.Printf("server: 查询用户失败 username=%s ip=%s err=%v", req.Username, c.IP(), err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "查询用户失败"})
 	}
 	if u.Disabled {

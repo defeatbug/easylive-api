@@ -248,6 +248,9 @@ func (c *Config) Validate() error {
 		if !dev {
 			log.Printf("config: 警告 非开发环境（%s）显式关闭了鉴权（AUTH_MODE=off）：信令不做任何身份校验，请确认这是刻意的", c.AppEnv)
 		}
+		// 开发环境下以前这里什么都不打，于是"为什么看不到登录页"要靠翻代码才能想明白。
+		// 明确说清后果：/auth/login 会返回 501，前端据此按**访客**直接入会。
+		log.Printf("config: 登录功能已关闭（AUTH_MODE=off）：/auth/login 返回 501，前端会以访客身份直接入会（不会出现登录页）。要启用请设 AUTH_MODE=required 并提供 JWT_SECRET（≥16 字符）")
 	default:
 		return fmt.Errorf("未知的 AUTH_MODE=%q（可选 off / optional / required）", c.AuthMode)
 	}

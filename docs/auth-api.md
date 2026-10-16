@@ -107,3 +107,66 @@
 
 首次启动后即可用该账号登录；之后再要加人，直接在 `users` 表插一行
 （`password_hash` 用 argon2id，`role` 取 `host` 或 `member`）。
+
+---
+
+## 7. 账号资料（左下角访客头像点开的那张 Dialog 需要这些）
+
+所有接口都要求**已登录会话**（Cookie），未登录统一 `401 {"error":"未登录"}`。
+**改资料和改密码都必须带上当前密码**——会话是可被劫持的凭据，不该能直接改名/改密。
+
+### 7.1 PATCH /auth/profile
+
+```json
+{ "displayName": "李老师", "username": "teacher2", "currentPassword": "……" }
+```
+`displayName`、`username` 都可选（只传要改的）；`currentPassword` **必填**。
+
+成功 `200`：`{ "user": { … } }`（结构与 `/auth/me` 一致，含 `avatarUrl`）
+
+| 状态 | 含义 |
+|---|---|
+| `400` | 用户名长度/字符不合法（只允许字母数字与 `. _ -`，3–32 位）、昵称超 32 字、缺 `currentPassword` |
+| `401` | 当前密码不正确 |
+| `409` | 用户名已被占用 |
+| `429` | 尝试过于频繁 |
+
+### 7.2 POST /auth/password
+
+```json
+{ "currentPassword": "……", "newPassword": "……" }
+```
+成功 `204`。失败：`400`（新密码过短/与当前相同）、`401`（当前密码错）、`429`。
+
+改完密码**旧密码立即失效**（已实测）。已签发的会话仍然有效（会话按用户 ID 签名）。
+
+### 7.3 头像
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/auth/avatar` | `multipart/form-data`，字段名 **`file`**；只接受 `image/png`、`image/jpeg`、`image/webp`；上限 **512KB** |
+| `DELETE` | `/auth/avatar` | 恢复默认头像，`204` |
+| `GET` | `/auth/avatar/:id` | 取头像字节。**需要已登录会话**（未登录 `401`） |
+
+上传成功 `200`：`{ "user": { …, "avatarUrl": "/auth/avatar/1?v=1792147936" } }`
+失败：`400`（缺 `file`）、`413`（超过 512KB）、`415`（类型不支持）。
+
+前端上传示例：
+
+```ts
+const form = new FormData()
+form.append('file', file)                       // 不要手动设 Content-Type，浏览器会带 boundary
+const res = await fetch('/auth/avatar', { method: 'POST', credentials: 'include', body: form })
+```
+
+`avatarUrl` 里带了 `?v=<更新时间>`：换头像后 URL 会变，浏览器不会用旧缓存。
+`<img src={user.avatarUrl}>` 直接可用（同源、带 Cookie 即可）。
+
+### 7.4 用户对象（`/auth/me`、登录、改资料、上传头像都返回它）
+
+```json
+{ "id": 1, "username": "teacher", "displayName": "李老师", "role": "host",
+  "avatarUrl": "/auth/avatar/1?v=1792147936" }
+```
+`avatarUrl` **仅在设置过头像时出现**（没有该字段就显示默认头像：昵称首字母）。
+**永远不含** `password_hash`，也不含头像字节。

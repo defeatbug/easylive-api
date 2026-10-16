@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -18,6 +19,10 @@ type User struct {
 	PasswordHash string
 	Role         string // host | member
 	Disabled     bool
+	// AvatarUpdatedAt 非空表示该用户设置过头像。
+	// 注意**不把头像字节放进这个结构**：User 会在每次请求里被读取（角色要实时），
+	// 顺手带上几百 KB 的图片会让每个请求都白搬一次数据。字节只在头像路由里取。
+	AvatarUpdatedAt *time.Time
 }
 
 // 为什么 users 表走 pgx 原生查询而不是 Ent/sqlc：
@@ -32,11 +37,11 @@ func hashForStore(password string) (string, error) { return auth.HashPassword(pa
 // ErrUserNotFound 表示用户名不存在。
 var ErrUserNotFound = errors.New("用户不存在")
 
-const userCols = `id, username, display_name, password_hash, role, disabled`
+const userCols = `id, username, display_name, password_hash, role, disabled, avatar_updated_at`
 
 func scanUser(row pgx.Row) (*User, error) {
 	var u User
-	if err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.Role, &u.Disabled); err != nil {
+	if err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.Role, &u.Disabled, &u.AvatarUpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
 		}
@@ -97,4 +102,85 @@ func (s *Store) EnsureUser(ctx context.Context, username, displayName, password,
 		return false, err
 	}
 	return true, nil
+}
+
+// UpdateProfile 修改用户名与显示名。
+//
+// 用户名是**登录身份**，改它必须同时校验口令（由调用方在路由层做），
+// 否则一个被劫持的会话就能把账号"改名带走"。
+func (s *Store) UpdateProfile(ctx context.Context, id int64, username, displayName string) error {
+	if s.Pool == nil {
+		return errors.New("数据层不可用")
+	}
+	_, err := s.Pool.Exec(ctx,
+		`UPDATE users SET username = $2, display_name = $3, updated_at = now() WHERE id = $1`,
+		id, username, displayName)
+	return err
+}
+
+// UsernameTaken 判断用户名是否已被**别人**占用（不区分大小写，与唯一索引一致）。
+func (s *Store) UsernameTaken(ctx context.Context, username string, exceptID int64) (bool, error) {
+	if s.Pool == nil {
+		return false, errors.New("数据层不可用")
+	}
+	var exists bool
+	err := s.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM users WHERE lower(username) = lower($1) AND id <> $2)`,
+		username, exceptID).Scan(&exists)
+	return exists, err
+}
+
+// UpdatePassword 写入新的口令哈希（明文哈希在调用方完成）。
+func (s *Store) UpdatePassword(ctx context.Context, id int64, passwordHash string) error {
+	if s.Pool == nil {
+		return errors.New("数据层不可用")
+	}
+	_, err := s.Pool.Exec(ctx,
+		`UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1`, id, passwordHash)
+	return err
+}
+
+// SetAvatar 保存头像字节（mime 已由路由层白名单校验、大小已限制）。
+func (s *Store) SetAvatar(ctx context.Context, id int64, mime string, data []byte) error {
+	if s.Pool == nil {
+		return errors.New("数据层不可用")
+	}
+	_, err := s.Pool.Exec(ctx,
+		`UPDATE users SET avatar_mime = $2, avatar_bytes = $3, avatar_updated_at = now(), updated_at = now()
+		 WHERE id = $1`, id, mime, data)
+	return err
+}
+
+// ClearAvatar 恢复默认头像。
+func (s *Store) ClearAvatar(ctx context.Context, id int64) error {
+	if s.Pool == nil {
+		return errors.New("数据层不可用")
+	}
+	_, err := s.Pool.Exec(ctx,
+		`UPDATE users SET avatar_mime = NULL, avatar_bytes = NULL, avatar_updated_at = NULL, updated_at = now()
+		 WHERE id = $1`, id)
+	return err
+}
+
+// Avatar 读取头像字节。未设置头像时返回 ErrUserNotFound（路由层据此返回 404）。
+func (s *Store) Avatar(ctx context.Context, id int64) (string, []byte, time.Time, error) {
+	if s.Pool == nil {
+		return "", nil, time.Time{}, errors.New("数据层不可用")
+	}
+	var mime *string
+	var data []byte
+	var at *time.Time
+	err := s.Pool.QueryRow(ctx,
+		`SELECT avatar_mime, avatar_bytes, avatar_updated_at FROM users WHERE id = $1`, id).
+		Scan(&mime, &data, &at)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil, time.Time{}, ErrUserNotFound
+	}
+	if err != nil {
+		return "", nil, time.Time{}, err
+	}
+	if mime == nil || len(data) == 0 || at == nil {
+		return "", nil, time.Time{}, ErrUserNotFound
+	}
+	return *mime, data, *at, nil
 }
