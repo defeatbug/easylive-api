@@ -5,9 +5,11 @@ import (
 	"math"
 	"regexp"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
@@ -82,6 +84,17 @@ type PublishedTrack struct {
 	// 用原子指针而不是普通字段：录制现在可以在**转发进行中**被主持人启停，
 	// 而转发热路径每个包都会读它——普通字段会被 race detector 判定为数据竞争。
 	rec atomic.Pointer[mediarec.Writer]
+	// lastPLINs 是上次向发布者请求关键帧的时间（UnixNano），用于限流。
+	// 必须限流：每个订阅者在新订阅、丢包、解码失败时都会发 PLI，
+	// 不限流的话 N 个订阅者能把发布端逼成"一直在编关键帧"——关键帧体积远大于普通帧，
+	// 结果是为了救一个人把所有人的画质都拖下去。
+	lastPLINs atomic.Int64
+	// rememberSSRCO 保证 SSRC 只登记一次
+	rememberSSRCO sync.Once
+	// registerLocalSSRCO 保证出向 SSRC 只登记一次
+	registerLocalSSRCO sync.Once
+	// outSSRC 是我们转发给订阅者的流的 SSRC（从写出的包头上取，注销时要清）
+	outSSRC atomic.Uint32
 
 	// 音频电平（活跃说话人检测用）。float64 拆成位存进 atomic，避免给热路径加锁。
 	audioLevelExtID uint8
@@ -196,6 +209,42 @@ func (t *PublishedTrack) RequestKeyframe() {
 	log.Printf("sfu: 已请求关键帧(PLI) track=%s ssrc=%d", t.info.ID, ssrc)
 }
 
+// keyframeInterval 是同一路轨道两次关键帧请求之间的最小间隔。
+// 400ms 的依据：关键帧本身要几百毫秒才能编完并送达，请求得比这更密只是徒增带宽。
+const keyframeInterval = 400 * time.Millisecond
+
+// RequestKeyframeThrottled 是"订阅端要求关键帧"的入口：内部限流，返回是否真的发了 PLI。
+//
+// 与 RequestKeyframe 的区别：那个是无条件发送（用于新订阅者加入这类必须成功的场景），
+// 这个是**外部触发**（订阅端 PLI/FIR）——外部触发必须限流，否则就是一个放大器。
+func (t *PublishedTrack) RequestKeyframeThrottled() bool {
+	now := time.Now().UnixNano()
+	last := t.lastPLINs.Load()
+	if last != 0 && now-last < int64(keyframeInterval) {
+		pliSuppressed.Add(1)
+		return false
+	}
+	// CAS 抢占时间戳：并发订阅者同时到达时只有一个能发出去
+	if !t.lastPLINs.CompareAndSwap(last, now) {
+		pliSuppressed.Add(1)
+		return false
+	}
+	t.RequestKeyframe()
+	pliForwarded.Add(1)
+	return true
+}
+
+// 关键帧请求的进程级计数（观测用：healthz / 日志都能看到）。
+var (
+	pliForwarded  atomic.Uint64
+	pliSuppressed atomic.Uint64
+)
+
+// FrameRequestStats 返回 (转发给发布者的关键帧请求数, 因限流被压掉的数量)。
+func FrameRequestStats() (forwarded, suppressed uint64) {
+	return pliForwarded.Load(), pliSuppressed.Load()
+}
+
 // NudgeKeyframe 在轨道迟迟没有数据时反复索要关键帧。
 //
 // 为什么需要：屏幕共享画面静止时，浏览器**不会编码新帧**，服务端自然收不到包
@@ -241,8 +290,22 @@ func (t *PublishedTrack) Pump() {
 	}()
 
 	for {
+		// SSRC 在这里才可知：订阅端的 PLI/FIR 只带 SSRC，必须能据此找回这条轨道
+		t.rememberSSRCO.Do(func() {
+			// 登记发布者远端的 SSRC：我们发给发布者的 PLI 用它。
+			// 注明：订阅端 PLI 里的 SSRC 在 Pion v4.2 下与它相同（见下面 WriteRTP 处的实测说明），
+			// 但那属于实现细节；出向 SSRC 会被单独、显式地登记，不依赖这个巧合。
+			remoteSSRC := uint32(t.remote.SSRC())
+			rememberSSRC(remoteSSRC, t)
+			log.Printf("sfu: 登记远端 SSRC=%d → track=%s", remoteSSRC, t.info.ID)
+		})
 		pkt, _, err := t.remote.ReadRTP()
 		if err != nil {
+			// 读循环结束 = 这条轨道不再有数据：把两个映射都清掉，避免查表拿到死轨道
+			forgetSSRC(uint32(t.remote.SSRC()))
+			if ssrc := t.outSSRC.Load(); ssrc != 0 {
+				forgetSSRC(ssrc)
+			}
 			return // 发布者取消发布、连接关闭或出错
 		}
 		t.packets.Add(1)
@@ -286,11 +349,28 @@ func (t *PublishedTrack) Pump() {
 		pkt.Header.Extensions = nil
 
 		// TrackLocalStaticRTP 会把包写给所有绑定的订阅者连接；没有订阅者时直接丢弃。
-		if err := t.local.WriteRTP(pkt); err != nil {
+		writeErr := t.local.WriteRTP(pkt)
+		if writeErr == nil {
+			// 出向 SSRC 从写出的包头取（该类型没有导出 SSRC 的取值接口）。
+			//
+			// 实测结论（不是推测）：Pion v4.2 的 TrackLocalStaticRTP.WriteRTP 对**已经有
+			// SSRC** 的包会原样保留，所以这里取到的值与发布者的远端 SSRC 相同——
+			// 日志里 remote 与 out 两个值一模一样就是这么来的。
+			// 仍然显式登记它，是为了把"订阅端 PLI 里带的到底是哪个 SSRC"这条不变量钉住：
+			// 一旦将来换实现/升级改动成"出向重新分配 SSRC"，这里就是唯一正确的取值点，
+			// 而不是靠"两个值恰好相等"这个巧合。
+			t.registerLocalSSRCO.Do(func() {
+				ssrc := pkt.Header.SSRC
+				t.outSSRC.Store(ssrc)
+				rememberSSRC(ssrc, t)
+				log.Printf("sfu: 登记出向 SSRC=%d → track=%s（订阅端 PLI 带的是它）", ssrc, t.info.ID)
+			})
+		}
+		if writeErr != nil {
 			// 注意：写入失败通常只是某个订阅者的 SRTP 尚未就绪（Pion 在未就绪时静默丢包），
 			// 绝不能因此退出循环——那会让这条轨道对所有人永久失效。
 			if n := t.writeFails.Add(1); n <= 3 {
-				log.Printf("sfu: 转发写入失败（忽略并继续）track=%s 第 %d 次: %v", t.info.ID, n, err)
+				log.Printf("sfu: 转发写入失败（忽略并继续）track=%s 第 %d 次: %v", t.info.ID, n, writeErr)
 			}
 			continue
 		}
@@ -321,4 +401,101 @@ func drainRTCP(sender *webrtc.RTPSender) {
 			return
 		}
 	}
+}
+
+// trackBySSRC 把 RTP 的 SSRC 映射到发布轨道。
+//
+// 为什么需要进程级映射：浏览器发来的 PLI/FIR 里**只有 SSRC**，而 RTCP 拦截器是挂在
+// PeerConnection 上的（一个订阅端 PC 可能同时收好几个人的画面），拦截器自身不知道
+// 这条 PLI 对应哪一路轨道。用 SSRC 查表是最直接的解法，也让拦截器保持为
+// "RTCP 字节的纯函数"，不必给每条 PC 单独组装 API 与拦截器链。
+var trackBySSRC sync.Map // uint32 -> *PublishedTrack
+
+func rememberSSRC(ssrc uint32, t *PublishedTrack) {
+	if ssrc != 0 {
+		trackBySSRC.Store(ssrc, t)
+	}
+}
+
+func forgetSSRC(ssrc uint32) {
+	if ssrc != 0 {
+		trackBySSRC.Delete(ssrc)
+	}
+}
+
+// keyframeForwarder 是一个 RTCP 拦截器：观察订阅端发来的 PLI/FIR，转发给对应的发布者。
+//
+// 这是弱网下恢复画面最快的路径：浏览器一旦丢包/解码失败就会发 PLI（或 FIR），
+// 以前订阅端的 RTCP 只是被排空——PLI 直接丢掉，只能等发布者下一个自然关键帧，
+// 表现为"卡住好几秒"。转发后从丢包到恢复只需一个 RTT 量级。
+//
+// 它实现 interceptor.RTCPReader 包装：只观察，不改写、不吞包。
+type keyframeForwarder struct {
+	interceptor.NoOp
+}
+
+// keyframeForwarderFactory 是拦截器注册所需的工厂：为每条 PeerConnection 造一个实例。
+type keyframeForwarderFactory struct{}
+
+func (keyframeForwarderFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
+	// 必须是**指针**：内嵌的 interceptor.NoOp 方法都是指针接收者
+	return &keyframeForwarder{}, nil
+}
+
+// rtcpMalformed 统计被丢弃的畸形 RTCP（观测用：出现异常增长说明有客户端在发垃圾）。
+var rtcpMalformed atomic.Uint64
+
+// MalformedRTCPCount 返回畸形 RTCP 的计数。
+func MalformedRTCPCount() uint64 { return rtcpMalformed.Load() }
+
+// unmarshalRTCP 解析 RTCP，**绝不 panic**。
+//
+// 为什么必须包 recover：pion/rtcp 的 Unmarshal 对某些畸形输入是直接 panic 而不是返回 error，
+// 而这条路径的数据**完全来自客户端**——不加保护的话，一个客户端发几个字节的垃圾 RTCP
+// 就能让整个服务进程崩溃。这是测试里真实触发出来才发现的。
+func unmarshalRTCP(b []byte) (pkts []rtcp.Packet, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			rtcpMalformed.Add(1)
+			pkts, ok = nil, false
+		}
+	}()
+	parsed, err := rtcp.Unmarshal(b)
+	if err != nil {
+		rtcpMalformed.Add(1)
+		return nil, false
+	}
+	return parsed, true
+}
+
+func (keyframeForwarder) BindRTCPReader(reader interceptor.RTCPReader) interceptor.RTCPReader {
+	return interceptor.RTCPReaderFunc(func(b []byte, a interceptor.Attributes) (int, interceptor.Attributes, error) {
+		n, attr, err := reader.Read(b, a)
+		if err != nil || n <= 0 {
+			return n, attr, err
+		}
+		pkts, ok := unmarshalRTCP(b[:n])
+		if !ok {
+			return n, attr, err // 畸形 RTCP：照常放行
+		}
+		for _, pkt := range pkts {
+			var ssrc uint32
+			switch p := pkt.(type) {
+			case *rtcp.PictureLossIndication:
+				ssrc = p.MediaSSRC
+			case *rtcp.FullIntraRequest:
+				ssrc = p.MediaSSRC
+			default:
+				continue
+			}
+			v, ok := trackBySSRC.Load(ssrc)
+			if !ok {
+				continue
+			}
+			if t, ok := v.(*PublishedTrack); ok && t.RequestKeyframeThrottled() {
+				log.Printf("sfu: 订阅端请求关键帧 → 已转发给发布者 track=%s ssrc=%d", t.info.ID, ssrc)
+			}
+		}
+		return n, attr, err
+	})
 }

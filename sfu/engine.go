@@ -129,6 +129,9 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 	if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
 		return nil, fmt.Errorf("注册默认拦截器失败: %w", err)
 	}
+	// 订阅端的 PLI/FIR → 转发给对应发布者（弱网恢复画面的关键路径）。
+	// 挂在全局注册表上：它只是观察 RTCP 字节，按 SSRC 查表，不需要按 PC 定制。
+	ir.Add(keyframeForwarderFactory{})
 
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),

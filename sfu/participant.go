@@ -351,6 +351,8 @@ func (p *Participant) Subscribe(track *PublishedTrack) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("添加轨道到订阅连接失败: %w", err)
 	}
+	// 订阅端：必须持续读 RTCP（否则 Pion 内部管道阻塞）。
+	// PLI/FIR 的转发由全局拦截器 keyframeForwarder 负责（按 SSRC 查表），这里只排空。
 	go drainRTCP(sender)
 
 	// 新订阅者需要立刻拿到关键帧，否则会黑屏到发布者下一个自然关键帧；
