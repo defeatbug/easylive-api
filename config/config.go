@@ -48,6 +48,9 @@ type Config struct {
 	// 而媒体功能完全正常——这种组合极易被误判成"接口写错了"。
 	AutoMigrate bool
 	// RecordEnabled 打开会议录制：把每条视频轨的 RTP **原样落盘**（IVF/VP8，零转码）。
+	//
+	// **默认开启**：录制是本项目的核心功能之一，默认关掉会表现为"主持人看得到录制按钮、
+	// 一按就失败"——功能看起来是坏的。要关闭请显式设 RECORD_ENABLED=false。
 	// 默认关闭——录制要写磁盘，是否开启属于部署决策。
 	RecordEnabled bool
 	// RecordDir 录制文件输出目录
@@ -129,7 +132,7 @@ func Load() *Config {
 		// 之前这里漏了赋值，导致端点写了却永远打不开（排查时白折腾了一轮）。
 		EnableDebugEndpoint: getBool("ENABLE_DEBUG_ENDPOINT", false),
 		AutoMigrate:         getBool("AUTO_MIGRATE", true),
-		RecordEnabled:       getBool("RECORD_ENABLED", false),
+		RecordEnabled:       getBool("RECORD_ENABLED", true),
 		SessionSecret:       sessionSecret(getStr("SESSION_SECRET", ""), getStr("JWT_SECRET", "")),
 		SessionTTL:          getDuration("SESSION_TTL", 12*time.Hour),
 		AdminUsername:       getStr("ADMIN_USERNAME", ""),
@@ -259,6 +262,26 @@ func (c *Config) Validate() error {
 	// 一个安全开关兼职做 UI 开关，只会让"我明明做了注册页，界面却没有按钮"这种问题反复出现。
 	if c.AuthMode != "off" {
 		log.Printf("config: 自助注册已开放（跟随 AUTH_MODE=%s）：注册出来的账号一律是 member，不是 host", c.AuthMode)
+	}
+	// ---- 会影响**界面上出现什么**的开关，集中在这里报一遍 ----
+	//
+	// 为什么要有这一段：反复出现过"我做的界面元素不见了"，而原因是某个环境变量没设。
+	// 用户不会去读 /auth/capabilities 的响应，但一定会看启动日志——把结论写在这里，
+	// 这类问题就能被一眼回答，而不是靠翻代码猜。
+	if c.RecordEnabled {
+		log.Printf("界面能力: 会议录制=开（主持人可见「录制」菜单；关闭设 RECORD_ENABLED=false）")
+	} else {
+		log.Printf("界面能力: 会议录制=**关**（显式关闭了 RECORD_ENABLED）：主持人看得到按钮但点不动")
+	}
+	if c.MetricsInterval > 0 {
+		log.Printf("界面能力: 报表数据=开（每 %s 采样一次；#/metrics 页面的历史曲线依赖它）", c.MetricsInterval)
+	} else {
+		log.Printf("界面能力: 报表数据=**关**（METRICS_INTERVAL=0）：#/metrics 页面能打开但历史曲线是空的")
+	}
+	if c.AutoMigrate {
+		log.Printf("界面能力: 自动迁移=开（users 等表会自动创建，登录/注册依赖它）")
+	} else {
+		log.Printf("界面能力: 自动迁移=**关**：若数据库里还没有 users 表，登录与注册都会失败")
 	}
 	return nil
 }
