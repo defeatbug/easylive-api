@@ -211,8 +211,9 @@ func (s *Server) handleMe(c *fiber.Ctx) error {
 // 它不要求登录，也不能泄露任何账号信息。
 func (s *Server) handleCapabilities(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
-		"authEnabled":   s.hub.Authenticator().Enabled(),
-		"signupEnabled": s.hub.Authenticator().Enabled() && s.cfg.SignupEnabled,
+		"authEnabled": s.hub.Authenticator().Enabled(),
+		// 注册跟随鉴权：开着鉴权就能注册，没有第二个开关（前端据此显示注册入口）
+		"signupEnabled": s.hub.Authenticator().Enabled(),
 	})
 }
 
@@ -222,16 +223,12 @@ func (s *Server) handleCapabilities(c *fiber.Ctx) error {
 //
 // 两条刻意的限制：
 //  1. 注册出来的账号**一律是 member**，绝不可能是 host —— 否则任何人都能注册成主持人；
-//  2. 是否开放注册由 SIGNUP_ENABLED 决定，默认关闭（未开放时返回 403 并说明原因）。
+//  2. 是否开放注册**跟随鉴权**（AUTH_MODE != off 即开放）：不额外加开关，
+//     否则"要不要显示注册按钮"这种 UI 决定会被绑在一个安全开关上，很容易对不上。
 func (s *Server) handleRegister(c *fiber.Ctx) error {
 	if !s.hub.Authenticator().Enabled() {
 		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{
 			"error": "鉴权未启用（AUTH_MODE=off），当前无需注册即可入会",
-		})
-	}
-	if !s.cfg.SignupEnabled {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "本服务器未开放自助注册，请联系管理员创建账号",
 		})
 	}
 	if s.st == nil {

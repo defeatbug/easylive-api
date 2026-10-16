@@ -103,6 +103,7 @@
 | `SESSION_SECRET` | 可选：单独指定会话签名密钥 |
 | `SESSION_TTL` | 会话有效期，默认 `12h` |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | **引导第一个主持人账号**（仅当该用户名不存在时创建；绝不覆盖已有口令） |
+| （无） | **自助注册跟随鉴权开关**：`AUTH_MODE != off` 即开放，不需要额外变量。注册出来的账号一律 `role=member` |
 | `DATABASE_URL` | 数据库（`users` 表在 `migrations/004_users.sql`） |
 
 首次启动后即可用该账号登录；之后再要加人，直接在 `users` 表插一行

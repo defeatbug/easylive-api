@@ -59,8 +59,6 @@ type Config struct {
 	SessionSecret string
 	// SessionTTL 是登录会话有效期。
 	SessionTTL time.Duration
-	// SignupEnabled 是否开放自助注册（默认关闭）。
-	SignupEnabled bool
 	// AdminUsername/AdminPassword 用于**引导**第一个主持人账号（仅当该用户不存在时创建）。
 	// 它是"第一次怎么进门"的答案：没有它，启用鉴权后没有任何账号能登录。
 	AdminUsername string
@@ -134,9 +132,6 @@ func Load() *Config {
 		RecordEnabled:       getBool("RECORD_ENABLED", false),
 		SessionSecret:       sessionSecret(getStr("SESSION_SECRET", ""), getStr("JWT_SECRET", "")),
 		SessionTTL:          getDuration("SESSION_TTL", 12*time.Hour),
-		// 默认**不开放**自助注册：开放注册意味着任何人都能建账号，
-		// 应当由部署方明确打开（SIGNUP_ENABLED=true）。
-		SignupEnabled:       getBool("SIGNUP_ENABLED", false),
 		AdminUsername:       getStr("ADMIN_USERNAME", ""),
 		AdminPassword:       getStr("ADMIN_PASSWORD", ""),
 		RecordDir:           getStr("RECORD_DIR", "recordings"),
@@ -259,14 +254,11 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("未知的 AUTH_MODE=%q（可选 off / optional / required）", c.AuthMode)
 	}
-	// 顺手把"注册开着没有"也说清楚：前端完全依据 /auth/capabilities 决定要不要显示注册入口，
-	// 而它默认是关的。不写这一行，就会出现"我明明做了注册页，界面上却没有注册按钮"。
+	// 自助注册**跟随鉴权开关**：鉴权开着就可用，没有任何额外开关。
+	// 曾经用 SIGNUP_ENABLED 单独控制，结果它同时决定了"能不能注册"和"界面上要不要显示注册入口"——
+	// 一个安全开关兼职做 UI 开关，只会让"我明明做了注册页，界面却没有按钮"这种问题反复出现。
 	if c.AuthMode != "off" {
-		if c.SignupEnabled {
-			log.Printf("config: 自助注册已开放（SIGNUP_ENABLED=true）：/auth/capabilities 返回 signupEnabled=true，登录页会显示注册入口")
-		} else {
-			log.Printf("config: 自助注册未开放（SIGNUP_ENABLED 未设置）：前端**不会**显示注册入口。要开放请设 SIGNUP_ENABLED=true")
-		}
+		log.Printf("config: 自助注册已开放（跟随 AUTH_MODE=%s）：注册出来的账号一律是 member，不是 host", c.AuthMode)
 	}
 	return nil
 }

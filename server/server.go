@@ -285,7 +285,7 @@ func (s *Server) build() *fiber.App {
 	router.Get("/auth/me", s.handleMe)
 	// 部署能力：前端据此决定要不要显示注册入口
 	router.Get("/auth/capabilities", s.handleCapabilities)
-	// 自助注册（是否开放由 SIGNUP_ENABLED 决定；注册出来的账号一律是 member）
+	// 自助注册（跟随鉴权：鉴权开着就可用；注册出来的账号一律是 member）
 	router.Post("/auth/register", s.handleRegister)
 	// 账号资料：改昵称/用户名、改密码、头像。全部要求当前口令或已登录会话。
 	router.Patch("/auth/profile", s.handleUpdateProfile)
