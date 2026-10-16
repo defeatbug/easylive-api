@@ -5,6 +5,14 @@
 -- 全站只有一个管理员（admin），它在任何会议里都是主持人，并且能查看所有用户。
 
 -- 1) 角色收敛为 admin / member（老数据里的 host 就是管理员）
+--
+-- 关键：先把**多出来的** host 降级，只留一个升成 admin。
+-- 否则如果老库里有两个以上 host，下面的唯一索引会创建失败，整个迁移中断——
+-- 那会连带 rooms.owner_id 也不存在，"创建会议"直接坏掉。
+-- 这类"在真实数据上才炸"的迁移必须在写的时候就考虑到。
+UPDATE users SET role = 'member'
+ WHERE role = 'host'
+   AND id <> (SELECT min(id) FROM users WHERE role IN ('host', 'admin'));
 UPDATE users SET role = 'admin'  WHERE role = 'host';
 UPDATE users SET role = 'member' WHERE role IS NULL OR role NOT IN ('admin', 'member');
 ALTER TABLE users ALTER COLUMN role SET DEFAULT 'member';
