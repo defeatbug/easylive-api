@@ -38,7 +38,14 @@ func postGraphQL(t *testing.T, base, query string) (int, gqlResponse) {
 	t.Helper()
 	raw, _ := json.Marshal(gqlRequest{Query: query})
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(base+"/graphql", "application/json", bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, base+"/graphql", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// 非 development 环境 GraphQL 需要 X-API-Key（以前是裸挂，任何人不带凭证就能调变更）
+	req.Header.Set("X-API-Key", testAPIKey)
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("请求 /graphql 失败: %v", err)
 	}

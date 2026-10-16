@@ -218,7 +218,7 @@ func TestE2ETokenEndpoint(t *testing.T) {
 	}
 
 	// ---- dev 环境：无需 API Key，签发后可直接入会 ----
-	code, out := post(base+"/token", map[string]any{"roomId": "room-tok", "identity": "u-9", "name": "小明"}, "")
+	code, out := post(base+"/token", map[string]any{"roomId": "room-tok", "identity": "u-9", "name": "小明"}, testAPIKey)
 	if code != http.StatusOK {
 		t.Fatalf("dev 环境签发应成功，实际 %d: %v", code, out)
 	}
@@ -234,7 +234,7 @@ func TestE2ETokenEndpoint(t *testing.T) {
 	}
 
 	// ---- 缺字段：400 ----
-	if code, _ := post(base+"/token", map[string]any{"identity": "u-1"}, ""); code != http.StatusBadRequest {
+	if code, _ := post(base+"/token", map[string]any{"identity": "u-1"}, testAPIKey); code != http.StatusBadRequest {
 		t.Fatalf("缺少 roomId 应返回 400，实际 %d", code)
 	}
 

@@ -210,6 +210,35 @@ func getInt(key string, def int) int {
 	return def
 }
 
+// Validate 对安全相关配置做**失败即拒绝启动**的校验，返回错误时调用方必须终止启动。
+//
+// 为什么必须 fail-closed：以前 AUTH_MODE=required 但漏配 JWT_SECRET 时，服务只打一条警告、
+// 然后**降级为不校验**；而「未启用校验」在 grants() 里被当成全权限（含 roomAdmin）——
+// 结果是**所有人都成了主持人**。安全配置写错必须启动失败：前者一眼可见，后者线上静默敞开。
+//
+// 另一条：非开发环境**不允许「默认不校验」**。AUTH_MODE 没显式设置时按 required 处理，
+// 于是「忘了配」会走失败路径，而不是「忘了配」变成「完全开放」。
+func (c *Config) Validate() error {
+	dev := c.AppEnv == "development"
+	if !dev && strings.TrimSpace(os.Getenv("AUTH_MODE")) == "" {
+		c.AuthMode = "required"
+		log.Printf("config: 非开发环境未设置 AUTH_MODE，按 required 处理（安全默认）")
+	}
+	switch c.AuthMode {
+	case "required", "optional":
+		if len(strings.TrimSpace(c.JWTSecret)) < 16 {
+			return fmt.Errorf("AUTH_MODE=%s 必须配置 JWT_SECRET（至少 16 字符）；拒绝以不校验状态启动（那会让所有人获得全权限）", c.AuthMode)
+		}
+	case "off":
+		if !dev {
+			log.Printf("config: 警告 非开发环境（%s）显式关闭了鉴权（AUTH_MODE=off）：信令不做任何身份校验，请确认这是刻意的", c.AppEnv)
+		}
+	default:
+		return fmt.Errorf("未知的 AUTH_MODE=%q（可选 off / optional / required）", c.AuthMode)
+	}
+	return nil
+}
+
 func getBool(key string, def bool) bool {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"sort"
+	"sync"
 	"time"
 
 	"easylive-api/store"
@@ -97,4 +98,35 @@ func mergeBuckets(ctx context.Context, st *store.Store, roomIDs []string, bucket
 	// 时间升序：图表直接按下标连线，不需要前端再排一次
 	sort.Slice(out, func(i, j int) bool { return out[i].Bucket.Before(out[j].Bucket) })
 	return out, nil
+}
+
+// 历史曲线的进程内缓存。
+//
+// 报表页按秒轮询，而每次请求都会把**每个房间**的时间桶查询跑一遍；数据本身每
+// METRICS_INTERVAL 才更新一次，所以 5 秒缓存能省掉绝大部分重复查询，又不影响观感。
+// 只缓存"聚合结果"这一小块；房间数、轨道数等实时数据仍然每次现算。
+var (
+	historyCacheMu sync.Mutex
+	historyCacheAt time.Time
+	historyCacheKV = map[string][]HistoryPoint{}
+)
+
+const historyCacheTTL = 5 * time.Second
+
+func historyCacheGet(key string) ([]HistoryPoint, bool) {
+	historyCacheMu.Lock()
+	defer historyCacheMu.Unlock()
+	if time.Since(historyCacheAt) > historyCacheTTL {
+		return nil, false
+	}
+	pts, ok := historyCacheKV[key]
+	return pts, ok
+}
+
+func historyCachePut(key string, pts []HistoryPoint) {
+	historyCacheMu.Lock()
+	defer historyCacheMu.Unlock()
+	// 报表页同一时刻只用一个时间窗，保留单个 key 足够
+	historyCacheKV = map[string][]HistoryPoint{key: pts}
+	historyCacheAt = time.Now()
 }

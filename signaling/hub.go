@@ -60,6 +60,14 @@ type authFailure struct {
 func (h *Hub) resolveClaims(c *Client, msg *protocol.Message) (*auth.Claims, *authFailure) {
 	a := h.auth
 	if !a.Enabled() {
+		// 配置说"要校验"但鉴权不可用（缺密钥等）：**绝不能**当成"不需要令牌"继续。
+		// 因为"不需要令牌"在 grants() 里等价于 devGrants（全权限含 roomAdmin），
+		// 那等于把主持人的钥匙发给所有人。启动时的 config.Validate 已经拦住这种配置，
+		// 这里是纵深防御：万一有人绕过校验重建了 Hub，也要拒绝而不是放行。
+		if a.Mode() != auth.ModeOff {
+			log.Printf("signaling: 鉴权不可用但 AUTH_MODE=%s，拒绝连接 session=%s", a.Mode(), c.ID)
+			return nil, &authFailure{protocol.ErrUnauthorized, "服务端鉴权不可用，拒绝入会"}
+		}
 		return nil, nil
 	}
 	if msg.Token == "" {

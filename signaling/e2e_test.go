@@ -69,11 +69,30 @@ func startServerWithGrace(t *testing.T, grace time.Duration) string {
 }
 
 // startServerFull 允许指定鉴权参数（authMode/jwtSecret/appEnv）。
+// testAPIKey 是测试用的运维密钥。
+//
+// /graphql、/recordings、/token 在**非 development** 环境都要求 X-API-Key
+// （这是刻意加的访问控制：以前 GraphQL 完全裸挂、录制接口在没配密钥时还放行）。
+// 因此测试服务器必须配置密钥，客户端必须带请求头——否则测的就不是真实配置。
+const testAPIKey = "test-ops-key"
+
+// apiKeyForEnv 按环境决定测试服务器是否配置运维密钥。
+// production 用例留空，用于验证"未配置密钥"时的失败即拒绝（403）。
+func apiKeyForEnv(appEnv string) string {
+	if appEnv == "production" {
+		return ""
+	}
+	return testAPIKey
+}
+
 func startServerFull(t *testing.T, grace time.Duration, authMode, jwtSecret, appEnv string) *testServer {
 	t.Helper()
 	port := freeTCPPort(t)
 	cfg := &config.Config{
-		AppName:      "easylive-api-test",
+		AppName: "easylive-api-test",
+		// 只有非 production 的用例才配密钥：production 用例需要能构造
+		// "服务端漏配 TOKEN_API_KEY"这个场景（应当 403，而不是 401 或被放行）。
+		TokenAPIKey:  apiKeyForEnv(appEnv),
 		AppPort:      fmt.Sprint(port),
 		MediaUDPPort: freeUDPPort(t),
 		// 刻意开启 ICE-TCP：这条路径曾经因为日志工厂尚未赋值而必然 panic，

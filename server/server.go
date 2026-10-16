@@ -169,7 +169,18 @@ func (s *Server) build() *fiber.App {
 					}
 				}
 			}
-			if hist, err := mergeBuckets(c.UserContext(), s.st, roomIDs, time.Duration(bucketSec)*time.Second, since); err == nil {
+			// 历史曲线加 5 秒缓存：报表页按秒轮询，而这里每次都要把**每个房间**的桶查询
+			// 跑一遍；数据本身每 METRICS_INTERVAL 才更新一次，同一窗口内的重复查询纯属浪费。
+			cacheKey := fmt.Sprintf("%d/%d", minutes, bucketSec)
+			hist, cached := historyCacheGet(cacheKey)
+			if !cached {
+				var herr error
+				hist, herr = mergeBuckets(c.UserContext(), s.st, roomIDs, time.Duration(bucketSec)*time.Second, since)
+				if herr == nil {
+					historyCachePut(cacheKey, hist)
+				}
+			}
+			if hist != nil {
 				out["history"] = hist
 				out["dbAvailable"] = true
 			}
@@ -349,8 +360,15 @@ func (s *Server) build() *fiber.App {
 	// 录制文件就是会议的音视频内容，属于敏感数据，所以访问控制与 /token 一致：
 	// 非 development 环境必须带 X-API-Key（复用同一个运维密钥，少一个配置项）。
 	recordKeyOK := func(c *fiber.Ctx) bool {
-		if cfg.AppEnv == "development" || cfg.TokenAPIKey == "" {
-			return true // 开发环境或未配置密钥时不拦（与 /token 的既有行为保持一致）
+		if cfg.AppEnv == "development" {
+			return true // 开发环境不拦，本地开箱可用
+		}
+		// 以前是 `cfg.TokenAPIKey == "" → return true`——**失败即放行**：
+		// 生产一旦忘了配密钥，录制文件这份会议音视频内容就完全公开。
+		// 改成失败即拒绝：没配密钥 = 只有带有效令牌的人能下（当前即无人能下），
+		// 宁可下载不可用，也不能把会议内容敞开。
+		if cfg.TokenAPIKey == "" {
+			return false
 		}
 		return c.Get("X-API-Key") == cfg.TokenAPIKey
 	}
@@ -411,7 +429,18 @@ func (s *Server) build() *fiber.App {
 	// 注意 gqlgen 的 handler 是 net/http 的 http.Handler，必须经 adaptor.HTTPHandler
 	// 桥接到 Fiber（Fiber 官方支持的方式）。
 	gqlSrv := handler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{Resolvers: graph.New(s.st)}))
-	router.All("/graphql", adaptor.HTTPHandler(gqlSrv))
+	gqlHandler := adaptor.HTTPHandler(gqlSrv)
+	// GraphQL 之前是**直接挂载、没有任何校验**：任何人都能调用 createRoom / closeRoom /
+	// recordMetricSample，也能读到房间与会议记录。前端并不使用它（只有运维脚本/评测用它），
+	// 所以非开发环境要求 X-API-Key；开发环境保持可直接用（含 GraphiQL 调试）。
+	router.All("/graphql", func(c *fiber.Ctx) error {
+		if cfg.AppEnv != "development" {
+			if cfg.TokenAPIKey == "" || c.Get("X-API-Key") != cfg.TokenAPIKey {
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "GraphQL 需要有效的 X-API-Key"})
+			}
+		}
+		return gqlHandler(c)
+	})
 	// GraphiQL 调试页：只在开发环境挂载，生产暴露它等于把整个 schema 摆出来给人试
 	if cfg.AppEnv == "development" {
 		router.Get("/playground", adaptor.HTTPHandler(playground.Handler("easylive GraphQL", "/graphql")))

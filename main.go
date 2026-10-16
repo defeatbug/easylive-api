@@ -37,6 +37,11 @@ func main() {
 	}
 
 	cfg := config.Load()
+	// 安全配置错误必须在**启动前**拦下：见 config.Validate 的说明
+	// （AUTH_MODE=required 漏配密钥以前会静默降级为"不校验"，等于全员全权限）。
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
 	cfg.LogSummary()
 
 	ctx := context.Background()
