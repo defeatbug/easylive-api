@@ -75,6 +75,11 @@ func CreatedBy(v string) predicate.Room {
 	return predicate.Room(sql.FieldEQ(FieldCreatedBy, v))
 }
 
+// OwnerID applies equality check predicate on the "owner_id" field. It's identical to OwnerIDEQ.
+func OwnerID(v int64) predicate.Room {
+	return predicate.Room(sql.FieldEQ(FieldOwnerID, v))
+}
+
 // CreatedAt applies equality check predicate on the "created_at" field. It's identical to CreatedAtEQ.
 func CreatedAt(v time.Time) predicate.Room {
 	return predicate.Room(sql.FieldEQ(FieldCreatedAt, v))
@@ -218,6 +223,56 @@ func CreatedByEqualFold(v string) predicate.Room {
 // CreatedByContainsFold applies the ContainsFold predicate on the "created_by" field.
 func CreatedByContainsFold(v string) predicate.Room {
 	return predicate.Room(sql.FieldContainsFold(FieldCreatedBy, v))
+}
+
+// OwnerIDEQ applies the EQ predicate on the "owner_id" field.
+func OwnerIDEQ(v int64) predicate.Room {
+	return predicate.Room(sql.FieldEQ(FieldOwnerID, v))
+}
+
+// OwnerIDNEQ applies the NEQ predicate on the "owner_id" field.
+func OwnerIDNEQ(v int64) predicate.Room {
+	return predicate.Room(sql.FieldNEQ(FieldOwnerID, v))
+}
+
+// OwnerIDIn applies the In predicate on the "owner_id" field.
+func OwnerIDIn(vs ...int64) predicate.Room {
+	return predicate.Room(sql.FieldIn(FieldOwnerID, vs...))
+}
+
+// OwnerIDNotIn applies the NotIn predicate on the "owner_id" field.
+func OwnerIDNotIn(vs ...int64) predicate.Room {
+	return predicate.Room(sql.FieldNotIn(FieldOwnerID, vs...))
+}
+
+// OwnerIDGT applies the GT predicate on the "owner_id" field.
+func OwnerIDGT(v int64) predicate.Room {
+	return predicate.Room(sql.FieldGT(FieldOwnerID, v))
+}
+
+// OwnerIDGTE applies the GTE predicate on the "owner_id" field.
+func OwnerIDGTE(v int64) predicate.Room {
+	return predicate.Room(sql.FieldGTE(FieldOwnerID, v))
+}
+
+// OwnerIDLT applies the LT predicate on the "owner_id" field.
+func OwnerIDLT(v int64) predicate.Room {
+	return predicate.Room(sql.FieldLT(FieldOwnerID, v))
+}
+
+// OwnerIDLTE applies the LTE predicate on the "owner_id" field.
+func OwnerIDLTE(v int64) predicate.Room {
+	return predicate.Room(sql.FieldLTE(FieldOwnerID, v))
+}
+
+// OwnerIDIsNil applies the IsNil predicate on the "owner_id" field.
+func OwnerIDIsNil() predicate.Room {
+	return predicate.Room(sql.FieldIsNull(FieldOwnerID))
+}
+
+// OwnerIDNotNil applies the NotNil predicate on the "owner_id" field.
+func OwnerIDNotNil() predicate.Room {
+	return predicate.Room(sql.FieldNotNull(FieldOwnerID))
 }
 
 // CreatedAtEQ applies the EQ predicate on the "created_at" field.

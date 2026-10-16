@@ -541,7 +541,7 @@ func (h *Hub) handleWhiteboard(c *Client, msg *protocol.Message) {
 	room.Broadcast(&protocol.Message{Type: protocol.TypeWhiteboardOp, Op: &accepted}, "")
 }
 
-// handleRecord 是录制开关（仅主持人）。
+// handleRecord 是录制开关（**任何已入会的成员**都可以用）。
 //
 // 设计上与 moderate 完全一致：**权限在服务端强制校验**，前端隐藏按钮只是体验。
 // 录制是"转发即录制"（零转码），所以启停都是即时的：
@@ -552,9 +552,10 @@ func (h *Hub) handleRecord(c *Client, msg *protocol.Message) {
 		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
 		return
 	}
-	if !c.requireGrant(msg, c.grants().RoomAdmin, "录制操作") {
-		return
-	}
+	// **任何已入会的成员都可以录制**（不再要求主持人）：
+	// 录制是"转发即录制"，不额外消耗转码资源；会议内容对参与者本来就是可见的，
+	// 而且主持人不一定在线——把录制权限只给主持人，反而会让"想留个记录"变成做不到的事。
+	// 仍然要求已入会（上面已经校验），所以房间外的人无法操作。
 
 	switch msg.Action {
 	case protocol.ActionRecordStart:

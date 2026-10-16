@@ -52,6 +52,20 @@ func (_c *RoomCreate) SetNillableCreatedBy(v *string) *RoomCreate {
 	return _c
 }
 
+// SetOwnerID sets the "owner_id" field.
+func (_c *RoomCreate) SetOwnerID(v int64) *RoomCreate {
+	_c.mutation.SetOwnerID(v)
+	return _c
+}
+
+// SetNillableOwnerID sets the "owner_id" field if the given value is not nil.
+func (_c *RoomCreate) SetNillableOwnerID(v *int64) *RoomCreate {
+	if v != nil {
+		_c.SetOwnerID(*v)
+	}
+	return _c
+}
+
 // SetCreatedAt sets the "created_at" field.
 func (_c *RoomCreate) SetCreatedAt(v time.Time) *RoomCreate {
 	_c.mutation.SetCreatedAt(v)
@@ -231,6 +245,10 @@ func (_c *RoomCreate) createSpec() (*Room, *sqlgraph.CreateSpec) {
 		_spec.SetField(room.FieldCreatedBy, field.TypeString, value)
 		_node.CreatedBy = value
 	}
+	if value, ok := _c.mutation.OwnerID(); ok {
+		_spec.SetField(room.FieldOwnerID, field.TypeInt64, value)
+		_node.OwnerID = &value
+	}
 	if value, ok := _c.mutation.CreatedAt(); ok {
 		_spec.SetField(room.FieldCreatedAt, field.TypeTime, value)
 		_node.CreatedAt = value
@@ -332,6 +350,30 @@ func (u *RoomUpsert) SetCreatedBy(v string) *RoomUpsert {
 // UpdateCreatedBy sets the "created_by" field to the value that was provided on create.
 func (u *RoomUpsert) UpdateCreatedBy() *RoomUpsert {
 	u.SetExcluded(room.FieldCreatedBy)
+	return u
+}
+
+// SetOwnerID sets the "owner_id" field.
+func (u *RoomUpsert) SetOwnerID(v int64) *RoomUpsert {
+	u.Set(room.FieldOwnerID, v)
+	return u
+}
+
+// UpdateOwnerID sets the "owner_id" field to the value that was provided on create.
+func (u *RoomUpsert) UpdateOwnerID() *RoomUpsert {
+	u.SetExcluded(room.FieldOwnerID)
+	return u
+}
+
+// AddOwnerID adds v to the "owner_id" field.
+func (u *RoomUpsert) AddOwnerID(v int64) *RoomUpsert {
+	u.Add(room.FieldOwnerID, v)
+	return u
+}
+
+// ClearOwnerID clears the value of the "owner_id" field.
+func (u *RoomUpsert) ClearOwnerID() *RoomUpsert {
+	u.SetNull(room.FieldOwnerID)
 	return u
 }
 
@@ -441,6 +483,34 @@ func (u *RoomUpsertOne) SetCreatedBy(v string) *RoomUpsertOne {
 func (u *RoomUpsertOne) UpdateCreatedBy() *RoomUpsertOne {
 	return u.Update(func(s *RoomUpsert) {
 		s.UpdateCreatedBy()
+	})
+}
+
+// SetOwnerID sets the "owner_id" field.
+func (u *RoomUpsertOne) SetOwnerID(v int64) *RoomUpsertOne {
+	return u.Update(func(s *RoomUpsert) {
+		s.SetOwnerID(v)
+	})
+}
+
+// AddOwnerID adds v to the "owner_id" field.
+func (u *RoomUpsertOne) AddOwnerID(v int64) *RoomUpsertOne {
+	return u.Update(func(s *RoomUpsert) {
+		s.AddOwnerID(v)
+	})
+}
+
+// UpdateOwnerID sets the "owner_id" field to the value that was provided on create.
+func (u *RoomUpsertOne) UpdateOwnerID() *RoomUpsertOne {
+	return u.Update(func(s *RoomUpsert) {
+		s.UpdateOwnerID()
+	})
+}
+
+// ClearOwnerID clears the value of the "owner_id" field.
+func (u *RoomUpsertOne) ClearOwnerID() *RoomUpsertOne {
+	return u.Update(func(s *RoomUpsert) {
+		s.ClearOwnerID()
 	})
 }
 
@@ -722,6 +792,34 @@ func (u *RoomUpsertBulk) SetCreatedBy(v string) *RoomUpsertBulk {
 func (u *RoomUpsertBulk) UpdateCreatedBy() *RoomUpsertBulk {
 	return u.Update(func(s *RoomUpsert) {
 		s.UpdateCreatedBy()
+	})
+}
+
+// SetOwnerID sets the "owner_id" field.
+func (u *RoomUpsertBulk) SetOwnerID(v int64) *RoomUpsertBulk {
+	return u.Update(func(s *RoomUpsert) {
+		s.SetOwnerID(v)
+	})
+}
+
+// AddOwnerID adds v to the "owner_id" field.
+func (u *RoomUpsertBulk) AddOwnerID(v int64) *RoomUpsertBulk {
+	return u.Update(func(s *RoomUpsert) {
+		s.AddOwnerID(v)
+	})
+}
+
+// UpdateOwnerID sets the "owner_id" field to the value that was provided on create.
+func (u *RoomUpsertBulk) UpdateOwnerID() *RoomUpsertBulk {
+	return u.Update(func(s *RoomUpsert) {
+		s.UpdateOwnerID()
+	})
+}
+
+// ClearOwnerID clears the value of the "owner_id" field.
+func (u *RoomUpsertBulk) ClearOwnerID() *RoomUpsertBulk {
+	return u.Update(func(s *RoomUpsert) {
+		s.ClearOwnerID()
 	})
 }
 

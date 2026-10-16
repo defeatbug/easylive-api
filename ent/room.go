@@ -22,6 +22,8 @@ type Room struct {
 	Title string `json:"title,omitempty"`
 	// 创建者身份（来自令牌 sub；无鉴权模式下是昵称）
 	CreatedBy string `json:"created_by,omitempty"`
+	// 创建者用户 ID；谁创建的会议，谁就是该会议的主持人。为空表示演示模式（无鉴权）下创建的
+	OwnerID *int64 `json:"owner_id,omitempty"`
 	// CreatedAt holds the value of the "created_at" field.
 	CreatedAt time.Time `json:"created_at,omitempty"`
 	// UpdatedAt holds the value of the "updated_at" field.
@@ -57,6 +59,8 @@ func (*Room) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
+		case room.FieldOwnerID:
+			values[i] = new(sql.NullInt64)
 		case room.FieldID, room.FieldTitle, room.FieldCreatedBy:
 			values[i] = new(sql.NullString)
 		case room.FieldCreatedAt, room.FieldUpdatedAt, room.FieldClosedAt:
@@ -93,6 +97,13 @@ func (_m *Room) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field created_by", values[i])
 			} else if value.Valid {
 				_m.CreatedBy = value.String
+			}
+		case room.FieldOwnerID:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field owner_id", values[i])
+			} else if value.Valid {
+				_m.OwnerID = new(int64)
+				*_m.OwnerID = value.Int64
 			}
 		case room.FieldCreatedAt:
 			if value, ok := values[i].(*sql.NullTime); !ok {
@@ -159,6 +170,11 @@ func (_m *Room) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("created_by=")
 	builder.WriteString(_m.CreatedBy)
+	builder.WriteString(", ")
+	if v := _m.OwnerID; v != nil {
+		builder.WriteString("owner_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
 	builder.WriteString(", ")
 	builder.WriteString("created_at=")
 	builder.WriteString(_m.CreatedAt.Format(time.ANSIC))

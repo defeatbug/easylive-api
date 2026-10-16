@@ -817,6 +817,8 @@ type RoomMutation struct {
 	id              *string
 	title           *string
 	created_by      *string
+	owner_id        *int64
+	addowner_id     *int64
 	created_at      *time.Time
 	updated_at      *time.Time
 	closed_at       *time.Time
@@ -1003,6 +1005,76 @@ func (m *RoomMutation) OldCreatedBy(ctx context.Context) (v string, err error) {
 // ResetCreatedBy resets all changes to the "created_by" field.
 func (m *RoomMutation) ResetCreatedBy() {
 	m.created_by = nil
+}
+
+// SetOwnerID sets the "owner_id" field.
+func (m *RoomMutation) SetOwnerID(i int64) {
+	m.owner_id = &i
+	m.addowner_id = nil
+}
+
+// OwnerID returns the value of the "owner_id" field in the mutation.
+func (m *RoomMutation) OwnerID() (r int64, exists bool) {
+	v := m.owner_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldOwnerID returns the old "owner_id" field's value of the Room entity.
+// If the Room object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *RoomMutation) OldOwnerID(ctx context.Context) (v *int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldOwnerID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldOwnerID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldOwnerID: %w", err)
+	}
+	return oldValue.OwnerID, nil
+}
+
+// AddOwnerID adds i to the "owner_id" field.
+func (m *RoomMutation) AddOwnerID(i int64) {
+	if m.addowner_id != nil {
+		*m.addowner_id += i
+	} else {
+		m.addowner_id = &i
+	}
+}
+
+// AddedOwnerID returns the value that was added to the "owner_id" field in this mutation.
+func (m *RoomMutation) AddedOwnerID() (r int64, exists bool) {
+	v := m.addowner_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ClearOwnerID clears the value of the "owner_id" field.
+func (m *RoomMutation) ClearOwnerID() {
+	m.owner_id = nil
+	m.addowner_id = nil
+	m.clearedFields[room.FieldOwnerID] = struct{}{}
+}
+
+// OwnerIDCleared returns if the "owner_id" field was cleared in this mutation.
+func (m *RoomMutation) OwnerIDCleared() bool {
+	_, ok := m.clearedFields[room.FieldOwnerID]
+	return ok
+}
+
+// ResetOwnerID resets all changes to the "owner_id" field.
+func (m *RoomMutation) ResetOwnerID() {
+	m.owner_id = nil
+	m.addowner_id = nil
+	delete(m.clearedFields, room.FieldOwnerID)
 }
 
 // SetCreatedAt sets the "created_at" field.
@@ -1214,12 +1286,15 @@ func (m *RoomMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *RoomMutation) Fields() []string {
-	fields := make([]string, 0, 5)
+	fields := make([]string, 0, 6)
 	if m.title != nil {
 		fields = append(fields, room.FieldTitle)
 	}
 	if m.created_by != nil {
 		fields = append(fields, room.FieldCreatedBy)
+	}
+	if m.owner_id != nil {
+		fields = append(fields, room.FieldOwnerID)
 	}
 	if m.created_at != nil {
 		fields = append(fields, room.FieldCreatedAt)
@@ -1242,6 +1317,8 @@ func (m *RoomMutation) Field(name string) (ent.Value, bool) {
 		return m.Title()
 	case room.FieldCreatedBy:
 		return m.CreatedBy()
+	case room.FieldOwnerID:
+		return m.OwnerID()
 	case room.FieldCreatedAt:
 		return m.CreatedAt()
 	case room.FieldUpdatedAt:
@@ -1261,6 +1338,8 @@ func (m *RoomMutation) OldField(ctx context.Context, name string) (ent.Value, er
 		return m.OldTitle(ctx)
 	case room.FieldCreatedBy:
 		return m.OldCreatedBy(ctx)
+	case room.FieldOwnerID:
+		return m.OldOwnerID(ctx)
 	case room.FieldCreatedAt:
 		return m.OldCreatedAt(ctx)
 	case room.FieldUpdatedAt:
@@ -1290,6 +1369,13 @@ func (m *RoomMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetCreatedBy(v)
 		return nil
+	case room.FieldOwnerID:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetOwnerID(v)
+		return nil
 	case room.FieldCreatedAt:
 		v, ok := value.(time.Time)
 		if !ok {
@@ -1318,13 +1404,21 @@ func (m *RoomMutation) SetField(name string, value ent.Value) error {
 // AddedFields returns all numeric fields that were incremented/decremented during
 // this mutation.
 func (m *RoomMutation) AddedFields() []string {
-	return nil
+	var fields []string
+	if m.addowner_id != nil {
+		fields = append(fields, room.FieldOwnerID)
+	}
+	return fields
 }
 
 // AddedField returns the numeric value that was incremented/decremented on a field
 // with the given name. The second boolean return value indicates that this field
 // was not set, or was not defined in the schema.
 func (m *RoomMutation) AddedField(name string) (ent.Value, bool) {
+	switch name {
+	case room.FieldOwnerID:
+		return m.AddedOwnerID()
+	}
 	return nil, false
 }
 
@@ -1333,6 +1427,13 @@ func (m *RoomMutation) AddedField(name string) (ent.Value, bool) {
 // type.
 func (m *RoomMutation) AddField(name string, value ent.Value) error {
 	switch name {
+	case room.FieldOwnerID:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddOwnerID(v)
+		return nil
 	}
 	return fmt.Errorf("unknown Room numeric field %s", name)
 }
@@ -1341,6 +1442,9 @@ func (m *RoomMutation) AddField(name string, value ent.Value) error {
 // mutation.
 func (m *RoomMutation) ClearedFields() []string {
 	var fields []string
+	if m.FieldCleared(room.FieldOwnerID) {
+		fields = append(fields, room.FieldOwnerID)
+	}
 	if m.FieldCleared(room.FieldClosedAt) {
 		fields = append(fields, room.FieldClosedAt)
 	}
@@ -1358,6 +1462,9 @@ func (m *RoomMutation) FieldCleared(name string) bool {
 // error if the field is not defined in the schema.
 func (m *RoomMutation) ClearField(name string) error {
 	switch name {
+	case room.FieldOwnerID:
+		m.ClearOwnerID()
+		return nil
 	case room.FieldClosedAt:
 		m.ClearClosedAt()
 		return nil
@@ -1374,6 +1481,9 @@ func (m *RoomMutation) ResetField(name string) error {
 		return nil
 	case room.FieldCreatedBy:
 		m.ResetCreatedBy()
+		return nil
+	case room.FieldOwnerID:
+		m.ResetOwnerID()
 		return nil
 	case room.FieldCreatedAt:
 		m.ResetCreatedAt()

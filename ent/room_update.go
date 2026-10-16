@@ -57,6 +57,33 @@ func (_u *RoomUpdate) SetNillableCreatedBy(v *string) *RoomUpdate {
 	return _u
 }
 
+// SetOwnerID sets the "owner_id" field.
+func (_u *RoomUpdate) SetOwnerID(v int64) *RoomUpdate {
+	_u.mutation.ResetOwnerID()
+	_u.mutation.SetOwnerID(v)
+	return _u
+}
+
+// SetNillableOwnerID sets the "owner_id" field if the given value is not nil.
+func (_u *RoomUpdate) SetNillableOwnerID(v *int64) *RoomUpdate {
+	if v != nil {
+		_u.SetOwnerID(*v)
+	}
+	return _u
+}
+
+// AddOwnerID adds value to the "owner_id" field.
+func (_u *RoomUpdate) AddOwnerID(v int64) *RoomUpdate {
+	_u.mutation.AddOwnerID(v)
+	return _u
+}
+
+// ClearOwnerID clears the value of the "owner_id" field.
+func (_u *RoomUpdate) ClearOwnerID() *RoomUpdate {
+	_u.mutation.ClearOwnerID()
+	return _u
+}
+
 // SetUpdatedAt sets the "updated_at" field.
 func (_u *RoomUpdate) SetUpdatedAt(v time.Time) *RoomUpdate {
 	_u.mutation.SetUpdatedAt(v)
@@ -175,6 +202,15 @@ func (_u *RoomUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.CreatedBy(); ok {
 		_spec.SetField(room.FieldCreatedBy, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.OwnerID(); ok {
+		_spec.SetField(room.FieldOwnerID, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedOwnerID(); ok {
+		_spec.AddField(room.FieldOwnerID, field.TypeInt64, value)
+	}
+	if _u.mutation.OwnerIDCleared() {
+		_spec.ClearField(room.FieldOwnerID, field.TypeInt64)
+	}
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(room.FieldUpdatedAt, field.TypeTime, value)
 	}
@@ -274,6 +310,33 @@ func (_u *RoomUpdateOne) SetNillableCreatedBy(v *string) *RoomUpdateOne {
 	if v != nil {
 		_u.SetCreatedBy(*v)
 	}
+	return _u
+}
+
+// SetOwnerID sets the "owner_id" field.
+func (_u *RoomUpdateOne) SetOwnerID(v int64) *RoomUpdateOne {
+	_u.mutation.ResetOwnerID()
+	_u.mutation.SetOwnerID(v)
+	return _u
+}
+
+// SetNillableOwnerID sets the "owner_id" field if the given value is not nil.
+func (_u *RoomUpdateOne) SetNillableOwnerID(v *int64) *RoomUpdateOne {
+	if v != nil {
+		_u.SetOwnerID(*v)
+	}
+	return _u
+}
+
+// AddOwnerID adds value to the "owner_id" field.
+func (_u *RoomUpdateOne) AddOwnerID(v int64) *RoomUpdateOne {
+	_u.mutation.AddOwnerID(v)
+	return _u
+}
+
+// ClearOwnerID clears the value of the "owner_id" field.
+func (_u *RoomUpdateOne) ClearOwnerID() *RoomUpdateOne {
+	_u.mutation.ClearOwnerID()
 	return _u
 }
 
@@ -424,6 +487,15 @@ func (_u *RoomUpdateOne) sqlSave(ctx context.Context) (_node *Room, err error) {
 	}
 	if value, ok := _u.mutation.CreatedBy(); ok {
 		_spec.SetField(room.FieldCreatedBy, field.TypeString, value)
+	}
+	if value, ok := _u.mutation.OwnerID(); ok {
+		_spec.SetField(room.FieldOwnerID, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedOwnerID(); ok {
+		_spec.AddField(room.FieldOwnerID, field.TypeInt64, value)
+	}
+	if _u.mutation.OwnerIDCleared() {
+		_spec.ClearField(room.FieldOwnerID, field.TypeInt64)
 	}
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(room.FieldUpdatedAt, field.TypeTime, value)

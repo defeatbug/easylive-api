@@ -108,7 +108,7 @@ func main() {
 				// 拿它去建账号只会拿到 "context canceled"（第一版就是这么写的，
 				// 表现为"迁移成功、表也在，但登录始终 401"）。
 				bctx, bcancel := context.WithTimeout(ctx, 30*time.Second)
-				created, err := st.EnsureUser(bctx, cfg.AdminUsername, cfg.AdminUsername, cfg.AdminPassword, "host")
+				created, err := st.EnsureUser(bctx, cfg.AdminUsername, cfg.AdminUsername, cfg.AdminPassword, "admin")
 				bcancel()
 				switch {
 				case err != nil:

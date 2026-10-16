@@ -205,3 +205,42 @@ func (s *Store) BumpSessionVersion(ctx context.Context, id int64) (int64, error)
 	}
 	return version, nil
 }
+
+// ListUsers 分页列出用户（管理员查看用）。**绝不返回口令哈希之外的敏感内容**——
+// 这里返回的 password_hash 字段由调用方负责不放进响应（路由层用 userJSON 序列化）。
+func (s *Store) ListUsers(ctx context.Context, limit, offset int) ([]User, error) {
+	if s.Pool == nil {
+		return nil, errors.New("数据层不可用")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.Pool.Query(ctx,
+		`SELECT `+userCols+` FROM users ORDER BY id ASC LIMIT $1 OFFSET $2`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]User, 0, limit)
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *u)
+	}
+	return out, rows.Err()
+}
+
+// CountUsers 返回用户总数（分页需要）。
+func (s *Store) CountUsers(ctx context.Context) (int, error) {
+	if s.Pool == nil {
+		return 0, errors.New("数据层不可用")
+	}
+	var n int
+	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM users`).Scan(&n)
+	return n, err
+}

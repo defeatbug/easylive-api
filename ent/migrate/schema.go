@@ -37,6 +37,7 @@ var (
 		{Name: "id", Type: field.TypeString},
 		{Name: "title", Type: field.TypeString, Default: ""},
 		{Name: "created_by", Type: field.TypeString, Default: ""},
+		{Name: "owner_id", Type: field.TypeInt64, Nullable: true},
 		{Name: "created_at", Type: field.TypeTime},
 		{Name: "updated_at", Type: field.TypeTime},
 		{Name: "closed_at", Type: field.TypeTime, Nullable: true},

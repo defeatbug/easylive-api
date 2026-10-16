@@ -50,11 +50,11 @@ func init() {
 	// room.DefaultCreatedBy holds the default value on creation for the created_by field.
 	room.DefaultCreatedBy = roomDescCreatedBy.Default.(string)
 	// roomDescCreatedAt is the schema descriptor for created_at field.
-	roomDescCreatedAt := roomFields[3].Descriptor()
+	roomDescCreatedAt := roomFields[4].Descriptor()
 	// room.DefaultCreatedAt holds the default value on creation for the created_at field.
 	room.DefaultCreatedAt = roomDescCreatedAt.Default.(func() time.Time)
 	// roomDescUpdatedAt is the schema descriptor for updated_at field.
-	roomDescUpdatedAt := roomFields[4].Descriptor()
+	roomDescUpdatedAt := roomFields[5].Descriptor()
 	// room.DefaultUpdatedAt holds the default value on creation for the updated_at field.
 	room.DefaultUpdatedAt = roomDescUpdatedAt.Default.(func() time.Time)
 	// room.UpdateDefaultUpdatedAt holds the default value on update for the updated_at field.

@@ -287,6 +287,13 @@ func (s *Server) build() *fiber.App {
 	router.Get("/auth/capabilities", s.handleCapabilities)
 	// 自助注册（跟随鉴权：鉴权开着就可用；注册出来的账号一律是 member）
 	router.Post("/auth/register", s.handleRegister)
+
+	// ---- 会议：创建（生成 8 位编码）与查询 ----
+	router.Post("/rooms", s.handleCreateRoom)
+	router.Get("/rooms/mine", s.handleMyRooms)
+	router.Get("/rooms/:id", s.handleRoomInfo)
+	// ---- 管理员：分页查看全部用户 ----
+	router.Get("/admin/users", s.handleAdminUsers)
 	// 账号资料：改昵称/用户名、改密码、头像。全部要求当前口令或已登录会话。
 	router.Patch("/auth/profile", s.handleUpdateProfile)
 	router.Post("/auth/password", s.handleChangePassword)
@@ -361,9 +368,19 @@ func (s *Server) build() *fiber.App {
 			RoomAdmin:      req.RoomAdmin != nil && *req.RoomAdmin,
 		}
 		if sessUser != nil {
-			// 主持人权限**由服务端按角色判定**：role=host 才能拿到 roomAdmin。
-			// 这一行是整个登录体系里最关键的一行——前端说什么都不算数。
-			grant.RoomAdmin = sessUser.Role == "host"
+			// 主持人权限**由服务端判定**，前端说什么都不算数：
+			//   · 管理员：在任何会议里都是主持人（权限最高）；
+			//   · 普通用户：只在**自己创建**的那个会议里是主持人。
+			// 这就是"谁创建会议，谁就是主持人"，并且它按用户 ID 记录，
+			// 所以之后改了用户名也不会丢掉主持权。
+			switch {
+			case sessUser.Role == "admin":
+				grant.RoomAdmin = true
+			default:
+				if owner, err := s.st.RoomOwner(c.UserContext(), req.RoomID); err == nil && owner == sessUser.ID {
+					grant.RoomAdmin = true
+				}
+			}
 		}
 		token, exp, err := a.Issue(req.Identity, req.Name, grant)
 		if err != nil {

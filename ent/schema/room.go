@@ -32,6 +32,10 @@ func (Room) Fields() []ent.Field {
 		field.String("created_by").
 			Comment("创建者身份（来自令牌 sub；无鉴权模式下是昵称）").
 			Default(""),
+		field.Int64("owner_id").
+			Comment("创建者用户 ID；谁创建的会议，谁就是该会议的主持人。为空表示演示模式（无鉴权）下创建的").
+			Optional().
+			Nillable(),
 		field.Time("created_at").
 			Default(time.Now).
 			Immutable(),
