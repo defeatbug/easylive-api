@@ -220,7 +220,7 @@ func (p *Participant) createPubPC() (*webrtc.PeerConnection, error) {
 	pc.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		// 必须持续读取接收端 RTCP：Pion 的拦截器链路是"有人读才流动"，
 		// 不读的话发布端回来的 RR/SR/NACK 会一直堆在缓冲里（RTT 统计也不会有值）。
-		go drainReceiverRTCP(receiver)
+		safeGo("rtcp-receiver/"+p.ID, func() { drainReceiverRTCP(receiver) })
 
 		// 来源判定：音频一律 microphone；视频用本次协商声明的 source（camera / screen）
 		source := p.takePendingSource()
@@ -237,7 +237,8 @@ func (p *Participant) createPubPC() (*webrtc.PeerConnection, error) {
 		if p.room != nil {
 			p.room.onTrackPublished(p, track)
 		}
-		go track.Pump() // 唯一的转发热路径
+		// 唯一的转发热路径：一条轨道一个协程，必须隔离——它 panic 会打掉所有人的会议
+		safeGo("pump/"+track.info.ID, track.Pump)
 	})
 
 	// 数据通道：客户端在 pub 连接上创建（客户端是 offerer），这里接收。
@@ -353,7 +354,7 @@ func (p *Participant) Subscribe(track *PublishedTrack) (string, error) {
 	}
 	// 订阅端：必须持续读 RTCP（否则 Pion 内部管道阻塞）。
 	// PLI/FIR 的转发由全局拦截器 keyframeForwarder 负责（按 SSRC 查表），这里只排空。
-	go drainRTCP(sender)
+	safeGo("rtcp-sender/"+p.ID, func() { drainRTCP(sender) })
 
 	// 新订阅者需要立刻拿到关键帧，否则会黑屏到发布者下一个自然关键帧；
 	// 若轨道当前一个包都没有（屏幕画面静止等），NudgeKeyframe 会持续催几次。

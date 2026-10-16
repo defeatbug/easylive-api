@@ -315,7 +315,7 @@ func newRoom(id string, m *Manager) *Room {
 		speakerStop:   make(chan struct{}),
 		hands:         make(map[string]bool),
 	}
-	go r.speakerLoop()
+	safeGo("speaker-loop/"+r.ID, r.speakerLoop)
 	return r
 }
 

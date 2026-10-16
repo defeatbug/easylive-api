@@ -3,6 +3,7 @@ package signaling
 import (
 	"encoding/json"
 	"log"
+	"sync/atomic"
 	"time"
 
 	ws "github.com/fasthttp/websocket"
@@ -27,6 +28,12 @@ func Mount(router fiber.Router, hub *Hub) {
 	router.Get("/", fiberws.New(hub.handleConnection))
 }
 
+// messageFloods 统计因超速被断开的连接数（观测用）。
+var messageFloods atomic.Uint64
+
+// MessageFloodCount 返回被断开的超速连接数。
+func MessageFloodCount() uint64 { return messageFloods.Load() }
+
 // handleConnection 是每条连接的主循环：读消息 → 分发 → 回写由 writePump 负责。
 func (h *Hub) handleConnection(conn *fiberws.Conn) {
 	ip := "unknown"
@@ -37,7 +44,8 @@ func (h *Hub) handleConnection(conn *fiberws.Conn) {
 	}
 
 	client := newClient(conn, h, h.cfg, ip)
-	go client.writePump()
+	// writePump 也要隔离：它 panic 会带走整个进程（所有人断开）
+	sfu.SafeGo("signaling-write-pump/"+client.ID, client.writePump)
 	h.Register(client)
 	defer client.Close()
 
@@ -56,6 +64,15 @@ func (h *Hub) handleConnection(conn *fiberws.Conn) {
 			return
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+		// 单连接消息总预算：防止一个客户端刷消息、每条都引发全员广播。
+		// 超限直接断开——正常客户端碰不到这个上限。
+		if !client.allowMessage() {
+			messageFloods.Add(1)
+			log.Printf("signaling: 消息速率超限，断开 session=%s", client.ID)
+			client.fail(nil, protocol.ErrBadRequest, "消息发送过快，连接已断开")
+			return
+		}
 
 		var msg protocol.Message
 		if err := json.Unmarshal(data, &msg); err != nil {

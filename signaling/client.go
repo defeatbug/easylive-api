@@ -53,8 +53,13 @@ type Client struct {
 	// mu 保护以下会话字段（由信令处理协程写、writePump/其他协程读）
 	mu sync.RWMutex
 	// 白板提交限速（固定窗口）：白板是高频小消息，必须挡住"按住不放刷满房间状态"。
-	wbWindow      time.Time
-	wbCount       int
+	wbWindow time.Time
+	wbCount  int
+	// msgWindow/msgCount 是**所有消息**的总预算（固定窗口）。
+	// 白板限速只覆盖白板；没有这层总预算时，一个客户端可以对 chat 等消息无限刷，
+	// 每条都可能触发一次全员广播——那就是一个放大攻击。
+	msgWindow     time.Time
+	msgCount      int
 	roomID        string
 	participantID string
 	participant   *sfu.Participant
@@ -215,6 +220,26 @@ func (c *Client) grants() *auth.VideoGrant {
 	}
 	g := cl.Video
 	return &g
+}
+
+// maxMessagesPerSecond 是单连接每秒的消息总量上限。
+//
+// 取 200 的依据：正常客户端的上限大概是——白板笔画几十条、trickle ICE 十几条、
+// 表情/聊天个位数、加上若干 SDP，合计几十条/秒。200 远高于正常使用，
+// 又远低于"刷广播"所需的量级。超限直接断开，而不是只丢消息：
+// 正常客户端永远碰不到这个上限，碰到的就是异常的。
+const maxMessagesPerSecond = 200
+
+// allowMessage 做单连接消息总量的固定窗口限速。
+func (c *Client) allowMessage() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if now.Sub(c.msgWindow) >= time.Second {
+		c.msgWindow, c.msgCount = now, 0
+	}
+	c.msgCount++
+	return c.msgCount <= maxMessagesPerSecond
 }
 
 // allowWhiteboardOp 做每秒提交上限的固定窗口限速。

@@ -254,7 +254,7 @@ func (t *PublishedTrack) NudgeKeyframe() {
 	if t.remote == nil {
 		return
 	}
-	go func() {
+	safeGo("keyframe-nudge/"+t.info.ID, func() {
 		for i := 0; i < 4; i++ {
 			if t.packets.Load() > 0 {
 				return // 已经有数据在流，不需要再催
@@ -262,7 +262,7 @@ func (t *PublishedTrack) NudgeKeyframe() {
 			t.RequestKeyframe()
 			time.Sleep(1200 * time.Millisecond)
 		}
-	}()
+	})
 }
 
 // attachRecorder 挂上录制写入器（发布时或主持人中途开始录制时调用）。
