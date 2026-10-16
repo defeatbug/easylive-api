@@ -103,6 +103,31 @@ func (s *Server) build() *fiber.App {
 	}
 
 	// ---- 健康检查与运行指标（评测脚本的采集入口）----
+	// 逐轨道指标：字段命名对齐浏览器 getStats 的口径，便于把两端放进同一张表。
+	// ?format=csv 导出稳定的列顺序，直接给评测脚本/论文图表用。
+	router.Get("/metrics/tracks", func(c *fiber.Ctx) error {
+		rows := s.manager.AllTrackStats()
+		if c.Query("format") != "csv" {
+			return c.JSON(fiber.Map{"tracks": rows, "count": len(rows)})
+		}
+		cols := []string{"roomId", "id", "publisherId", "kind", "source", "codec", "payloadType",
+			"muted", "recording", "packets", "bytes", "dropped", "writeFails", "subscribers",
+			"pliForwarded", "pliSuppressed", "keyframes"}
+		var b strings.Builder
+		b.WriteString(strings.Join(cols, ","))
+		b.WriteString("\n")
+		for _, row := range rows {
+			vals := make([]string, 0, len(cols))
+			for _, col := range cols {
+				vals = append(vals, fmt.Sprint(row[col]))
+			}
+			b.WriteString(strings.Join(vals, ","))
+			b.WriteString("\n")
+		}
+		c.Set("Content-Type", "text/csv; charset=utf-8")
+		return c.SendString(b.String())
+	})
+
 	router.Get("/healthz", func(c *fiber.Ctx) error {
 		rooms, participants, tracks := s.manager.Stats()
 
@@ -115,6 +140,7 @@ func (s *Server) build() *fiber.App {
 		}
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
+		pliForwarded, pliSuppressed := sfu.FrameRequestStats()
 		return c.JSON(fiber.Map{
 			"status":       "ok",
 			"uptimeSec":    int(time.Since(s.started).Seconds()),
@@ -131,6 +157,15 @@ func (s *Server) build() *fiber.App {
 			// 这两个字段是给"我到底接没接上数据库"这个问题准备的：
 			// 数据层不可用时整层会被跳过（媒体优先的设计），没有这两个字段的话
 			// 从外部完全看不出来，只能靠翻启动日志猜。
+			// 防护机制的计数：这些机制**必须能被看见**，否则等于不可证伪。
+			// 三个数字的期望值都是 0（或恒为 0 增长）：长期增长说明有客户端异常或有 bug。
+			"goroutinePanics": sfu.GoroutinePanicCount(),
+			"messageFloods":   signaling.MessageFloodCount(),
+			"malformedRTCP":   sfu.MalformedRTCPCount(),
+			// 订阅端关键帧请求的转发量与被限流量：转发量说明弱网恢复在起作用，
+			// 被限流量说明限流挡下了多少"无意义的关键帧风暴"。
+			"pliForwarded":    pliForwarded,
+			"pliSuppressed":   pliSuppressed,
 			"dataLayer":       dataLayer,
 			"metricsSampling": metricsSampling,
 		})

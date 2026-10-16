@@ -909,6 +909,52 @@ func (r *Room) SetHand(participantID string, raised bool) {
 }
 
 // Stats 返回房间级指标，供评测脚本采集。
+// AllTrackStats 返回所有房间的轨道画像（每行带 roomId），供 /metrics/tracks 使用。
+func (m *Manager) AllTrackStats() []map[string]any {
+	type roomRef struct {
+		id string
+		r  *Room
+	}
+	m.mu.RLock()
+	rooms := make([]roomRef, 0, len(m.rooms))
+	for id, r := range m.rooms {
+		rooms = append(rooms, roomRef{id: id, r: r})
+	}
+	m.mu.RUnlock()
+	sort.Slice(rooms, func(i, j int) bool { return rooms[i].id < rooms[j].id })
+
+	out := make([]map[string]any, 0, len(rooms))
+	for _, rr := range rooms {
+		for _, row := range rr.r.TrackStats() {
+			out = append(out, map[string]any{
+				"roomId": rr.id,
+				"id":     row.ID, "publisherId": row.PublisherID, "kind": row.Kind, "source": row.Source,
+				"codec": row.Codec, "payloadType": row.PayloadType, "muted": row.Muted,
+				"recording": row.Recording, "packets": row.Packets, "bytes": row.Bytes,
+				"dropped": row.Dropped, "writeFails": row.WriteFails, "subscribers": row.Subscribers,
+				"pliForwarded": row.PLIForwarded, "pliSuppressed": row.PLISuppressed, "keyframes": row.Keyframes,
+			})
+		}
+	}
+	return out
+}
+
+// TrackStats 返回本房间所有发布轨道的画像（按轨道 ID 排序，便于逐次对比）。
+func (r *Room) TrackStats() []TrackStatsRow {
+	r.mu.RLock()
+	tracks := make([]*PublishedTrack, 0, len(r.tracks))
+	for _, t := range r.tracks {
+		tracks = append(tracks, t)
+	}
+	r.mu.RUnlock()
+	rows := make([]TrackStatsRow, 0, len(tracks))
+	for _, t := range tracks {
+		rows = append(rows, t.TrackStats())
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return rows
+}
+
 func (r *Room) Stats() (participants, tracks int, packets, bytes uint64) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

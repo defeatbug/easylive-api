@@ -74,6 +74,11 @@ type PublishedTrack struct {
 	bytes      atomic.Uint64
 	writeFails atomic.Uint64
 	dropped    atomic.Uint64 // 因静音/关闭而被丢弃的包数（评测时能量化"静音省了多少带宽"）
+	// 以下三个是本轨道的观测计数（以前只有进程级）：订阅者数量在服务端原本不可见
+	subscribers   atomic.Int64
+	pliForwarded  atomic.Uint64
+	pliSuppressed atomic.Uint64
+	keyframes     atomic.Uint64
 
 	// muted 用原子量而不是直接改 info.Muted：转发热路径会读它，
 	// 直接读写 info 会与信令协程构成数据竞争。
@@ -201,6 +206,7 @@ func (t *PublishedTrack) RequestKeyframe() {
 		log.Printf("sfu: 跳过关键帧请求（SSRC 未知）track=%s", t.info.ID)
 		return
 	}
+	t.keyframes.Add(1)
 	pli := &rtcp.PictureLossIndication{MediaSSRC: ssrc}
 	if err := t.pubPC.WriteRTCP([]rtcp.Packet{pli}); err != nil {
 		log.Printf("sfu: 请求关键帧失败 track=%s: %v", t.info.ID, err)
@@ -221,15 +227,18 @@ func (t *PublishedTrack) RequestKeyframeThrottled() bool {
 	now := time.Now().UnixNano()
 	last := t.lastPLINs.Load()
 	if last != 0 && now-last < int64(keyframeInterval) {
+		t.pliSuppressed.Add(1)
 		pliSuppressed.Add(1)
 		return false
 	}
 	// CAS 抢占时间戳：并发订阅者同时到达时只有一个能发出去
 	if !t.lastPLINs.CompareAndSwap(last, now) {
+		t.pliSuppressed.Add(1)
 		pliSuppressed.Add(1)
 		return false
 	}
 	t.RequestKeyframe()
+	t.pliForwarded.Add(1)
 	pliForwarded.Add(1)
 	return true
 }

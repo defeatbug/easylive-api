@@ -348,7 +348,9 @@ func (p *Participant) Subscribe(track *PublishedTrack) (string, error) {
 	}
 
 	// 包一层，让"绑定失败"这类静默故障显式可见（见 tracklocal.go 的说明）
-	sender, err := pc.AddTrack(wrapTrackLocal(track.Local(), track.info.ID))
+	sender, err := pc.AddTrack(wrapTrackLocal(track.Local(), track.info.ID, func() {
+		track.subscribers.Add(1)
+	}))
 	if err != nil {
 		return "", fmt.Errorf("添加轨道到订阅连接失败: %w", err)
 	}

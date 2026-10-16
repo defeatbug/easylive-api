@@ -16,10 +16,12 @@ import (
 type bindLoggingTrackLocal struct {
 	webrtc.TrackLocal
 	label string
+	// onBind 在绑定成功时回调（用于统计真实订阅者数量）
+	onBind func()
 }
 
-func wrapTrackLocal(t webrtc.TrackLocal, label string) webrtc.TrackLocal {
-	return &bindLoggingTrackLocal{TrackLocal: t, label: label}
+func wrapTrackLocal(t webrtc.TrackLocal, label string, onBind func()) webrtc.TrackLocal {
+	return &bindLoggingTrackLocal{TrackLocal: t, label: label, onBind: onBind}
 }
 
 func (b *bindLoggingTrackLocal) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, error) {
@@ -35,5 +37,9 @@ func (b *bindLoggingTrackLocal) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCo
 	}
 	log.Printf("sfu: 轨道已绑定 track=%s mid=%s ssrc=%d pt=%d codec=%s",
 		b.label, ctx.ID(), ctx.SSRC(), params.PayloadType, params.MimeType)
+	// 绑定成功 = 多了一个真正收得到流的订阅者。这个数字以前在服务端不可见。
+	if b.onBind != nil {
+		b.onBind()
+	}
 	return params, nil
 }
