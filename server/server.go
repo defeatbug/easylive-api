@@ -105,6 +105,78 @@ func (s *Server) build() *fiber.App {
 	// ---- 健康检查与运行指标（评测脚本的采集入口）----
 	// 逐轨道指标：字段命名对齐浏览器 getStats 的口径，便于把两端放进同一张表。
 	// ?format=csv 导出稳定的列顺序，直接给评测脚本/论文图表用。
+	// 指标总览：实时状态 + 数据库里的历史曲线，供报表页一次拉齐。
+	// 数据库不可用时**不报错**，只把 dbAvailable 置为 false —— 媒体面永远优先，
+	// 报表页应当显示"无历史数据"而不是整页崩掉。
+	router.Get("/metrics/overview", func(c *fiber.Ctx) error {
+		minutes := c.QueryInt("minutes", 30)
+		if minutes < 1 {
+			minutes = 1
+		}
+		if minutes > 1440 {
+			minutes = 1440
+		}
+		bucketSec := c.QueryInt("bucket", 10)
+		if bucketSec < 1 {
+			bucketSec = 1
+		}
+		if bucketSec > 600 {
+			bucketSec = 600
+		}
+		since := time.Now().Add(-time.Duration(minutes) * time.Minute)
+
+		rooms, participants, tracks := s.manager.Stats()
+		var mem runtime.MemStats
+		runtime.ReadMemStats(&mem)
+		pliFwd, pliSup := sfu.FrameRequestStats()
+
+		out := fiber.Map{
+			"sampledAt":   time.Now().UTC().Format(time.RFC3339),
+			"windowMin":   minutes,
+			"bucketSec":   bucketSec,
+			"dbAvailable": false,
+			"history":     []any{},
+			"live": fiber.Map{
+				"rooms": rooms, "participants": participants, "tracks": tracks,
+				"goroutines":      runtime.NumGoroutine(),
+				"heapAllocMB":     float64(mem.HeapAlloc) / 1024 / 1024,
+				"cpuSeconds":      sysinfo.CPUSeconds(),
+				"goroutinePanics": sfu.GoroutinePanicCount(),
+				"messageFloods":   signaling.MessageFloodCount(),
+				"malformedRTCP":   sfu.MalformedRTCPCount(),
+				"pliForwarded":    pliFwd,
+				"pliSuppressed":   pliSup,
+			},
+		}
+
+		if s.st != nil {
+			if gm, err := s.st.GlobalMetrics(c.UserContext(), since); err == nil {
+				out["global"] = gm
+			}
+			// 房间集合 = 当前存活的 ∪ **已落库的**。
+			// 只用存活房间会有一个很容易漏掉的现象：重启后历史数据全部"消失"——
+			// 因为历史样本属于已经结束的房间。实测正是这样（重启后曲线点数 0）。
+			roomIDs := s.manager.RoomIDs()
+			seen := make(map[string]bool, len(roomIDs))
+			for _, id := range roomIDs {
+				seen[id] = true
+			}
+			if rooms, rerr := s.st.ListRooms(c.UserContext(), 200, 0); rerr == nil {
+				for _, r := range rooms {
+					if !seen[r.ID] {
+						seen[r.ID] = true
+						roomIDs = append(roomIDs, r.ID)
+					}
+				}
+			}
+			if hist, err := mergeBuckets(c.UserContext(), s.st, roomIDs, time.Duration(bucketSec)*time.Second, since); err == nil {
+				out["history"] = hist
+				out["dbAvailable"] = true
+			}
+		}
+		return c.JSON(out)
+	})
+
 	router.Get("/metrics/tracks", func(c *fiber.Ctx) error {
 		rows := s.manager.AllTrackStats()
 		if c.Query("format") != "csv" {

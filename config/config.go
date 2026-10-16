@@ -246,6 +246,12 @@ func getList(key, def string) []string {
 }
 
 func buildDSN() string {
+	// DATABASE_URL 优先。这一条以前**只写在提示信息里、代码却没读**：
+	// buildDSN 永远按 POSTGRES_* 拼 DSN，于是"设了 DATABASE_URL 却连到别处"，
+	// 表现为"迁移报成功、库里却没有表"——实测踩到，很难从日志看出问题。
+	if dsn := getStr("DATABASE_URL", ""); dsn != "" {
+		return dsn
+	}
 	host := getStr("POSTGRES_HOST", "localhost")
 	port := getStr("POSTGRES_PORT", "5432")
 	user := getStr("POSTGRES_USER", "postgres")

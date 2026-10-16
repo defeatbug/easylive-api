@@ -267,6 +267,19 @@ func (m *Manager) RoomSnapshots() []RoomSnapshot {
 }
 
 // Stats 供 /healthz 与评测脚本观测。
+// RoomIDs 返回当前所有房间 ID 的快照（按 ID 排序）。
+// 用于"把所有房间的指标曲线合并成一条全局曲线"。
+func (m *Manager) RoomIDs() []string {
+	m.mu.RLock()
+	ids := make([]string, 0, len(m.rooms))
+	for id := range m.rooms {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
+	sort.Strings(ids)
+	return ids
+}
+
 func (m *Manager) Stats() (rooms, participants, tracks int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
