@@ -259,6 +259,15 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("未知的 AUTH_MODE=%q（可选 off / optional / required）", c.AuthMode)
 	}
+	// 顺手把"注册开着没有"也说清楚：前端完全依据 /auth/capabilities 决定要不要显示注册入口，
+	// 而它默认是关的。不写这一行，就会出现"我明明做了注册页，界面上却没有注册按钮"。
+	if c.AuthMode != "off" {
+		if c.SignupEnabled {
+			log.Printf("config: 自助注册已开放（SIGNUP_ENABLED=true）：/auth/capabilities 返回 signupEnabled=true，登录页会显示注册入口")
+		} else {
+			log.Printf("config: 自助注册未开放（SIGNUP_ENABLED 未设置）：前端**不会**显示注册入口。要开放请设 SIGNUP_ENABLED=true")
+		}
+	}
 	return nil
 }
 
