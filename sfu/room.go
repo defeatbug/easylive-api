@@ -676,22 +676,24 @@ func (r *Room) Subscribe(subscriberID, trackID string) (string, error) {
 	return offer, nil
 }
 
-func (r *Room) Unsubscribe(subscriberID, trackID string) error {
+func (r *Room) Unsubscribe(subscriberID, trackID string) (string, error) {
 	r.mu.RLock()
 	sub, ok := r.participants[subscriberID]
 	r.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("参与者不存在")
+		return "", fmt.Errorf("参与者不存在")
 	}
-	if err := sub.Unsubscribe(trackID); err != nil {
-		return err
+	// 只移除单条轨道的发送器并重协商；offer 为空表示无需通知客户端
+	offer, err := sub.Unsubscribe(trackID)
+	if err != nil {
+		return "", err
 	}
 	r.mu.Lock()
 	if subs := r.subscriptions[subscriberID]; subs != nil {
 		delete(subs, trackID)
 	}
 	r.mu.Unlock()
-	return nil
+	return offer, nil
 }
 
 // SetTrackMuted 只更新状态并广播；真正的静音由发布端停发（或发静音帧）实现，
@@ -884,13 +886,24 @@ func (r *Room) AddWhiteboardOp(op protocol.WhiteboardOp, by string) (protocol.Wh
 	defer r.mu.Unlock()
 	switch op.Kind {
 	case protocol.WhiteboardUndo:
-		if len(r.whiteboard) == 0 {
-			return op, false // 没东西可撤：不广播空操作
+		// 撤销只撤自己的最后一笔：从后往前找 by 的最新一笔 stroke。
+		// 不校验归属的话，A 点撤销会擦掉 B 刚画的笔画。
+		idx := -1
+		for i := len(r.whiteboard) - 1; i >= 0; i-- {
+			if r.whiteboard[i].By == by {
+				idx = i
+				break
+			}
 		}
-		r.whiteboard = r.whiteboard[:len(r.whiteboard)-1]
-		// 撤销也要带序号广播，客户端据此做同样的裁剪
+		if idx < 0 {
+			return op, false // 自己没有可撤的笔画：不广播空操作
+		}
+		removed := r.whiteboard[idx]
+		r.whiteboard = append(r.whiteboard[:idx], r.whiteboard[idx+1:]...)
+		// 撤销也要带序号广播，并带上被撤销那一笔的序号，
+		// 客户端据此精确删除对应笔画（而不是盲目弹掉最后一笔）
 		r.whiteboardSeq++
-		return protocol.WhiteboardOp{Kind: protocol.WhiteboardUndo, By: by, Seq: r.whiteboardSeq}, true
+		return protocol.WhiteboardOp{Kind: protocol.WhiteboardUndo, By: by, Seq: r.whiteboardSeq, UndoSeq: removed.Seq}, true
 	case protocol.WhiteboardClear:
 		if len(r.whiteboard) == 0 {
 			return op, false
