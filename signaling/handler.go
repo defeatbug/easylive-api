@@ -376,8 +376,15 @@ func (h *Hub) handleUnsubscribe(c *Client, msg *protocol.Message) {
 	if !c.requireGrant(msg, c.grants().CanSubscribe, "订阅媒体") {
 		return
 	}
-	if err := room.Unsubscribe(pid, msg.TrackID); err != nil {
+	offer, err := room.Unsubscribe(pid, msg.TrackID)
+	if err != nil {
 		c.fail(msg, protocol.ErrInternal, err.Error())
+		return
+	}
+	// 订阅连接保留：把重协商的 offer 回给客户端，走已有的 subscribe 应答流程；
+	// offer 为空表示之前就没订阅，无需通知
+	if offer != "" {
+		c.reply(msg, &protocol.Message{Type: protocol.TypeSubscribeOffer, SDP: offer})
 	}
 }
 
@@ -603,8 +610,8 @@ func (h *Hub) handleWhiteboard(c *Client, msg *protocol.Message) {
 	}
 	accepted, ok := room.AddWhiteboardOp(op, pid)
 	if !ok {
-		// 白板已满 / 无可撤销内容：明确告知，而不是静默丢弃
-		c.fail(msg, protocol.ErrBadRequest, "白板内容已达上限或没有可撤销的内容，可先清空")
+		// 白板已满 / 无可撤销内容（撤销只撤自己的笔画）：明确告知，而不是静默丢弃
+		c.fail(msg, protocol.ErrBadRequest, "白板内容已达上限，或当前没有你可以撤销/清空的内容")
 		return
 	}
 	// 广播给所有人（含提交者）：白板是共享状态，不做"仅他人"的差异化
