@@ -515,6 +515,22 @@ func (h *Hub) handleFlash(c *Client, msg *protocol.Message) {
 			TS:       time.Now().UnixMilli(),
 		},
 	}, "") // 空 = 不排除任何人，发送者也会收到自己的那条
+
+	// 带文字的弹幕**同时**记一条聊天消息：
+	//   · 弹幕是瞬时的（飘几秒就没了），聊天是**历史**——发过的话应该能在聊天里找到；
+	//   · 只有带文字时才记：纯表情发一条聊天记录会变成刷屏；
+	//   · 由服务端广播而不是客户端本地塞：这样房间里**所有人**的聊天记录都一致。
+	if text != "" {
+		room.Broadcast(&protocol.Message{
+			Type: protocol.TypeChatMessage,
+			ChatMessage: &protocol.ChatMessage{
+				FromID:   pid,
+				FromName: p.Name,
+				Text:     text,
+				TS:       time.Now().UnixMilli(),
+			},
+		}, "")
+	}
 }
 
 // handleHandState 处理客户端经**信令面**上报的举手。
