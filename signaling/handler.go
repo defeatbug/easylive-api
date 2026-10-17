@@ -212,14 +212,25 @@ func (h *Hub) tryResume(c *Client, msg *protocol.Message, claims *auth.Claims) b
 	if !ok {
 		return false
 	}
-	p, ok := room.Resume(entry.participantID, c, msg.ResetMedia)
-	if !ok {
-		return false
-	}
 	// 鉴权开启时，恢复请求的令牌身份必须与原参与者一致：
 	// 否则拿到别人 resumeToken 的人就能顶替其身份（令牌泄漏的影响面会扩大）。
-	if claims != nil && p.Identity() != claims.Identity() {
-		log.Printf("signaling: 恢复请求的令牌身份与原参与者不一致，拒绝 session=%s", c.ID)
+	// 注意：校验必须在 room.Resume() 之前——Resume 会切换 notifier、停掉宽限期
+	// 计时器并广播状态变更，校验失败时不应产生这些副作用（否则旧参与者已被
+	// 激活，外层又会创建一个新参与者，同一身份出现两个人）。
+	if claims != nil {
+		p0, ok := room.ParticipantByID(entry.participantID)
+		if !ok || p0.Identity() != claims.Identity() {
+			log.Printf("signaling: 恢复请求的令牌身份与原参与者不一致，拒绝 session=%s", c.ID)
+			// 令牌在 takeResume 时已被消费；身份校验失败不算一次真正的恢复，
+			// 把令牌放回去，真正的持有者仍可在宽限期内重试。
+			if ttl := time.Until(entry.expiresAt); ttl > 0 {
+				h.registerResume(msg.ResumeToken, entry.roomID, entry.participantID, ttl)
+			}
+			return false
+		}
+	}
+	p, ok := room.Resume(entry.participantID, c, msg.ResetMedia)
+	if !ok {
 		return false
 	}
 	c.setClaims(claims)
