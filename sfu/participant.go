@@ -284,6 +284,9 @@ func (p *Participant) createPubPC() (*webrtc.PeerConnection, error) {
 			log.Printf("sfu: 创建反向数据通道失败 participant=%s: %v", p.ID, err)
 			return
 		}
+		// 成功也要记一行：数据面没有送达确认，排查"对方收不到"时，
+		// 第一件要确认的就是"服务端到底有没有把这条反向通道建起来"。
+		log.Printf("sfu: 已创建反向数据通道(推送用) participant=%s label=easylive-s2c", p.ID)
 		p.mu.Lock()
 		p.outDC = out
 		p.mu.Unlock()
@@ -594,19 +597,34 @@ func (p *Participant) handleDataMessage(data []byte) {
 // 返回 false 表示通道未就绪——数据面语义是"尽力而为"，调用方不应因此报错。
 func (p *Participant) SendData(data []byte) bool {
 	p.mu.RLock()
-	dc := p.outDC
+	// **优先用客户端创建的那条通道**。SCTP 通道本身是双向的，服务端可以直接在
+	// 同一条上回推，不需要再反向开一条。
+	//
+	// 为什么改：实测发现反向通道在这套 SDP 时序下**客户端收不到**——
+	// 服务端能创建、能往里面写（Send 返回 nil，日志显示"送达 1/1"），
+	// 但浏览器的 ondatachannel 从不触发，于是消息静默消失。
+	// 而客户端自己建的那条一直是通的（上行本来就在用它）。
+	pub, out := p.pubDC, p.outDC
 	p.mu.RUnlock()
-	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
-		return false
+	for _, dc := range []*webrtc.DataChannel{pub, out} {
+		if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
+			return dc.Send(data) == nil
+		}
 	}
-	return dc.Send(data) == nil
+	return false
 }
 
 // DataChannelReady 供 /debug/stats 观测（评测时可以确认数据面是否真的建立）。
 func (p *Participant) DataChannelReady() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.outDC != nil && p.outDC.ReadyState() == webrtc.DataChannelStateOpen
+	// 与 SendData 保持一致：哪条通道会被用来推送，就以哪条为准
+	for _, dc := range []*webrtc.DataChannel{p.pubDC, p.outDC} {
+		if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
+			return true
+		}
+	}
+	return false
 }
 
 // AudioLevel 返回该参与者所有音频轨里最大的平滑电平（0—1）。
