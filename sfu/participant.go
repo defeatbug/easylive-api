@@ -597,34 +597,27 @@ func (p *Participant) handleDataMessage(data []byte) {
 // 返回 false 表示通道未就绪——数据面语义是"尽力而为"，调用方不应因此报错。
 func (p *Participant) SendData(data []byte) bool {
 	p.mu.RLock()
-	// **优先用客户端创建的那条通道**。SCTP 通道本身是双向的，服务端可以直接在
-	// 同一条上回推，不需要再反向开一条。
+	// **用服务端反向开的那条**（easylive-s2c）。
 	//
-	// 为什么改：实测发现反向通道在这套 SDP 时序下**客户端收不到**——
-	// 服务端能创建、能往里面写（Send 返回 nil，日志显示"送达 1/1"），
-	// 但浏览器的 ondatachannel 从不触发，于是消息静默消失。
-	// 而客户端自己建的那条一直是通的（上行本来就在用它）。
-	pub, out := p.pubDC, p.outDC
+	// 曾经改成"优先用客户端创建的那条"，理由是 SCTP 双向、而浏览器收不到反向通道。
+	// 那是错的：signaling 的 e2e（TestE2EDataChannel）证明反向通道在标准客户端上完全可用，
+	// 改成客户端通道反而把它弄坏了。浏览器收不到是**浏览器侧**的特例，
+	// 不该为一个特例改动所有客户端的路径——弹幕/互动因此改走信令面，
+	// 那条路（聊天/举手/白板）在任何客户端上都已验证可靠。
+	dc := p.outDC
 	p.mu.RUnlock()
-	for _, dc := range []*webrtc.DataChannel{pub, out} {
-		if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
-			return dc.Send(data) == nil
-		}
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return false
 	}
-	return false
+	return dc.Send(data) == nil
 }
 
 // DataChannelReady 供 /debug/stats 观测（评测时可以确认数据面是否真的建立）。
 func (p *Participant) DataChannelReady() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	// 与 SendData 保持一致：哪条通道会被用来推送，就以哪条为准
-	for _, dc := range []*webrtc.DataChannel{p.pubDC, p.outDC} {
-		if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
-			return true
-		}
-	}
-	return false
+	// 与 SendData 保持一致：推送只走反向通道，就只看它
+	return p.outDC != nil && p.outDC.ReadyState() == webrtc.DataChannelStateOpen
 }
 
 // AudioLevel 返回该参与者所有音频轨里最大的平滑电平（0—1）。

@@ -35,6 +35,14 @@ const (
 	TypeUnpublish   MsgType = "unpublish"   // {trackId}            停止发布某条轨道（如结束屏幕共享）
 	TypeMute        MsgType = "mute"        // {trackId, muted}
 	TypeChat        MsgType = "chat"        // {text}
+	// 弹幕 / 互动：**走信令面**而不是数据面。
+	//
+	// 为什么改：数据面（SCTP）虽然延迟更低，但它依赖发布连接协商完成，实测在同一套
+	// SDP 时序下出现了"服务端日志显示送达 1/1、对端浏览器却收不到"的情况，
+	// 通道双方都报 open 也照样丢。举手当初就是因为同类原因保留了信令面这条路
+	// （见 signaling/handler.go 里 handleHandState 的说明），弹幕与互动是**低频**消息，
+	// 走信令完全够用，而且这条路上的聊天/举手/白板都已验证可靠。
+	TypeFlash MsgType = "flash" // {emoji, text?, kind?}
 	// TypeHandState 是**双向**消息：
 	//   客户端 → 服务端：{raised} 上报举手（数据面不可用时的信令回退路径）
 	//   服务端 → 客户端：{participantId, raised} 广播状态（并进房间快照，新人可见）
@@ -56,6 +64,7 @@ const (
 	TypeTrackMuted       MsgType = "track_muted"        // {trackId, muted}
 	TypeActiveSpeakers   MsgType = "active_speakers"    // {speakers:[{participantId, level}]}  只在集合变化时推送
 	TypeChatMessage      MsgType = "chat_message"       // {message}
+	TypeFlashMessage     MsgType = "flash_message"      // {flash}
 	TypePong             MsgType = "pong"               // {}
 	TypeForceMute        MsgType = "force_mute"         // {muted}  服务端下发给被强制静音的参与者
 	TypeError            MsgType = "error"              // {code, reason, id?}
@@ -120,11 +129,18 @@ type Message struct {
 	TrackID     string     `json:"trackId,omitempty"`
 	Muted       *bool      `json:"muted,omitempty"`
 	Text        string     `json:"text,omitempty"`
+	// Emoji / Kind 是弹幕与互动的入参（客户端 → 服务端）。
+	// Emoji 复用数据面那个名字，Kind 为空表示普通表情浮层、"action" 表示互动动效。
+	Emoji string `json:"emoji,omitempty"`
+	Kind  string `json:"kind,omitempty"`
 	// TargetID / Action 用于主持人管理（moderate）
 	TargetID string `json:"targetId,omitempty"`
 	Action   string `json:"action,omitempty"`
 	// Recording 是录制状态载荷（record 的广播 / recording_state 消息）
 	Recording *RecordingState `json:"recording,omitempty"`
+
+	// Flash 是服务端广播出去的弹幕/互动（fromId/fromName 由服务端填，客户端无法伪造）
+	Flash *FlashMessage `json:"flash,omitempty"`
 	// Op 是白板操作载荷（whiteboard / whiteboard_op 用）
 	Op *WhiteboardOp `json:"op,omitempty"`
 	// Grants 是**服务端实际生效**的权限，随 joined 下发。
@@ -356,6 +372,20 @@ type DataMessage struct {
 type SpeakerInfo struct {
 	ParticipantID string  `json:"participantId"`
 	Level         float64 `json:"level"`
+}
+
+// FlashMessage 是一条弹幕或互动动效（走信令面广播）。
+//
+// 与聊天分开而不是复用 ChatMessage：聊天是**内容**（可能要进历史、有面板），
+// 弹幕是**瞬时事件**（飘一下就走、不落库），生命周期不同，混在一起以后会互相牵制。
+type FlashMessage struct {
+	FromID   string `json:"fromId"`
+	FromName string `json:"fromName"`
+	Emoji    string `json:"emoji"`
+	Text     string `json:"text,omitempty"`
+	// Kind 为空是普通表情浮层；"action" 是互动动效（小红花等）
+	Kind string `json:"kind,omitempty"`
+	TS   int64  `json:"ts"`
 }
 
 type ChatMessage struct {

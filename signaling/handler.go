@@ -116,6 +116,8 @@ func (h *Hub) dispatch(c *Client, msg *protocol.Message) {
 	case protocol.TypeMute:
 		h.handleMute(c, msg)
 
+	case protocol.TypeFlash:
+		h.handleFlash(c, msg)
 	case protocol.TypeChat:
 		h.handleChat(c, msg)
 
@@ -461,6 +463,58 @@ func (h *Hub) handleChat(c *Client, msg *protocol.Message) {
 			TS:       time.Now().UnixMilli(),
 		},
 	}, "")
+}
+
+// maxFlashTextRunes 是弹幕文字上限（超出截断，不丢弃）。
+// 与 sfu 包里的同名常量保持一致；两个包各留一份是刻意的——
+// signaling 不该为了一个数字去 import sfu（那会把媒体依赖带进信令层）。
+const maxFlashTextRunes = 60
+
+// handleFlash 广播一条弹幕 / 互动动效（**信令面**）。
+//
+// 与 handleChat 同一形状：服务端填 FromID/FromName（客户端无法伪造发送者），
+// 然后广播给房间里**所有人**（含发送者自己）——发送者不需要本地回显，
+// 这样"我看到的"和"别人看到的"永远是同一条消息，不会出现两边不一致。
+func (h *Hub) handleFlash(c *Client, msg *protocol.Message) {
+	roomID, pid, p := c.session()
+	if roomID == "" || p == nil {
+		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
+		return
+	}
+	if !c.requireGrant(msg, c.grants().CanPublishData, "发送弹幕") {
+		return
+	}
+	emoji := msg.Emoji
+	if emoji == "" || len([]rune(emoji)) > 8 {
+		c.fail(msg, protocol.ErrBadRequest, "表情为空或过长")
+		return
+	}
+	// 文字**截断而不是拒绝**：用户打了一长句，不该整条发不出去
+	text := msg.Text
+	if r := []rune(text); len(r) > maxFlashTextRunes {
+		text = string(r[:maxFlashTextRunes])
+	}
+	// 只认识两种 kind：空与 action。未知值归零，免得客户端随便塞字符串。
+	kind := msg.Kind
+	if kind != "" && kind != protocol.ReactionKindAction {
+		kind = ""
+	}
+	room, ok := h.manager.Get(roomID)
+	if !ok {
+		c.fail(msg, protocol.ErrInternal, "房间不存在")
+		return
+	}
+	room.Broadcast(&protocol.Message{
+		Type: protocol.TypeFlashMessage,
+		Flash: &protocol.FlashMessage{
+			FromID:   pid,
+			FromName: p.Name,
+			Emoji:    emoji,
+			Text:     text,
+			Kind:     kind,
+			TS:       time.Now().UnixMilli(),
+		},
+	}, "") // 空 = 不排除任何人，发送者也会收到自己的那条
 }
 
 // handleHandState 处理客户端经**信令面**上报的举手。
