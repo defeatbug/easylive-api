@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"easylive-api/ai"
 	"easylive-api/auth"
 	"easylive-api/config"
 	"easylive-api/protocol"
@@ -24,6 +25,9 @@ type Hub struct {
 	manager *sfu.Manager
 	cfg     *config.Config
 	auth    *auth.Authenticator
+	// ai 是 AI 会议总结管理器（房间级会话）。配置缺失时 Start 会明确报错，
+	// 不影响正常信令流程。
+	ai *ai.Manager
 
 	mu      sync.RWMutex
 	clients map[string]*Client // sessionID -> client
@@ -33,10 +37,17 @@ type Hub struct {
 }
 
 func NewHub(manager *sfu.Manager, cfg *config.Config) *Hub {
+	aiCfg := ai.ConfigFromEnv()
+	if !aiCfg.Ready() {
+		log.Printf("signaling: AI 总结未配置（缺 OPENAI_API_KEY 或 DEEPSEEK_API_KEY），ai_summary 请求会被拒绝")
+	} else {
+		log.Printf("signaling: AI 总结已就绪（Whisper=%s，DeepSeek=%s）", aiCfg.WhisperModel, aiCfg.DeepSeekModel)
+	}
 	return &Hub{
 		manager: manager,
 		cfg:     cfg,
 		auth:    auth.New(cfg.JWTSecret, cfg.TokenTTL, auth.ParseMode(cfg.AuthMode)),
+		ai:      ai.New(aiCfg),
 		clients: make(map[string]*Client),
 		resumes: make(map[string]resumeEntry),
 	}

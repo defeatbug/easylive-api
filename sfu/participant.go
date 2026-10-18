@@ -37,13 +37,13 @@ type Participant struct {
 	notifier Notifier
 	room     *Room // 由 Room.Join 注入，Participant 不反向持有 manager
 
-	mu            sync.RWMutex
-	pubPC         *webrtc.PeerConnection // 发布者连接：客户端 offer / 服务端 answer
-	subPC         *webrtc.PeerConnection // 订阅者连接：服务端 offer / 客户端 answer
-	published     map[string]*PublishedTrack
+	mu        sync.RWMutex
+	pubPC     *webrtc.PeerConnection // 发布者连接：客户端 offer / 服务端 answer
+	subPC     *webrtc.PeerConnection // 订阅者连接：服务端 offer / 客户端 answer
+	published map[string]*PublishedTrack
 	// subSenders 记录订阅轨道在 sub 连接上的发送器（trackID -> 发送器），
 	// 用于 Unsubscribe 时只移除单条轨道并重协商，而不是关闭整条 sub 连接。
-	subSenders map[string]*subSender
+	subSenders    map[string]*subSender
 	pendingSource string // 本次 publish 协商声明的媒体来源（见 protocol.Message.Source）
 	// pendingCandidates 缓存"远端描述尚未就绪"时收到的 ICE 候选。
 	// 浏览器会在 setLocalDescription 后立刻开始 trickle，候选完全可能早于 publish/subscribe 到达；

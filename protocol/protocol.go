@@ -71,6 +71,9 @@ const (
 	// TypeRecord 由**主持人**发起：{action: start|stop}，服务端校验 roomAdmin 后
 	// 开始/结束一次录制会话，并向全房间广播 TypeRecordingState。
 	TypeRecord MsgType = "record"
+	// TypeAISummary 由**任何参会者**发起：{action: start|stop}，开关 AI 会议总结。
+	// 开启后服务端订阅各路音频做转写 + 定期生成 markdown 纪要，通过 ai_summary_state/update 推送。
+	TypeAISummary MsgType = "ai_summary"
 	// TypeWhiteboard 由**任何参会者**发起：{op:{kind, stroke}}。
 	// 服务端做校验/裁剪/编号后广播为 TypeWhiteboardOp，并把它记进房间状态。
 	TypeWhiteboard MsgType = "whiteboard"
@@ -80,6 +83,11 @@ const (
 	// 参会者据此显示"录制中"红点；入会快照 room.recording 也会带上它，
 	// 保证中途进来的人同样看得到。
 	TypeRecordingState MsgType = "recording_state"
+	// TypeAISummaryState 服务端广播 AI 总结状态：{aiSummary}；入会快照 room.aiSummary 同样携带，
+	// 中途进来的人能看到当前纪要。
+	TypeAISummaryState MsgType = "ai_summary_state"
+	// TypeAISummaryUpdate 服务端推送纪要内容更新：{aiSummary:{markdown, updatedAt, segmentCount}}
+	TypeAISummaryUpdate MsgType = "ai_summary_update"
 )
 
 // 媒体连接目标：发布者连接 或 订阅者连接（每个参与者各持一条，避免重复协商/glare）
@@ -138,6 +146,8 @@ type Message struct {
 	Action   string `json:"action,omitempty"`
 	// Recording 是录制状态载荷（record 的广播 / recording_state 消息）
 	Recording *RecordingState `json:"recording,omitempty"`
+	// AISummary 是 AI 总结载荷（ai_summary 的广播 / ai_summary_state / ai_summary_update 消息）
+	AISummary *AISummaryState `json:"aiSummary,omitempty"`
 
 	// Flash 是服务端广播出去的弹幕/互动（fromId/fromName 由服务端填，客户端无法伪造）
 	Flash *FlashMessage `json:"flash,omitempty"`
@@ -319,9 +329,23 @@ type RecordingState struct {
 	Files int `json:"files,omitempty"`
 }
 
+// AISummaryState 是 AI 会议总结的房间状态：开关 + 实时更新的 markdown 纪要。
+type AISummaryState struct {
+	Active       bool   `json:"active"`
+	StartedAt    int64  `json:"startedAt,omitempty"`
+	StartedBy    string `json:"startedBy,omitempty"` // 发起者的 participantId
+	StartedByName string `json:"startedByName,omitempty"`
+	// Markdown 是当前纪要全文（markdown）；UpdatedAt 是服务端毫秒时间戳
+	Markdown     string `json:"markdown,omitempty"`
+	UpdatedAt    int64  `json:"updatedAt,omitempty"`
+	SegmentCount int    `json:"segmentCount,omitempty"` // 已转写片段数
+}
+
 type RoomState struct {
 	// Recording 指示当前房间是否正在录制（入会快照携带，中途进来的也能看到红点）
 	Recording    *RecordingState `json:"recording,omitempty"`
+	// AISummary 是 AI 总结状态（入会快照携带，中途进来的人能看到当前纪要）
+	AISummary    *AISummaryState `json:"aiSummary,omitempty"`
 	RoomID       string          `json:"roomId"`
 	Participants []*PeerInfo     `json:"participants"`
 	Tracks       []*TrackInfo    `json:"tracks"`
@@ -418,6 +442,9 @@ const (
 	ActionRecordStart = "start"
 	ActionRecordStop  = "stop"
 	ActionKick        = "kick" // 移出房间
+	// AI 总结动作：复用 start/stop（ai_summary 消息用）
+	ActionAISummaryStart = "start"
+	ActionAISummaryStop  = "stop"
 )
 
 func New(t MsgType) *Message { return &Message{Type: t} }

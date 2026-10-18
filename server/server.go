@@ -444,64 +444,10 @@ func (s *Server) build() *fiber.App {
 	//
 	// 录制文件就是会议的音视频内容，属于敏感数据，所以访问控制与 /token 一致：
 	// 非 development 环境必须带 X-API-Key（复用同一个运维密钥，少一个配置项）。
-	recordKeyOK := func(c *fiber.Ctx) bool {
-		if cfg.AppEnv == "development" {
-			return true // 开发环境不拦，本地开箱可用
-		}
-		// 以前是 `cfg.TokenAPIKey == "" → return true`——**失败即放行**：
-		// 生产一旦忘了配密钥，录制文件这份会议音视频内容就完全公开。
-		// 改成失败即拒绝：没配密钥 = 只有带有效令牌的人能下（当前即无人能下），
-		// 宁可下载不可用，也不能把会议内容敞开。
-		if cfg.TokenAPIKey == "" {
-			return false
-		}
-		return c.Get("X-API-Key") == cfg.TokenAPIKey
-	}
 
-	router.Get("/recordings", func(c *fiber.Ctx) error {
-		if !recordKeyOK(c) {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "X-API-Key 无效"})
-		}
-		rec := s.manager.Recording()
-		if rec == nil {
-			// 没开启录制能力：明确返回 enabled=false，前端据此隐藏入口而不是报错
-			return c.JSON(fiber.Map{
-				"enabled":   false,
-				"recording": fiber.Map{"active": false},
-				"sessions":  []any{},
-			})
-		}
-		sessions, err := rec.ListSessions()
-		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-		}
-		return c.JSON(fiber.Map{
-			"enabled":   true,
-			"recording": s.manager.RecordingState(),
-			"sessions":  sessions,
-			"dir":       rec.Dir(),
-		})
-	})
-
-	router.Get("/recordings/:session/:file", func(c *fiber.Ctx) error {
-		if !recordKeyOK(c) {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "X-API-Key 无效"})
-		}
-		rec := s.manager.Recording()
-		if rec == nil {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "服务端未开启录制"})
-		}
-		// 路径穿越防护：只用白名单字符，并拒绝 ..
-		path, ok := rec.SessionPath(c.Params("session"), c.Params("file"))
-		if !ok {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "非法文件名"})
-		}
-		if _, err := os.Stat(path); err != nil {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "文件不存在"})
-		}
-		c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("attachment; filename=%q", c.Params("file")))
-		return c.SendFile(path)
-	})
+	// ---- 录制列表与下载（授权见 server/recordings.go：运维密钥 / 管理员 / 会议创建者）----
+	router.Get("/recordings", s.handleListRecordings)
+	router.Get("/recordings/:session/:file", s.handleDownloadRecording)
 
 	// ---- 媒体信令入口：<basePath>/ws ----
 	signaling.Mount(router.Group("/ws"), s.hub)
