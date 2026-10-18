@@ -46,21 +46,19 @@ type Transcriber struct {
 
 	dropped    atomic.Uint64
 	chunkSeconds int
-	apiKey     string
-	model      string
-	lang       string
+	stt          STTBackend
+	lang         string
 }
 
 // NewTranscriber 创建一条轨道的转写器并启动后台协程。
-func NewTranscriber(speaker string, chunkSeconds int, apiKey, model, lang string, onSegment func(Segment)) *Transcriber {
+func NewTranscriber(speaker string, chunkSeconds int, stt STTBackend, lang string, onSegment func(Segment)) *Transcriber {
 	t := &Transcriber{
 		speaker:      speaker,
 		onSegment:    onSegment,
 		ch:           make(chan []byte, 512),
 		done:         make(chan struct{}),
 		chunkSeconds: chunkSeconds,
-		apiKey:       apiKey,
-		model:        model,
+		stt:          stt,
 		lang:         lang,
 	}
 	t.wg.Add(1)
@@ -113,8 +111,8 @@ func (t *Transcriber) loop() {
 		}
 		wav := encodeWAV(downsample16k(pcm48))
 		pcm48 = nil
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		text, err := Transcribe(ctx, t.apiKey, t.model, wav, t.lang)
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+		text, err := t.stt.Transcribe(ctx, wav, t.lang)
 		cancel()
 		if err != nil {
 			log.Printf("ai: whisper 转写失败 %s: %v", t.speaker, err)

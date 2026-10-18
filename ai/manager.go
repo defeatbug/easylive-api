@@ -12,6 +12,7 @@ import (
 // Manager 管理各房间的 AI 总结会话（一个房间同时最多一个）。
 type Manager struct {
 	cfg Config
+	stt STTBackend // 转写后端（Start 时按配置构建，失败则拒绝启动）
 
 	mu       sync.Mutex
 	sessions map[string]*Session // roomID → 会话
@@ -22,19 +23,34 @@ func New(cfg Config) *Manager {
 	return &Manager{cfg: cfg, sessions: make(map[string]*Session)}
 }
 
+// buildSTT 按配置构建转写后端。
+func (m *Manager) buildSTT() (STTBackend, error) {
+	if m.cfg.STTBackend == "api" {
+		return NewWhisperAPI(m.cfg.OpenAIAPIKey, m.cfg.WhisperModel), nil
+	}
+	return NewWhisperLocal(m.cfg.WhisperBin, m.cfg.WhisperModelPath)
+}
+
 // Config 返回当前配置（日志/排查用，不含密钥）。
 func (m *Manager) Config() Config { return m.cfg }
 
 // Start 启动房间的 AI 总结会话。已在运行则幂等返回 nil。
 func (m *Manager) Start(room *sfu.Room, startedBy string) error {
 	if !m.cfg.Ready() {
-		return fmt.Errorf("AI 总结未配置：需要 OPENAI_API_KEY（Whisper 转写）与 DEEPSEEK_API_KEY（纪要生成）")
+		return fmt.Errorf("AI 总结未配置：%s", m.cfg.UnreadyReason())
+	}
+	// 先构建转写后端：本地模式缺二进制/模型时在这里就明确报错，
+	// 而不是等到第一段音频来了才炸。
+	stt, err := m.buildSTT()
+	if err != nil {
+		return fmt.Errorf("AI 总结转写后端初始化失败: %w", err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.sessions[room.ID]; ok {
 		return nil
 	}
+	m.stt = stt
 	s := newSession(m, room, startedBy)
 	m.sessions[room.ID] = s
 	// 让房间快照带上 AI 状态：中途入会的人能立刻看到纪要

@@ -15,27 +15,44 @@ import (
 // whisperURL 是 OpenAI 音频转写接口。
 const whisperURL = "https://api.openai.com/v1/audio/transcriptions"
 
+// STTBackend 是语音转写的后端接口：输入一段 WAV，返回转写文本。
+// 无有效语音时返回空字符串（不是错误）。
+type STTBackend interface {
+	Transcribe(ctx context.Context, wav []byte, language string) (string, error)
+}
+
+// whisperAPI 是 OpenAI Whisper 云端接口的实现。
+type whisperAPI struct {
+	apiKey string
+	model  string
+}
+
+// NewWhisperAPI 创建云端 Whisper 后端。
+func NewWhisperAPI(apiKey, model string) STTBackend {
+	return &whisperAPI{apiKey: apiKey, model: model}
+}
+
 // Transcribe 把一段 WAV 音频发给 Whisper，返回转写文本。
-// 无有效语音时返回空字符串（不是错误）。调用方用带超时的 ctx 控制。
-func Transcribe(ctx context.Context, apiKey, model string, wav []byte, language string) (string, error) {
+// 调用方用带超时的 ctx 控制。
+func (w *whisperAPI) Transcribe(ctx context.Context, wav []byte, language string) (string, error) {
 	if len(wav) == 0 {
 		return "", nil
 	}
 	var body bytes.Buffer
-	w := multipart.NewWriter(&body)
-	fw, err := w.CreateFormFile("file", "audio.wav")
+	mw := multipart.NewWriter(&body)
+	fw, err := mw.CreateFormFile("file", "audio.wav")
 	if err != nil {
 		return "", fmt.Errorf("whisper: 构造表单失败: %w", err)
 	}
 	if _, err := fw.Write(wav); err != nil {
 		return "", fmt.Errorf("whisper: 写入音频失败: %w", err)
 	}
-	_ = w.WriteField("model", model)
+	_ = mw.WriteField("model", w.model)
 	if language != "" {
-		_ = w.WriteField("language", language)
+		_ = mw.WriteField("language", language)
 	}
-	_ = w.WriteField("response_format", "json")
-	if err := w.Close(); err != nil {
+	_ = mw.WriteField("response_format", "json")
+	if err := mw.Close(); err != nil {
 		return "", fmt.Errorf("whisper: 关闭表单失败: %w", err)
 	}
 
@@ -43,8 +60,8 @@ func Transcribe(ctx context.Context, apiKey, model string, wav []byte, language 
 	if err != nil {
 		return "", fmt.Errorf("whisper: 构造请求失败: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+w.apiKey)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)

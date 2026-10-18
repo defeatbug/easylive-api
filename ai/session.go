@@ -83,7 +83,7 @@ func (s *Session) attachTrack(tr *sfu.PublishedTrack) {
 		return
 	}
 	tb := NewTranscriber(speaker, s.mgr.cfg.ChunkSeconds,
-		s.mgr.cfg.OpenAIAPIKey, s.mgr.cfg.WhisperModel, s.mgr.cfg.WhisperLang,
+		s.mgr.stt, s.mgr.cfg.WhisperLang,
 		func(seg Segment) { s.onSegment(seg) })
 	s.transcribers[info.ID] = tb
 	s.mu.Unlock()

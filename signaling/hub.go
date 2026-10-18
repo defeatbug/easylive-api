@@ -39,9 +39,9 @@ type Hub struct {
 func NewHub(manager *sfu.Manager, cfg *config.Config) *Hub {
 	aiCfg := ai.ConfigFromEnv()
 	if !aiCfg.Ready() {
-		log.Printf("signaling: AI 总结未配置（缺 OPENAI_API_KEY 或 DEEPSEEK_API_KEY），ai_summary 请求会被拒绝")
+		log.Printf("signaling: AI 总结未配置（%s），ai_summary 请求会被拒绝", aiCfg.UnreadyReason())
 	} else {
-		log.Printf("signaling: AI 总结已就绪（Whisper=%s，DeepSeek=%s）", aiCfg.WhisperModel, aiCfg.DeepSeekModel)
+		log.Printf("signaling: AI 总结已就绪（转写=%s，DeepSeek=%s）", aiCfg.STTBackend, aiCfg.DeepSeekModel)
 	}
 	return &Hub{
 		manager: manager,

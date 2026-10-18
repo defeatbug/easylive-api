@@ -16,14 +16,31 @@ COPY . .
 # -ldflags "-s -w" 去掉符号表与调试信息
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/easylive-api .
 
+# ---- whisper.cpp 构建（AI 总结本地转写用）----
+FROM golang:1.25-alpine AS whisper-builder
+RUN apk add --no-cache cmake g++ make git
+WORKDIR /src
+RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git . \
+    && cmake -B build -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON \
+    && cmake --build build -j$(nproc) --target whisper-cli
+# 模型在构建时下载（small：中文效果与速度的平衡点；要更快可用 base）
+RUN mkdir -p /models && wget -q -O /models/ggml-small.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates tzdata wget \
+RUN apk add --no-cache ca-certificates tzdata wget libstdc++ \
     && adduser -D -u 10001 -h /app app
 
 WORKDIR /app
 COPY --from=builder /out/easylive-api /app/easylive-api
 COPY --from=builder /src/migrations /app/migrations
+# whisper 本地转写：二进制 + 模型（STT_BACKEND=local 时用；模型约 500MB）
+COPY --from=whisper-builder /src/build/bin/whisper-cli /usr/local/bin/whisper-cli
+COPY --from=whisper-builder /models/ggml-small.bin /app/models/ggml-small.bin
+ENV STT_BACKEND=local \
+    WHISPER_BIN=/usr/local/bin/whisper-cli \
+    WHISPER_MODEL_PATH=/app/models/ggml-small.bin
 
 # 以非 root 运行：容器逃逸的影响面小得多
 USER app
