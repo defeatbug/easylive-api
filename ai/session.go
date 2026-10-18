@@ -74,12 +74,14 @@ func (s *Session) attachTrack(tr *sfu.PublishedTrack) {
 	if info.Kind != protocol.KindAudio {
 		return
 	}
+	// 先取 speaker 名：此时不持有 s.mu，保证锁顺序恒为 room → session，
+	// 与 Room.State()（持 room.mu 读锁调 provider → 取 s.mu）一致，避免死锁。
+	speaker := s.room.ParticipantName(info.PublisherID)
 	s.mu.Lock()
 	if _, ok := s.transcribers[info.ID]; ok {
 		s.mu.Unlock()
 		return
 	}
-	speaker := s.room.ParticipantName(info.PublisherID)
 	tb := NewTranscriber(speaker, s.mgr.cfg.ChunkSeconds,
 		s.mgr.cfg.OpenAIAPIKey, s.mgr.cfg.WhisperModel, s.mgr.cfg.WhisperLang,
 		func(seg Segment) { s.onSegment(seg) })
@@ -116,10 +118,8 @@ func (s *Session) detachTrack(trackID string) {
 func (s *Session) onSegment(seg Segment) {
 	s.mu.Lock()
 	s.segments = append(s.segments, seg)
-	n := len(s.segments)
 	s.mu.Unlock()
 	log.Printf("ai: 转写片段 room=%s [%s] %s：%s", s.roomID, seg.StartedAt.Format("15:04:05"), seg.Speaker, truncate(seg.Text, 60))
-	_ = n
 }
 
 // summarizeLoop 定时检查新片段，有新内容就重新生成纪要并广播。
