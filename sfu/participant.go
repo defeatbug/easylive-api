@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -18,13 +17,6 @@ import (
 // 用接口而不是直接依赖 signaling 包，避免 sfu ←→ signaling 的循环依赖。
 type Notifier interface {
 	Notify(msg *protocol.Message)
-}
-
-// subSender 记录一条订阅在 sub 连接上的发送器及其归属轨道。
-type subSender struct {
-	sender *webrtc.RTPSender
-	track  *PublishedTrack // 所属发布轨道（退订时维护 subscribers 计数）
-	bound  atomic.Bool     // onBind 是否已触发（计数是否加过 1）
 }
 
 // Participant 是一个参会者：两条 PeerConnection + 已发布的轨道集合。
@@ -41,9 +33,6 @@ type Participant struct {
 	pubPC         *webrtc.PeerConnection // 发布者连接：客户端 offer / 服务端 answer
 	subPC         *webrtc.PeerConnection // 订阅者连接：服务端 offer / 客户端 answer
 	published     map[string]*PublishedTrack
-	// subSenders 记录订阅轨道在 sub 连接上的发送器（trackID -> 发送器），
-	// 用于 Unsubscribe 时只移除单条轨道并重协商，而不是关闭整条 sub 连接。
-	subSenders map[string]*subSender
 	pendingSource string // 本次 publish 协商声明的媒体来源（见 protocol.Message.Source）
 	// pendingCandidates 缓存"远端描述尚未就绪"时收到的 ICE 候选。
 	// 浏览器会在 setLocalDescription 后立刻开始 trickle，候选完全可能早于 publish/subscribe 到达；
@@ -76,7 +65,6 @@ func NewParticipant(id, name string, engine *Engine, notifier Notifier) *Partici
 		engine:            engine,
 		notifier:          notifier,
 		published:         make(map[string]*PublishedTrack),
-		subSenders:        make(map[string]*subSender),
 		pendingCandidates: make(map[string][]protocol.Candidate),
 		state:             protocol.StateActive,
 		canPublishData:    true, // 默认允许；信令层按令牌覆盖
@@ -387,18 +375,12 @@ func (p *Participant) Subscribe(track *PublishedTrack) (string, error) {
 	}
 
 	// 包一层，让"绑定失败"这类静默故障显式可见（见 tracklocal.go 的说明）
-	st := &subSender{track: track}
 	sender, err := pc.AddTrack(wrapTrackLocal(track.Local(), track.info.ID, func() {
 		track.subscribers.Add(1)
-		st.bound.Store(true)
 	}))
 	if err != nil {
 		return "", fmt.Errorf("添加轨道到订阅连接失败: %w", err)
 	}
-	st.sender = sender
-	p.mu.Lock()
-	p.subSenders[track.info.ID] = st
-	p.mu.Unlock()
 	// 订阅端：必须持续读 RTCP（否则 Pion 内部管道阻塞）。
 	// PLI/FIR 的转发由全局拦截器 keyframeForwarder 负责（按 SSRC 查表），这里只排空。
 	safeGo("rtcp-sender/"+p.ID, func() { drainRTCP(sender) })
@@ -419,38 +401,23 @@ func (p *Participant) Subscribe(track *PublishedTrack) (string, error) {
 	return pc.LocalDescription().SDP, nil
 }
 
-// Unsubscribe 只停止向该参与者转发指定轨道：从 sub 连接上移除对应的
-// RTPSender 并重协商，不断整条 sub 连接——其余订阅不受影响。
-// 返回重协商的 offer SDP；空字符串表示无需重协商（调用方无需通知客户端）。
-func (p *Participant) Unsubscribe(trackID string) (string, error) {
+// Unsubscribe 停止向该参与者转发某条轨道。
+// 说明：骨架里用"移除并重建 sub 连接"的方式实现，重新协商逻辑最简单；
+// 生产实现应使用 RTPSender.ReplaceTrack(nil) + 一次 renegotiation 完成。
+func (p *Participant) Unsubscribe(trackID string) error {
 	p.mu.Lock()
 	pc := p.subPC
-	st := p.subSenders[trackID]
+	p.subPC = nil
 	p.mu.Unlock()
 
-	if pc == nil || st == nil || st.sender == nil {
-		return "", nil // 没订阅过（或连接已不存在）：无需重协商
+	if pc == nil {
+		return nil
 	}
-	if err := pc.RemoveTrack(st.sender); err != nil {
-		return "", fmt.Errorf("从订阅连接移除轨道失败: %w", err)
+	if err := pc.Close(); err != nil {
+		return err
 	}
-	p.mu.Lock()
-	delete(p.subSenders, trackID)
-	p.mu.Unlock()
-	if st.bound.Load() {
-		st.track.subscribers.Add(-1)
-	}
-
-	// 重协商：让客户端用新的 offer 更新远端描述（m-line 减少一条）
-	offer, err := pc.CreateOffer(nil)
-	if err != nil {
-		return "", fmt.Errorf("创建取消订阅 offer 失败: %w", err)
-	}
-	if err := pc.SetLocalDescription(offer); err != nil {
-		return "", fmt.Errorf("设置取消订阅本地描述失败: %w", err)
-	}
-	log.Printf("sfu: 已取消单条订阅（重协商，不断连接）participant=%s track=%s", p.ID, trackID)
-	return pc.LocalDescription().SDP, nil
+	log.Printf("sfu: 已取消订阅（重建订阅连接）participant=%s track=%s", p.ID, trackID)
+	return nil
 }
 
 // HandleSubscribeAnswer 处理客户端对服务端订阅 offer 的应答（Offer/Answer 方向 2）。
@@ -686,7 +653,6 @@ func (p *Participant) ResetMedia() {
 	p.pubPC, p.subPC = nil, nil
 	p.pubDC, p.outDC = nil, nil
 	p.published = make(map[string]*PublishedTrack)
-	p.subSenders = make(map[string]*subSender)
 	p.pendingCandidates = make(map[string][]protocol.Candidate)
 	p.closed = false
 	p.mu.Unlock()

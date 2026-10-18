@@ -219,9 +219,6 @@ type WhiteboardOp struct {
 	// 客户端提交时带的值一律被覆盖（不能自报身份，也不能自定顺序）。
 	By  string `json:"by,omitempty"`
 	Seq uint64 `json:"seq,omitempty"`
-	// UndoSeq 仅 kind=undo 时由服务端填写：被撤销的那一笔的 Seq。
-	// 客户端据此精确删除对应笔画，而不是盲目弹掉最后一笔。
-	UndoSeq uint64 `json:"undoSeq,omitempty"`
 }
 
 // Stroke 是一笔画。
