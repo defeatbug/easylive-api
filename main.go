@@ -112,7 +112,10 @@ func main() {
 				bcancel()
 				switch {
 				case err != nil:
-					log.Printf("main: 引导管理员账号失败（不影响启动，可稍后手动处理）: %v", err)
+					// 全站只允许一个管理员（users 上的部分唯一索引）。若已有管理员
+					// （可能不叫 ADMIN_USERNAME），这里会拿到 duplicate key —— 那是**预期行为**，
+					// 不是故障。旧文案写成"失败"会让人以为配置有问题，实际是保护生效了。
+					log.Printf("main: 未新建管理员账号（已有管理员时属正常；全站只允许一个管理员，唯一索引生效）: %v", err)
 				case created:
 					log.Printf("main: 已创建主持人账号 username=%s（口令来自 ADMIN_PASSWORD，未记录明文）", cfg.AdminUsername)
 				default:
