@@ -127,6 +127,9 @@ func (h *Hub) dispatch(c *Client, msg *protocol.Message) {
 	case protocol.TypeRecord:
 		h.handleRecord(c, msg)
 
+	case protocol.TypeAISummary:
+		h.handleAISummary(c, msg)
+
 	case protocol.TypeWhiteboard:
 		h.handleWhiteboard(c, msg)
 
@@ -657,6 +660,45 @@ func (h *Hub) handleRecord(c *Client, msg *protocol.Message) {
 		room.Broadcast(&protocol.Message{Type: protocol.TypeRecordingState, Recording: st, TargetID: msg.TargetID}, "")
 	}
 	c.reply(msg, &protocol.Message{Type: protocol.TypeRecord, Action: msg.Action, Recording: st})
+}
+
+// handleAISummary 是 AI 会议总结的开关（**任何已入会的成员**都可以用）。
+//
+// 与录制同一权限哲学：转写与纪要只处理参会者本来就能听到的音频，不引入新的
+// 信息暴露面；是否开启由房间内的人决定。API Key 缺失时 Start 会明确报错，
+// 前端据此提示用户联系管理员配置。
+func (h *Hub) handleAISummary(c *Client, msg *protocol.Message) {
+	roomID, pid, _ := c.session()
+	if roomID == "" {
+		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
+		return
+	}
+	room, ok := h.manager.Get(roomID)
+	if !ok {
+		c.fail(msg, protocol.ErrNotJoined, "房间不存在")
+		return
+	}
+
+	switch msg.Action {
+	case protocol.ActionAISummaryStart:
+		if err := h.ai.Start(room, pid); err != nil {
+			c.fail(msg, protocol.ErrInternal, "启动 AI 总结失败: "+err.Error())
+			return
+		}
+		log.Printf("signaling: AI 总结启动 room=%s by=%s", roomID, pid)
+	case protocol.ActionAISummaryStop:
+		h.ai.Stop(roomID)
+		log.Printf("signaling: AI 总结停止 room=%s by=%s", roomID, pid)
+	default:
+		c.fail(msg, protocol.ErrBadRequest, "未知的 AI 总结动作: "+msg.Action)
+		return
+	}
+
+	// 广播给**所有人**（含操作者）：总结状态是房间共享状态；
+	// 内容更新走 ai_summary_update，由 ai 会话定时推送。
+	st := h.ai.State(roomID)
+	room.Broadcast(&protocol.Message{Type: protocol.TypeAISummaryState, AISummary: st}, "")
+	c.reply(msg, &protocol.Message{Type: protocol.TypeAISummary, Action: msg.Action, AISummary: st})
 }
 
 func (h *Hub) handleModerate(c *Client, msg *protocol.Message) {

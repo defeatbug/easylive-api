@@ -55,6 +55,14 @@ func audioLevelExtID(pc *webrtc.PeerConnection) uint8 {
 	return uint8(id)
 }
 
+// PacketSink 是 RTP 包的接收端（AI 转写用）。
+//
+// Write 挂在转发热路径上，因此必须：非阻塞（队列满则丢包并计数，绝不能卡住转发）、
+// 不抛 panic。实现方（ai 包）自己做缓冲与解码。
+type PacketSink interface {
+	Write(pkt *rtp.Packet)
+}
+
 // PublishedTrack 是一条已发布的轨道：远端（发布者）→ 本地（分发给订阅者）。
 //
 // 转发模型：一条轨道对应**一个** TrackLocalStaticRTP，把它 AddTrack 到每个订阅者的
@@ -74,6 +82,10 @@ type PublishedTrack struct {
 	bytes      atomic.Uint64
 	writeFails atomic.Uint64
 	dropped    atomic.Uint64 // 因静音/关闭而被丢弃的包数（评测时能量化"静音省了多少带宽"）
+	// aiSink 是 AI 转写的包接收端（nil 表示未启用）。读写用 aiMu 保护；
+	// 热路径上只是多一次 RLock（约 20ns），相对转发可忽略。
+	aiMu   sync.RWMutex
+	aiSink PacketSink
 	// 以下三个是本轨道的观测计数（以前只有进程级）：订阅者数量在服务端原本不可见
 	subscribers   atomic.Int64
 	pliForwarded  atomic.Uint64
@@ -280,6 +292,20 @@ func (t *PublishedTrack) attachRecorder(w *mediarec.Writer) { t.rec.Store(w) }
 // detachRecorder 摘掉并返回当前写入器（停止录制时调用，返回 nil 表示本来就没挂）。
 func (t *PublishedTrack) detachRecorder() *mediarec.Writer { return t.rec.Swap(nil) }
 
+// AttachAISink 挂载 AI 转写的包接收端；重复挂载会覆盖旧的。
+func (t *PublishedTrack) AttachAISink(s PacketSink) {
+	t.aiMu.Lock()
+	t.aiSink = s
+	t.aiMu.Unlock()
+}
+
+// DetachAISink 摘掉 AI 转写的包接收端。
+func (t *PublishedTrack) DetachAISink() {
+	t.aiMu.Lock()
+	t.aiSink = nil
+	t.aiMu.Unlock()
+}
+
 // recordedBytes 报告录制是否挂着（观测用）。
 func (t *PublishedTrack) recording() bool { return t.rec.Load() != nil }
 
@@ -324,6 +350,15 @@ func (t *PublishedTrack) Pump() {
 		// 它挂在热路径上，所以 Write 必须是非阻塞的（队列满则丢帧并计数）。
 		if w := t.rec.Load(); w != nil {
 			w.Write(pkt)
+		}
+
+		// AI 转写：同样在转发之前分一份音频包（只挂音频轨道，由 ai 包按需挂载）。
+		// 与录制同一约束：Write 必须非阻塞。
+		t.aiMu.RLock()
+		sink := t.aiSink
+		t.aiMu.RUnlock()
+		if sink != nil {
+			sink.Write(pkt)
 		}
 
 		// 活跃说话人：顺手从包头扩展取电平，不额外读一遍包、不解码

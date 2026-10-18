@@ -34,6 +34,7 @@ require (
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/go-openapi/inflect v0.19.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
+	github.com/godeps/opus v1.0.3 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
@@ -59,6 +60,7 @@ require (
 	github.com/rogpeppe/go-internal v1.16.0 // indirect
 	github.com/savsgio/gotils v0.0.0-20240704082632-aef3928b8a38 // indirect
 	github.com/sosodev/duration v1.4.0 // indirect
+	github.com/tetratelabs/wazero v1.9.0 // indirect
 	github.com/tinylib/msgp v1.2.5 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasthttp v1.58.0 // indirect

@@ -314,6 +314,74 @@ type Room struct {
 	whiteboard []protocol.WhiteboardOp
 	// whiteboardSeq 是白板操作的房间内递增序号（客户端不能自定顺序）
 	whiteboardSeq uint64
+	// trackHooks 是轨道事件钩子（AI 转写用）：added=true 发布，false 下线。
+	// 用独立锁：回调里可能再调回 Room 的方法，不能复用 r.mu（会死锁）。
+	hookMu     sync.RWMutex
+	trackHooks []func(track *PublishedTrack, added bool)
+	// aiSummaryProvider 由 ai 包设置：返回当前 AI 总结状态（nil 表示未启用）。
+	// Room 本身不依赖 ai 包（避免循环依赖），只通过这个函数指针取状态进快照。
+	aiSummaryProvider func() *protocol.AISummaryState
+}
+
+// OnTrackEvent 注册轨道事件钩子（AI 转写用）。回调在轨道发布/下线后被调用，
+// 不要在回调里做耗时操作。返回注销函数，不再需要时调用以避免钩子堆积。
+func (r *Room) OnTrackEvent(fn func(track *PublishedTrack, added bool)) (unregister func()) {
+	r.hookMu.Lock()
+	r.trackHooks = append(r.trackHooks, fn)
+	idx := len(r.trackHooks) - 1
+	r.hookMu.Unlock()
+	return func() {
+		r.hookMu.Lock()
+		defer r.hookMu.Unlock()
+		if idx < len(r.trackHooks) && r.trackHooks[idx] != nil {
+			// 与闭包比较函数值不可行（Go 不允许比较 func），用索引占位注销
+			r.trackHooks[idx] = nil
+		}
+	}
+}
+
+func (r *Room) emitTrackEvent(track *PublishedTrack, added bool) {
+	r.hookMu.RLock()
+	hooks := make([]func(*PublishedTrack, bool), len(r.trackHooks))
+	copy(hooks, r.trackHooks)
+	r.hookMu.RUnlock()
+	for _, fn := range hooks {
+		if fn != nil {
+			fn(track, added)
+		}
+	}
+}
+
+// SetAISummaryProvider 设置/清除 AI 总结状态提供者（ai 包在会话起停时调用）。
+func (r *Room) SetAISummaryProvider(fn func() *protocol.AISummaryState) {
+	r.mu.Lock()
+	r.aiSummaryProvider = fn
+	r.mu.Unlock()
+}
+
+// AudioTracks 返回当前所有音频轨道的快照。
+func (r *Room) AudioTracks() []*PublishedTrack {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []*PublishedTrack
+	for _, t := range r.tracks {
+		if t.info.Kind == protocol.KindAudio {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// ParticipantName 返回参与者的显示名，找不到返回 ID 本身。
+func (r *Room) ParticipantName(id string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if p, ok := r.participants[id]; ok && p != nil {
+		if n := p.Info().Name; n != "" {
+			return n
+		}
+	}
+	return id
 }
 
 func newRoom(id string, m *Manager) *Room {
@@ -600,6 +668,7 @@ func (r *Room) onTrackPublished(publisher *Participant, track *PublishedTrack) {
 	for _, p := range targets {
 		p.NotifyTo(&protocol.Message{Type: protocol.TypeTrackPublished, Track: track.Info()})
 	}
+	r.emitTrackEvent(track, true)
 }
 
 // Unpublish 停止发布某条轨道（发布者主动请求）。
@@ -643,6 +712,7 @@ func (r *Room) removeTrack(trackID, reason string) {
 	for _, p := range targets {
 		p.NotifyTo(&protocol.Message{Type: protocol.TypeTrackUnpublished, TrackID: trackID})
 	}
+	r.emitTrackEvent(track, false)
 }
 
 // Subscribe 让 subscriberID 订阅 trackID，返回需要发给客户端的 offer SDP。
@@ -788,6 +858,10 @@ func (r *Room) State() *protocol.RoomState {
 	state.Whiteboard = append([]protocol.WhiteboardOp(nil), r.whiteboard...)
 	for id := range r.hands {
 		state.Hands = append(state.Hands, id)
+	}
+	// 带上 AI 总结状态：中途入会的人能立刻看到当前纪要，而不是等下一次更新
+	if r.aiSummaryProvider != nil {
+		state.AISummary = r.aiSummaryProvider()
 	}
 	return state
 }
