@@ -34,6 +34,11 @@ type Config struct {
 	SummaryInterval time.Duration
 	// ChunkSeconds 单个转写分片的最大音频时长（秒），默认 30（AI_CHUNK_SECONDS）
 	ChunkSeconds int
+	// TTSBackend 语音合成后端："piper"（本地 Piper CLI，默认）。（TTS_BACKEND）
+	TTSBackend string
+	// PiperBin / PiperModelPath 本地 Piper 用（PIPER_BIN / PIPER_MODEL_PATH）
+	PiperBin       string
+	PiperModelPath string
 }
 
 // Ready 当且仅当纪要（DeepSeek Key）与所选转写后端都就绪。
@@ -63,6 +68,24 @@ func (c Config) UnreadyReason() string {
 	return ""
 }
 
+// AgentReady 当且仅当 AI 问答助手可运行：DeepSeek Key + TTS 模型路径。
+//
+// 与 Ready() 分开：AI 总结（转写+纪要）不需要 TTS，不能让"没配 TTS"把总结也挡掉。
+func (c Config) AgentReady() bool {
+	return c.DeepSeekAPIKey != "" && c.PiperModelPath != ""
+}
+
+// AgentUnreadyReason 返回问答助手未就绪的具体原因。
+func (c Config) AgentUnreadyReason() string {
+	if c.DeepSeekAPIKey == "" {
+		return "需要 DEEPSEEK_API_KEY（问答推理）"
+	}
+	if c.PiperModelPath == "" {
+		return "需要 PIPER_MODEL_PATH（本地 Piper 语音模型）"
+	}
+	return ""
+}
+
 // ConfigFromEnv 从环境变量读取配置。Key 缺失不报错——Ready() 为 false 时
 // 启动会话会明确拒绝，日志里也会说明缺了哪个。
 func ConfigFromEnv() Config {
@@ -77,6 +100,9 @@ func ConfigFromEnv() Config {
 		WhisperLang:    envOr("WHISPER_LANG", "zh"),
 		SummaryInterval: 60 * time.Second,
 		ChunkSeconds:    30,
+		TTSBackend:     envOr("TTS_BACKEND", "piper"),
+		PiperBin:       envOr("PIPER_BIN", "piper"),
+		PiperModelPath: os.Getenv("PIPER_MODEL_PATH"),
 	}
 	if v := os.Getenv("AI_SUMMARY_INTERVAL"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 15 {

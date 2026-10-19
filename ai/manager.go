@@ -95,3 +95,15 @@ func (m *Manager) Active(roomID string) bool {
 	_, ok := m.sessions[roomID]
 	return ok
 }
+
+// SummaryMarkdown 返回房间最近一次生成的纪要 markdown（没有则返回 ""）。
+// 供 AI 问答助手做上下文：回答"刚才谁说了什么"这类问题时有依据。
+func (m *Manager) SummaryMarkdown(roomID string) string {
+	m.mu.Lock()
+	s, ok := m.sessions[roomID]
+	m.mu.Unlock()
+	if !ok {
+		return ""
+	}
+	return s.state().Markdown
+}

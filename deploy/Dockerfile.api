@@ -27,6 +27,24 @@ RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git . \
 RUN mkdir -p /models && wget -q -O /models/ggml-small.bin \
     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
 
+# Piper TTS（AI 问答助手语音合成用）
+# 预编译二进制 + 中文语音模型（约 63MB），与 whisper 阶段同模式：
+# Go 侧以 CLI 进程调用，保持 CGO_ENABLED=0 构建约束干净。
+#
+# 注意两点：
+# 1. piper 是 glibc 动态链接的二进制（含自带的 libespeak-ng/libonnxruntime 等），
+#    整个 piper/ 目录原样拷走（espeak-ng-data 靠相对路径定位，不能只拷二进制）；
+# 2. 最终镜像是 Alpine（musl），用 gcompat 提供 glibc 兼容层。
+FROM alpine:3.21 AS piper-builder
+RUN apk add --no-cache wget tar
+RUN mkdir -p /piper /models && wget -q -O /tmp/piper.tar.gz \
+    https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz \
+    && tar xzf /tmp/piper.tar.gz -C /piper \
+    && wget -q -O /models/zh_CN-huayan-medium.onnx \
+    https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx \
+    && wget -q -O /models/zh_CN-huayan-medium.onnx.json \
+    https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json
+
 FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates tzdata wget libstdc++ \
@@ -41,6 +59,14 @@ COPY --from=whisper-builder /models/ggml-small.bin /app/models/ggml-small.bin
 ENV STT_BACKEND=local \
     WHISPER_BIN=/usr/local/bin/whisper-cli \
     WHISPER_MODEL_PATH=/app/models/ggml-small.bin
+# Piper 本地语音合成：整个 piper/ 目录原样拷走（TTS_BACKEND=piper 时用；AI 问答助手）
+# espeak-ng-data 靠相对路径定位，不能只拷二进制；gcompat 给 glibc 二进制提供兼容层（Alpine 是 musl）
+COPY --from=piper-builder /piper/piper /opt/piper
+COPY --from=piper-builder /models/zh_CN-huayan-medium.onnx* /app/models/
+RUN apk add --no-cache gcompat
+ENV TTS_BACKEND=piper \
+    PIPER_BIN=/opt/piper/piper \
+    PIPER_MODEL_PATH=/app/models/zh_CN-huayan-medium.onnx
 
 # 以非 root 运行：容器逃逸的影响面小得多
 USER app

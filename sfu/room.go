@@ -1,6 +1,8 @@
 package sfu
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pion/webrtc/v4"
 
 	"easylive-api/mediarec"
 	"easylive-api/protocol"
@@ -321,6 +325,10 @@ type Room struct {
 	// aiSummaryProvider 由 ai 包设置：返回当前 AI 总结状态（nil 表示未启用）。
 	// Room 本身不依赖 ai 包（避免循环依赖），只通过这个函数指针取状态进快照。
 	aiSummaryProvider func() *protocol.AISummaryState
+	// agentTrack / agentPeer 是 AI 问答助手的虚拟参会者状态：
+	// 一条服务端生成的音频轨 + 合成身份。ai 包通过 PublishAgentTrack 按需创建（幂等）。
+	agentTrack *PublishedTrack
+	agentPeer  *protocol.PeerInfo
 }
 
 // OnTrackEvent 注册轨道事件钩子（AI 转写用）。回调在轨道发布/下线后被调用，
@@ -359,6 +367,77 @@ func (r *Room) SetAISummaryProvider(fn func() *protocol.AISummaryState) {
 	r.mu.Unlock()
 }
 
+// PublishAgentTrack 发布（或复用）AI 问答助手的虚拟音频轨。幂等。
+//
+// 虚拟参会者没有真实连接：轨道是服务端本地生成的（newLocalPublishedTrack），
+// 订阅者走正常订阅流程收听。与普通轨道的区别：
+//   - 身份是合成的 protocol.PeerInfo（进房间快照 + participant_joined 广播）；
+//   - 没有 Pump 循环，AI 通过 WriteAgentRTP 按 20ms 起搏写入；
+//   - RequestKeyframe 对无 pubPC 的轨道是 no-op，订阅端无需处理。
+func (r *Room) PublishAgentTrack() (*PublishedTrack, error) {
+	r.mu.Lock()
+	if r.agentTrack != nil {
+		t := r.agentTrack
+		r.mu.Unlock()
+		return t, nil
+	}
+	// SSRC 由服务端选：订阅端 PLI 按 SSRC 查表，虚拟轨同样适用（trackBySSRC 映射）。
+	// 用 crypto 强随机避免与真实轨道碰撞（概率可忽略，但零成本）。
+	var ssrcBuf [4]byte
+	if _, err := rand.Read(ssrcBuf[:]); err != nil {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("生成 SSRC 失败: %w", err)
+	}
+	ssrc := binary.BigEndian.Uint32(ssrcBuf[:])
+	if ssrc == 0 {
+		ssrc = 1
+	}
+	codec := webrtc.RTPCodecCapability{
+		MimeType:    webrtc.MimeTypeOpus,
+		ClockRate:   48000,
+		Channels:    2, // RFC 7587：SDP 里 opus 固定声明为 48000/2
+		SDPFmtpLine: "minptime=10;useinbandfec=1",
+	}
+	track, err := newLocalPublishedTrack(protocol.AIAgentID, "microphone", codec, ssrc)
+	if err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+	rememberSSRC(ssrc, track)
+	track.onEnd = r.onTrackEnded
+	r.tracks[track.info.ID] = track
+	r.agentTrack = track // 幂等复用的锚点
+	if r.agentPeer == nil {
+		r.agentPeer = &protocol.PeerInfo{
+			ID:       protocol.AIAgentID,
+			Name:     protocol.AIAgentName,
+			Identity: protocol.AIAgentID,
+			JoinedAt: time.Now().UnixMilli(),
+			State:    protocol.StateActive,
+		}
+	}
+	peer := *r.agentPeer
+	info := track.Info()
+	targets := r.allLocked()
+	r.mu.Unlock()
+
+	log.Printf("sfu: AI 助手虚拟轨道已发布 room=%s track=%s ssrc=%d", r.ID, info.ID, ssrc)
+	for _, p := range targets {
+		peerCopy := peer
+		p.NotifyTo(&protocol.Message{Type: protocol.TypeParticipantJoin, Participant: &peerCopy})
+		p.NotifyTo(&protocol.Message{Type: protocol.TypeTrackPublished, Track: info})
+	}
+	r.emitTrackEvent(track, true)
+	return track, nil
+}
+
+// AgentPeer 返回 AI 助手的合成身份（未激活时 nil）。
+func (r *Room) AgentPeer() *protocol.PeerInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.agentPeer
+}
+
 // AudioTracks 返回当前所有音频轨道的快照。
 func (r *Room) AudioTracks() []*PublishedTrack {
 	r.mu.RLock()
@@ -374,6 +453,9 @@ func (r *Room) AudioTracks() []*PublishedTrack {
 
 // ParticipantName 返回参与者的显示名，找不到返回 ID 本身。
 func (r *Room) ParticipantName(id string) string {
+	if id == protocol.AIAgentID {
+		return protocol.AIAgentName
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if p, ok := r.participants[id]; ok && p != nil {
@@ -436,12 +518,20 @@ func (r *Room) detectSpeakers() []protocol.SpeakerInfo {
 	for _, p := range r.participants {
 		participants = append(participants, p)
 	}
+	agentTrack := r.agentTrack // 锁内取值：PublishAgentTrack 与并发读之间不能有竞争
 	r.mu.RUnlock()
 
 	out := make([]protocol.SpeakerInfo, 0, len(participants))
 	for _, p := range participants {
 		if level := p.AudioLevel(); level >= audioLevelThreshold {
 			out = append(out, protocol.SpeakerInfo{ParticipantID: p.ID, Level: level})
+		}
+	}
+	// AI 助手：虚拟轨的电平由 AI 侧按 PCM RMS 上报（NoteAudioLevel），
+	// 同样参与说话人判定，前端高亮复用同一套 active_speakers。
+	if agentTrack != nil {
+		if level := agentTrack.AudioLevel(); level >= audioLevelThreshold {
+			out = append(out, protocol.SpeakerInfo{ParticipantID: protocol.AIAgentID, Level: level})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Level > out[j].Level })
@@ -851,6 +941,11 @@ func (r *Room) State() *protocol.RoomState {
 	}
 	for _, p := range r.participants {
 		state.Participants = append(state.Participants, p.Info())
+	}
+	// AI 助手：虚拟参会者同样进快照，中途入会的人能看到它（及其轨道）
+	if r.agentPeer != nil {
+		peer := *r.agentPeer
+		state.Participants = append(state.Participants, &peer)
 	}
 	for _, t := range r.tracks {
 		state.Tracks = append(state.Tracks, t.Info())

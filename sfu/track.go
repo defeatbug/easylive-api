@@ -119,6 +119,58 @@ type PublishedTrack struct {
 	audioLevelAt    atomic.Int64 // 最后一次更新时间（UnixMilli）
 }
 
+// newLocalPublishedTrack 创建"无远端发布者"的本地轨道：
+// 服务端媒体生产者（AI 语音）直接往 local 里写 RTP，订阅者走正常订阅流程收听。
+// remote/pubPC 为 nil：Pump 不运行（也就没有转发循环），RequestKeyframe 天然 no-op。
+func newLocalPublishedTrack(publisherID, source string, codec webrtc.RTPCodecCapability, ssrc uint32) (*PublishedTrack, error) {
+	id := publisherID + "/" + source + "/local/" + strconv.FormatUint(uint64(ssrc), 10)
+	local, err := webrtc.NewTrackLocalStaticRTP(codec, id, "agent")
+	if err != nil {
+		return nil, err
+	}
+	return &PublishedTrack{
+		info: &protocol.TrackInfo{
+			ID:          id,
+			PublisherID: publisherID,
+			Kind:        protocol.KindAudio,
+			Source:      source,
+		},
+		local: local,
+	}, nil
+}
+
+// WriteAgentRTP 供服务端媒体生产者（AI 语音）写入 RTP 包。
+//
+// 与 Pump 热路径的区别：包是本地生成的，不需要剥头扩展；
+// 电平由 NoteAudioLevel 另行上报（生成侧有 PCM，直接算 RMS 比从包头取更准）。
+func (t *PublishedTrack) WriteAgentRTP(pkt *rtp.Packet) error {
+	if t.muted.Load() {
+		t.dropped.Add(1)
+		return nil
+	}
+	t.packets.Add(1)
+	t.bytes.Add(uint64(len(pkt.Payload)))
+	return t.local.WriteRTP(pkt)
+}
+
+// NoteAudioLevel 由服务端媒体生产者直接上报电平（0-1），供活跃说话人检测。
+//
+// 虚拟轨没有 RTP 头扩展（RFC 6464），走不了 observeAudioLevel；
+// 生成侧手握 PCM，RMS 是最准的电平来源。
+func (t *PublishedTrack) NoteAudioLevel(level float64) {
+	if t.info.Kind != protocol.KindAudio {
+		return
+	}
+	if level < 0 {
+		level = 0
+	}
+	if level > 1 {
+		level = 1
+	}
+	t.audioLevelBits.Store(math.Float64bits(level))
+	t.audioLevelAt.Store(time.Now().UnixMilli())
+}
+
 func newPublishedTrack(publisherID, source string, remote *webrtc.TrackRemote, pubPC *webrtc.PeerConnection) (*PublishedTrack, error) {
 	kind := protocol.KindAudio
 	if remote.Kind() == webrtc.RTPCodecTypeVideo {

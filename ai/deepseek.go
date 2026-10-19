@@ -81,3 +81,67 @@ func Complete(ctx context.Context, apiKey, model, user string) (string, error) {
 	}
 	return strings.TrimSpace(out.Choices[0].Message.Content), nil
 }
+
+// qaSystemPrompt 是会议问答助手的系统提示词：口语、简短，
+// 因为回答会被 TTS 念出来——书面长句听起来像背书。
+const qaSystemPrompt = `你是会议里的 AI 助手，有人 @你提问。请用中文口语简短回答。
+
+要求：
+- 直接说答案，不铺垫、不说"你好"
+- 控制在 120 字以内，适合语音播报
+- 有会议纪要上下文时优先依据它回答；不知道就直说不知道，绝不编造人名和数字`
+
+// CompleteQA 调 DeepSeek 回答会议中的 @AI 提问，返回口语化短回答。
+// context 是可选的会议纪要（最近一次的 markdown），为空则不带上下文。
+func CompleteQA(ctx context.Context, apiKey, model, question, context string) (string, error) {
+	user := question
+	if context != "" {
+		user = "【会议纪要上下文】\n" + context + "\n\n【提问】\n" + question
+	}
+	reqBody, _ := json.Marshal(map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": qaSystemPrompt},
+			{"role": "user", "content": user},
+		},
+		"temperature": 0.5,
+		"max_tokens":  500,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deepseekURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("deepseek: 构造请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("deepseek: 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("deepseek: HTTP %d: %s", resp.StatusCode, truncate(string(raw), 300))
+	}
+	var out struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("deepseek: 解析响应失败: %w", err)
+	}
+	if out.Error != nil {
+		return "", fmt.Errorf("deepseek: API 错误: %s", out.Error.Message)
+	}
+	if len(out.Choices) == 0 {
+		return "", fmt.Errorf("deepseek: 响应无 choices")
+	}
+	return strings.TrimSpace(out.Choices[0].Message.Content), nil
+}
