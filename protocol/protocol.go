@@ -88,6 +88,11 @@ const (
 	TypeAISummaryState MsgType = "ai_summary_state"
 	// TypeAISummaryUpdate 服务端推送纪要内容更新：{aiSummary:{markdown, updatedAt, segmentCount}}
 	TypeAISummaryUpdate MsgType = "ai_summary_update"
+	// TypeAIAgentState 服务端广播 AI 问答助手状态：{aiAgent:{active, state}}。
+	// state: thinking（正在想）| speaking（正在语音回答）| idle（空闲）。
+	// 问答触发走普通聊天（@AI 前缀），文字回答同样走 chat_message（发送者为 AI 助手），
+	// 因此不需要单独的 ask/reply 消息类型。
+	TypeAIAgentState MsgType = "ai_agent_state"
 )
 
 // 媒体连接目标：发布者连接 或 订阅者连接（每个参与者各持一条，避免重复协商/glare）
@@ -148,6 +153,8 @@ type Message struct {
 	Recording *RecordingState `json:"recording,omitempty"`
 	// AISummary 是 AI 总结载荷（ai_summary 的广播 / ai_summary_state / ai_summary_update 消息）
 	AISummary *AISummaryState `json:"aiSummary,omitempty"`
+	// AIAgent 是 AI 问答助手状态载荷（ai_agent_state 消息）
+	AIAgent *AIAgentState `json:"aiAgent,omitempty"`
 
 	// Flash 是服务端广播出去的弹幕/互动（fromId/fromName 由服务端填，客户端无法伪造）
 	Flash *FlashMessage `json:"flash,omitempty"`
@@ -340,6 +347,28 @@ type AISummaryState struct {
 	UpdatedAt    int64  `json:"updatedAt,omitempty"`
 	SegmentCount int    `json:"segmentCount,omitempty"` // 已转写片段数
 }
+
+// AIAgentState 是 AI 问答助手的状态（ai_agent_state 消息载荷）。
+//
+// 与 AI 总结的区别：总结是"房间级后台任务"，问答助手是"虚拟参会者"——
+// 它以 ai-agent 身份发布一条音频轨，说话时参与 active_speakers 高亮。
+type AIAgentState struct {
+	Active bool   `json:"active"`
+	State  string `json:"state"` // thinking | speaking | idle
+}
+
+// AI 问答助手的状态取值。
+const (
+	AIAgentThinking = "thinking" // 正在调 LLM
+	AIAgentSpeaking = "speaking" // 正在语音回答（虚拟轨有音频流出）
+	AIAgentIdle     = "idle"     // 空闲
+)
+
+// AIAgentID 是 AI 问答助手在房间里的虚拟参与者 ID（预留，不与真实参与者冲突）。
+const AIAgentID = "ai-agent"
+
+// AIAgentName 是 AI 助手对外显示的名字。
+const AIAgentName = "AI 助手"
 
 type RoomState struct {
 	// Recording 指示当前房间是否正在录制（入会快照携带，中途进来的也能看到红点）

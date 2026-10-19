@@ -13,6 +13,7 @@ import (
 	"easylive-api/auth"
 	"easylive-api/protocol"
 	"easylive-api/sfu"
+	"easylive-api/ai"
 )
 
 // Mount 把信令入口挂到 Fiber 路由（约定：GET <basePath>/ws）。
@@ -473,6 +474,12 @@ func (h *Hub) handleChat(c *Client, msg *protocol.Message) {
 			TS:       time.Now().UnixMilli(),
 		},
 	}, "")
+
+	// @AI 问答：原消息照常广播（大家能看到问了什么），同时转给 AI 助手。
+	// Ask 非阻塞（未就绪/队列满时自己在聊天框说明原因），不会卡住信令读循环。
+	if ai.IsAIMention(msg.Text) {
+		h.agent.Ask(room, p.Name, msg.Text)
+	}
 }
 
 // maxFlashTextRunes 是弹幕文字上限（超出截断，不丢弃）。

@@ -28,6 +28,9 @@ type Hub struct {
 	// ai 是 AI 会议总结管理器（房间级会话）。配置缺失时 Start 会明确报错，
 	// 不影响正常信令流程。
 	ai *ai.Manager
+	// agent 是 AI 问答助手（虚拟参会者，常驻）。未就绪时 Ask 会在聊天框说明原因，
+	// 同样不影响正常信令流程。
+	agent *ai.Agent
 
 	mu      sync.RWMutex
 	clients map[string]*Client // sessionID -> client
@@ -43,11 +46,18 @@ func NewHub(manager *sfu.Manager, cfg *config.Config) *Hub {
 	} else {
 		log.Printf("signaling: AI 总结已就绪（转写=%s，DeepSeek=%s）", aiCfg.STTBackend, aiCfg.DeepSeekModel)
 	}
+	aiMgr := ai.New(aiCfg)
+	if !aiCfg.AgentReady() {
+		log.Printf("signaling: AI 问答助手未配置（%s），@AI 提问会被拒绝并在聊天框说明", aiCfg.AgentUnreadyReason())
+	} else {
+		log.Printf("signaling: AI 问答助手已就绪（TTS=%s，DeepSeek=%s）", aiCfg.TTSBackend, aiCfg.DeepSeekModel)
+	}
 	return &Hub{
 		manager: manager,
 		cfg:     cfg,
 		auth:    auth.New(cfg.JWTSecret, cfg.TokenTTL, auth.ParseMode(cfg.AuthMode)),
-		ai:      ai.New(aiCfg),
+		ai:      aiMgr,
+		agent:   ai.NewAgent(aiCfg, aiMgr.SummaryMarkdown),
 		clients: make(map[string]*Client),
 		resumes: make(map[string]resumeEntry),
 	}
