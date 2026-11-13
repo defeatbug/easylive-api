@@ -205,13 +205,21 @@ func (s *Session) broadcastUpdate() {
 	}, "")
 }
 
-// Stop 结束会话：停定时器、摘掉所有 tap、做最后一次纪要（有新片段才做）、广播关闭状态。
+// Stop 结束会话。
+//
+// **必须快速返回**：调用方是信令读循环（handleAISummary 同步调用），而这个函数以前
+// 会在这里等每一路转写器做完最后一次 Whisper、再等一次 DeepSeek 纪要——单次最长
+// 150s，几路叠起来就是好几分钟。读循环被堵住之后，客户端 60s 内收不到任何消息就会
+// 被读超时断开：用户点"停止 AI 总结"，结果自己被踢下线。
+//
+// 所以这里只做"秒级"的收尾（停定时器、摘 hook、摘 tap、清 provider、广播关闭），
+// 慢活（转写器 flush + 收尾纪要）交给后台协程，不阻塞任何人。
 func (s *Session) Stop() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
-		s.wg.Wait()
 		if s.unregisterHook != nil {
 			s.unregisterHook()
+			s.unregisterHook = nil
 		}
 		// 摘掉所有轨道的 tap
 		s.mu.Lock()
@@ -224,27 +232,38 @@ func (s *Session) Stop() {
 		for _, tr := range s.room.AudioTracks() {
 			tr.DetachAISink()
 		}
-		for _, tb := range tbs {
-			tb.Stop() // 最后一次转写（缓冲音频）
-		}
-		// 有新片段没进纪要？收尾生成一次
-		s.mu.Lock()
-		dirty := len(s.segments) > 0 && len(s.segments) != s.segmentCount
-		s.mu.Unlock()
-		if dirty {
-			if err := s.regenerate(); err != nil {
-				log.Printf("ai: 收尾纪要失败 room=%s: %v", s.roomID, err)
-			} else {
-				s.mu.Lock()
-				s.segmentCount = len(s.segments)
-				s.mu.Unlock()
-			}
-		}
+		s.room.SetAISummaryProvider(nil)
 		s.room.Broadcast(&protocol.Message{
 			Type:      protocol.TypeAISummaryState,
 			AISummary: &protocol.AISummaryState{Active: false},
 		}, "")
-		s.room.SetAISummaryProvider(nil)
 		log.Printf("ai: 会议总结已停止 room=%s", s.roomID)
+		// 慢收尾放后台：转写器的最后一段音频、以及没进纪要的片段。
+		go s.finalize(tbs)
 	})
+}
+
+// finalize 是 Stop 的后台部分：等转写协程收尾、做最后一次纪要。
+//
+// 注意结果**不会再广播**（面板在 Active=false 时不渲染 markdown），只落日志；
+// 会话已经从 Manager.sessions 里摘掉，这里持有的是最后一个引用。
+func (s *Session) finalize(tbs []*Transcriber) {
+	s.wg.Wait() // summarizeLoop 退出（stopCh 已关，最多一个 tick）
+	for _, tb := range tbs {
+		tb.Stop() // 最后一次转写（缓冲音频）
+	}
+	s.mu.Lock()
+	dirty := len(s.segments) > 0 && len(s.segments) != s.segmentCount
+	s.mu.Unlock()
+	if !dirty {
+		return
+	}
+	if err := s.regenerate(); err != nil {
+		log.Printf("ai: 收尾纪要失败 room=%s: %v", s.roomID, err)
+		return
+	}
+	s.mu.Lock()
+	s.segmentCount = len(s.segments)
+	s.mu.Unlock()
+	log.Printf("ai: 收尾纪要已生成 room=%s（会话已结束，仅记录）", s.roomID)
 }

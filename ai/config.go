@@ -90,19 +90,19 @@ func (c Config) AgentUnreadyReason() string {
 // 启动会话会明确拒绝，日志里也会说明缺了哪个。
 func ConfigFromEnv() Config {
 	c := Config{
-		STTBackend:     envOr("STT_BACKEND", "local"),
-		OpenAIAPIKey:   os.Getenv("OPENAI_API_KEY"),
-		WhisperBin:     envOr("WHISPER_BIN", "whisper-cli"),
+		STTBackend:       envOr("STT_BACKEND", "local"),
+		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
+		WhisperBin:       envOr("WHISPER_BIN", "whisper-cli"),
 		WhisperModelPath: os.Getenv("WHISPER_MODEL_PATH"),
-		DeepSeekAPIKey: os.Getenv("DEEPSEEK_API_KEY"),
-		DeepSeekModel:  envOr("DEEPSEEK_MODEL", "deepseek-chat"),
-		WhisperModel:   envOr("WHISPER_MODEL", "whisper-1"),
-		WhisperLang:    envOr("WHISPER_LANG", "zh"),
-		SummaryInterval: 60 * time.Second,
-		ChunkSeconds:    30,
-		TTSBackend:     envOr("TTS_BACKEND", "piper"),
-		PiperBin:       envOr("PIPER_BIN", "piper"),
-		PiperModelPath: os.Getenv("PIPER_MODEL_PATH"),
+		DeepSeekAPIKey:   os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekModel:    envOr("DEEPSEEK_MODEL", "deepseek-chat"),
+		WhisperModel:     envOr("WHISPER_MODEL", "whisper-1"),
+		WhisperLang:      envOr("WHISPER_LANG", "zh"),
+		SummaryInterval:  60 * time.Second,
+		ChunkSeconds:     30,
+		TTSBackend:       envOr("TTS_BACKEND", "piper"),
+		PiperBin:         envOr("PIPER_BIN", "piper"),
+		PiperModelPath:   os.Getenv("PIPER_MODEL_PATH"),
 	}
 	if v := os.Getenv("AI_SUMMARY_INTERVAL"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 15 {

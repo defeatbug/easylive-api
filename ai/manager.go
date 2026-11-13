@@ -64,6 +64,9 @@ func (m *Manager) Start(room *sfu.Room, startedBy string) error {
 }
 
 // Stop 停止房间的 AI 总结会话（幂等）。
+//
+// 它只做**秒级**的收尾并立刻返回：慢的部分（转写器 flush、收尾纪要）在 Session.Stop
+// 里已经挪到后台协程。调用方是信令读循环，不能在这里等 Whisper/DeepSeek。
 func (m *Manager) Stop(roomID string) {
 	m.mu.Lock()
 	s, ok := m.sessions[roomID]
@@ -73,7 +76,7 @@ func (m *Manager) Stop(roomID string) {
 	m.mu.Unlock()
 	if !ok {
 		return
-	 }
+	}
 	s.Stop()
 }
 

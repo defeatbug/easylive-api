@@ -174,6 +174,16 @@ type Writer struct {
 	// closeOnce 让 Close 幂等：管理器统一收尾时可能对同一条轨道再关一次，
 	// 直接 close 已关闭的 channel 会 panic（测试就抓到了这一点）。
 	closeOnce sync.Once
+	// mu 把"往 frames 里发"与"关 frames"互斥。
+	//
+	// 只靠 closeOnce 不够：转发协程是 `if w := t.rec.Load(); w != nil { w.Write(pkt) }`，
+	// Load 之后、Write 之前如果另一个人（点"停止录制"）把 frames 关了，那次发送就是
+	// **send on closed channel**——panic 会被 safeGo 兜住，但这条轨道的 Pump 就此永久退出，
+	// 房间里所有人从此收不到这个人的媒体。
+	//
+	// 热路径只多一次 RLock（几十纳秒），相对每包转发/落盘的开销可忽略。
+	mu     sync.RWMutex
+	closed bool
 
 	dropped atomic.Uint64
 	written atomic.Uint64
@@ -189,7 +199,14 @@ type Writer struct {
 }
 
 // Write 把包交给后台写协程。**永不阻塞**：队列满时丢包并计数。
+//
+// 与 Close 并发是安全的：已关闭就静默丢弃（见 Writer.mu 的说明）。
 func (w *Writer) Write(pkt *rtp.Packet) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.closed {
+		return
+	}
 	select {
 	case w.frames <- pkt:
 	default:
@@ -201,9 +218,15 @@ func (w *Writer) Write(pkt *rtp.Packet) {
 }
 
 // Close 停止写协程、flush 并关文件。可重复调用（幂等）。
+//
+// 顺序很重要：先抢写锁置 closed 并关 frames（此后不会再有新的发送进来），
+// 再等写协程把剩余队列排空并收尾（<-w.done）。
 func (w *Writer) Close() error {
 	w.closeOnce.Do(func() {
+		w.mu.Lock()
+		w.closed = true
 		close(w.frames)
+		w.mu.Unlock()
 		<-w.done
 	})
 	return nil

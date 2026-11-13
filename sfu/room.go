@@ -31,9 +31,25 @@ type Manager struct {
 	// recorder 非 nil 时开启录制：每条轨道多写一份到磁盘（见 mediarec 包）。
 	// 它对转发是"旁路"：写队列满就丢帧，绝不阻塞媒体。
 	recorder *mediarec.Manager
+	// onRoomRemoved 在房间被回收（人走空了）时调用，由上层注册。
+	// 用途：让不属于 sfu 的子系统跟着收尾（AI 总结会话就是这样挂进来的）。
+	// 不注册也不会错，只是那些子系统得自己找别的时机收尾。
+	onRoomRemoved func(roomID string)
 
 	mu    sync.RWMutex
 	rooms map[string]*Room
+}
+
+// OnRoomRemoved 注册"房间被回收"的回调。传 nil 取消注册。
+//
+// 为什么需要它：房间对象是 sfu 私有的，上层（signaling/ai）拿不到"这个房间没了"的
+// 事件，只能靠客户端消息猜。AI 总结会话因此曾经在房间回收后继续挂着——协程空转，
+// 而且同一个 roomId 再开会时 Start 会命中旧会话直接幂等返回，用户看到"已开启"却
+// 永远没有纪要，只能重启进程。
+func (m *Manager) OnRoomRemoved(fn func(roomID string)) {
+	m.mu.Lock()
+	m.onRoomRemoved = fn
+	m.mu.Unlock()
 }
 
 // EnableRecording 打开会议录制（传 nil 表示关闭）。
@@ -65,7 +81,12 @@ func (m *Manager) StartRecording(roomID, startedBy string) (*mediarec.Session, e
 		return nil, ErrRecordingDisabled
 	}
 	if rec.Recording() {
-		return rec.CurrentSession(), nil // 已在录：幂等
+		// 已在录：只有**同一个房间**才算幂等。
+		// 别的房间必须明确报错——否则用户会看到"已开始录制"但一个字节都不落盘。
+		if sess := rec.CurrentSession(); sess != nil && sess.RoomID == roomID {
+			return sess, nil
+		}
+		return nil, mediarec.ErrRoomBusy
 	}
 	sess, err := rec.StartSession(roomID, startedBy)
 	if err != nil {
@@ -75,6 +96,18 @@ func (m *Manager) StartRecording(roomID, startedBy string) (*mediarec.Session, e
 		r.attachRecorders()
 	}
 	return sess, nil
+}
+
+// StopRecordingIn 只停止 roomID 自己的录制会话。
+//
+// 录制会话没有 roomID 维度（单例），所以这里必须先核对归属：否则 B 房间的人
+// 点"停止录制"会把 A 房间正在进行的录制停掉、把 A 的清单收尾。
+// 房间不是当前会话的归属房间时返回 mediarec.ErrRoomBusy。
+func (m *Manager) StopRecordingIn(roomID string) (*mediarec.Session, error) {
+	if sess := m.RecordingSession(); sess != nil && sess.RoomID != roomID {
+		return nil, mediarec.ErrRoomBusy
+	}
+	return m.StopRecording(), nil
 }
 
 // StopRecording 结束当前录制并返回会话（没有在录时返回 nil）。
@@ -109,6 +142,11 @@ func (r *Room) attachRecorders() {
 	if rec == nil {
 		return
 	}
+	// 录制会话是进程级单例（一次只录一个房间）：不是本房间的会话时，
+	// 绝不能把本房间的轨道挂上去，否则本房间的媒体会被写进另一个房间的会话目录。
+	if !rec.RecordingFor(r.ID) {
+		return
+	}
 	r.mu.RLock()
 	tracks := make([]*PublishedTrack, 0, len(r.tracks))
 	for _, t := range r.tracks {
@@ -117,6 +155,13 @@ func (r *Room) attachRecorders() {
 	r.mu.RUnlock()
 	for _, t := range tracks {
 		if t.recording() {
+			continue
+		}
+		// 虚拟轨道（AI 助手的语音）没有远端：它的 RTP 是服务端自己生成的，
+		// t.remote 为 nil。这里必须跳过，否则下面取 PayloadType/SSRC 直接 nil 解引用 panic。
+		// 曾经的表现是：房间里用过一次 @AI 之后，任何人点"开始录制"都会把自己的连接打断。
+		if t.remote == nil {
+			log.Printf("sfu: 跳过虚拟轨道（无远端，不落盘）track=%s", t.info.ID)
 			continue
 		}
 		codec := mediarec.Codec{
@@ -216,6 +261,14 @@ func (m *Manager) remove(roomID string) {
 			log.Printf("sfu: 房间回收，录制会话已自动收尾 room=%s session=%s", roomID, sess.ID)
 		}
 	}
+
+	// 通知上层：这个房间没了。同样放在解锁之后（回调可能反过来调 Manager 的方法）。
+	m.mu.RLock()
+	onRemoved := m.onRoomRemoved
+	m.mu.RUnlock()
+	if onRemoved != nil {
+		onRemoved(roomID)
+	}
 }
 
 // RecordingState 把录制会话映射成给客户端的录制状态（信令层广播与入会快照都用它）。
@@ -232,6 +285,21 @@ func (m *Manager) RecordingState() *protocol.RecordingState {
 		Active: true, SessionID: sess.ID,
 		StartedAt: sess.StartedAt.UnixMilli(), StartedBy: sess.StartedBy, Files: len(sess.Files),
 	}
+}
+
+// RecordingStateFor 是"**本房间**的录制状态"：会话不属于 roomID 时一律返回未录制。
+//
+// 为什么需要它：录制会话是进程级单例，而快照与广播原先直接用全局状态，
+// 于是 A 房间在录的时候，B 房间的新入会者会在快照里看到"录制中"红点——纯属串台。
+func (m *Manager) RecordingStateFor(roomID string) *protocol.RecordingState {
+	st := m.RecordingState()
+	if !st.Active {
+		return st
+	}
+	if sess := m.RecordingSession(); sess == nil || sess.RoomID != roomID {
+		return &protocol.RecordingState{Active: false}
+	}
+	return st
 }
 
 // RoomSnapshot 是单个房间的轻量快照（供采样器与观测使用）。
@@ -284,15 +352,26 @@ func (m *Manager) RoomIDs() []string {
 	return ids
 }
 
+// Stats 汇总全部房间的人数与轨道数。
+//
+// 锁顺序：**先在 m.mu 下拷贝房间列表，解锁后再逐个取 r.mu**。
+// 以前是持 m.mu 读锁去调 r.counts()（取 r.mu），而 Room.State() 持 r.mu 去调
+// Manager.RecordingStateFor()（取 m.mu）——两条相反的路径加上 Go RWMutex 的写者优先，
+// 一旦有 writer（创建/回收房间）排队就会 ABBA 互等。
 func (m *Manager) Stats() (rooms, participants, tracks int) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	list := make([]*Room, 0, len(m.rooms))
 	for _, r := range m.rooms {
+		list = append(list, r)
+	}
+	m.mu.RUnlock()
+
+	for _, r := range list {
 		p, t := r.counts()
 		participants += p
 		tracks += t
 	}
-	return len(m.rooms), participants, tracks
+	return len(list), participants, tracks
 }
 
 // ---------- Room ----------
@@ -927,36 +1006,59 @@ func (r *Room) Track(trackID string) (*PublishedTrack, bool) {
 }
 
 // State 生成房间快照：新成员入会或断线重连时下发。
+//
+// 锁顺序：**锁内只做"拷贝引用/值"，解锁后再调外部东西**（manager 的录制状态、ai 的
+// 纪要 provider、各参与者的 Info()）。以前整段都在 r.mu.RLock 里，而 manager 那边
+// （Stats/录制路径）是持 m.mu 取 r.mu —— 两条相反顺序在某些交错下会 ABBA 死锁；
+// 同理 ai provider 内部要取 session 锁，也会引入 room → session 的反向依赖。
 func (r *Room) State() *protocol.RoomState {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	participants := make([]*Participant, 0, len(r.participants))
+	for _, p := range r.participants {
+		participants = append(participants, p)
+	}
+	tracks := make([]*PublishedTrack, 0, len(r.tracks))
+	for _, t := range r.tracks {
+		tracks = append(tracks, t)
+	}
+	var agent *protocol.PeerInfo
+	if r.agentPeer != nil {
+		cp := *r.agentPeer
+		agent = &cp
+	}
+	whiteboard := append([]protocol.WhiteboardOp(nil), r.whiteboard...)
+	hands := make([]string, 0, len(r.hands))
+	for id, up := range r.hands {
+		if up {
+			hands = append(hands, id)
+		}
+	}
+	aiSummaryProvider := r.aiSummaryProvider
+	r.mu.RUnlock()
 
 	state := &protocol.RoomState{
 		RoomID:       r.ID,
-		Participants: make([]*protocol.PeerInfo, 0, len(r.participants)),
-		Tracks:       make([]*protocol.TrackInfo, 0, len(r.tracks)),
+		Participants: make([]*protocol.PeerInfo, 0, len(participants)+1),
+		Tracks:       make([]*protocol.TrackInfo, 0, len(tracks)),
 		// 带上录制状态：中途入会的人也要能立刻看到"录制中"红点，
 		// 而不是等到下一次广播（否则"有人在录我"这件事对新来者不可见）
-		Recording: r.manager.RecordingState(),
+		Recording: r.manager.RecordingStateFor(r.ID),
 	}
-	for _, p := range r.participants {
+	for _, p := range participants {
 		state.Participants = append(state.Participants, p.Info())
 	}
 	// AI 助手：虚拟参会者同样进快照，中途入会的人能看到它（及其轨道）
-	if r.agentPeer != nil {
-		peer := *r.agentPeer
-		state.Participants = append(state.Participants, &peer)
+	if agent != nil {
+		state.Participants = append(state.Participants, agent)
 	}
-	for _, t := range r.tracks {
+	for _, t := range tracks {
 		state.Tracks = append(state.Tracks, t.Info())
 	}
-	state.Whiteboard = append([]protocol.WhiteboardOp(nil), r.whiteboard...)
-	for id := range r.hands {
-		state.Hands = append(state.Hands, id)
-	}
+	state.Whiteboard = whiteboard
+	state.Hands = hands
 	// 带上 AI 总结状态：中途入会的人能立刻看到当前纪要，而不是等下一次更新
-	if r.aiSummaryProvider != nil {
-		state.AISummary = r.aiSummaryProvider()
+	if aiSummaryProvider != nil {
+		state.AISummary = aiSummaryProvider()
 	}
 	return state
 }

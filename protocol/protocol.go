@@ -338,9 +338,9 @@ type RecordingState struct {
 
 // AISummaryState 是 AI 会议总结的房间状态：开关 + 实时更新的 markdown 纪要。
 type AISummaryState struct {
-	Active       bool   `json:"active"`
-	StartedAt    int64  `json:"startedAt,omitempty"`
-	StartedBy    string `json:"startedBy,omitempty"` // 发起者的 participantId
+	Active        bool   `json:"active"`
+	StartedAt     int64  `json:"startedAt,omitempty"`
+	StartedBy     string `json:"startedBy,omitempty"` // 发起者的 participantId
 	StartedByName string `json:"startedByName,omitempty"`
 	// Markdown 是当前纪要全文（markdown）；UpdatedAt 是服务端毫秒时间戳
 	Markdown     string `json:"markdown,omitempty"`
@@ -372,7 +372,7 @@ const AIAgentName = "AI 助手"
 
 type RoomState struct {
 	// Recording 指示当前房间是否正在录制（入会快照携带，中途进来的也能看到红点）
-	Recording    *RecordingState `json:"recording,omitempty"`
+	Recording *RecordingState `json:"recording,omitempty"`
 	// AISummary 是 AI 总结状态（入会快照携带，中途进来的人能看到当前纪要）
 	AISummary    *AISummaryState `json:"aiSummary,omitempty"`
 	RoomID       string          `json:"roomId"`

@@ -19,7 +19,7 @@ func TestResampleTo48000(t *testing.T) {
 	// 1 秒 22050Hz → 48000 个采样
 	in22050 := make([]int16, 22050)
 	for i := range in22050 {
-		in22050[i] = int16(math.Sin(2 * math.Pi * 440 * float64(i) / 22050) * 10000)
+		in22050[i] = int16(math.Sin(2*math.Pi*440*float64(i)/22050) * 10000)
 	}
 	out := ResampleTo48000(in22050, 22050)
 	if len(out) != 48000 {
@@ -46,7 +46,7 @@ func TestEncodeOpusFrames(t *testing.T) {
 	// 0.5 秒 440Hz 正弦波 @48k
 	pcm := make([]int16, 24000)
 	for i := range pcm {
-		pcm[i] = int16(math.Sin(2 * math.Pi * 440 * float64(i) / 48000) * 10000)
+		pcm[i] = int16(math.Sin(2*math.Pi*440*float64(i)/48000) * 10000)
 	}
 	frames, err := EncodeOpusFrames(pcm)
 	if err != nil {

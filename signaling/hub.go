@@ -52,12 +52,23 @@ func NewHub(manager *sfu.Manager, cfg *config.Config) *Hub {
 	} else {
 		log.Printf("signaling: AI 问答助手已就绪（TTS=%s，DeepSeek=%s）", aiCfg.TTSBackend, aiCfg.DeepSeekModel)
 	}
+	// 房间被回收（人走空了）时，把挂在里面的 AI 会话与助手状态一起收掉。
+	//
+	// 不加这个钩子的话：AI 总结会话永远留在 sessions map 里，summarizeLoop 空转到进程结束；
+	// 而且同一个 roomId 再开会时 Start 命中旧会话直接幂等返回，用户看到"已开启 AI 总结"
+	// 却永远等不到纪要——只能重启进程才能恢复。助手那边的每房间 RTP 状态同理。
+	agent := ai.NewAgent(aiCfg, aiMgr.SummaryMarkdown)
+	manager.OnRoomRemoved(func(roomID string) {
+		aiMgr.Stop(roomID)
+		agent.ForgetRoom(roomID)
+	})
+
 	return &Hub{
 		manager: manager,
 		cfg:     cfg,
 		auth:    auth.New(cfg.JWTSecret, cfg.TokenTTL, auth.ParseMode(cfg.AuthMode)),
 		ai:      aiMgr,
-		agent:   ai.NewAgent(aiCfg, aiMgr.SummaryMarkdown),
+		agent:   agent,
 		clients: make(map[string]*Client),
 		resumes: make(map[string]resumeEntry),
 	}
