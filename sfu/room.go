@@ -55,13 +55,15 @@ var ErrRecordingDisabled = fmt.Errorf("服务端未开启录制（RECORD_ENABLED
 //
 // 关键点：**已经在发布的轨道也要挂上**——主持人是会中才点录制的，
 // 那时候摄像头/麦克风早就在推流了，只给"之后发布的轨道"挂写入器会漏掉所有人的画面。
+//
+// 幂等性按房间判定：同一房间重复开始返回已有会话，不同房间各自独立。
 func (m *Manager) StartRecording(roomID, startedBy string) (*mediarec.Session, error) {
 	rec := m.Recording()
 	if rec == nil {
 		return nil, ErrRecordingDisabled
 	}
-	if rec.Recording() {
-		return rec.CurrentSession(), nil // 已在录：幂等
+	if rec.Recording(roomID) {
+		return rec.CurrentSession(roomID), nil // 本房间已在录：幂等
 	}
 	sess, err := rec.StartSession(roomID, startedBy)
 	if err != nil {
@@ -73,28 +75,25 @@ func (m *Manager) StartRecording(roomID, startedBy string) (*mediarec.Session, e
 	return sess, nil
 }
 
-// StopRecording 结束当前录制并返回会话（没有在录时返回 nil）。
-func (m *Manager) StopRecording() *mediarec.Session {
-	// 先把房间里的写入器摘掉，再收会话：让每条轨道在清单落盘前完成收尾
-	m.mu.RLock()
-	rooms := make([]*Room, 0, len(m.rooms))
-	for _, r := range m.rooms {
-		rooms = append(rooms, r)
-	}
-	m.mu.RUnlock()
-	for _, r := range rooms {
+// StopRecording 结束**指定房间**的录制并返回会话（没有在录时返回 nil）。
+//
+// 只影响这个房间：过去它会把所有房间的写入器一起摘掉，
+// 于是 A 房结束录制会连带把 B 房正在进行的录制停掉（多房间串台的另一半）。
+func (m *Manager) StopRecording(roomID string) *mediarec.Session {
+	// 先把该房间的写入器摘掉，再收会话：让每条轨道在清单落盘前完成收尾
+	if r, ok := m.Get(roomID); ok {
 		r.detachRecorders()
 	}
 	if rec := m.Recording(); rec != nil {
-		return rec.StopSession()
+		return rec.StopSession(roomID)
 	}
 	return nil
 }
 
-// RecordingSession 返回当前录制会话（没有则 nil）。
-func (m *Manager) RecordingSession() *mediarec.Session {
+// RecordingSession 返回指定房间的录制会话（没有则 nil）。
+func (m *Manager) RecordingSession(roomID string) *mediarec.Session {
 	if rec := m.Recording(); rec != nil {
-		return rec.CurrentSession()
+		return rec.CurrentSession(roomID)
 	}
 	return nil
 }
@@ -102,7 +101,7 @@ func (m *Manager) RecordingSession() *mediarec.Session {
 // attachRecorders 给房间里已经在发布的每条轨道挂上录制写入器。
 func (r *Room) attachRecorders() {
 	rec := r.manager.Recording()
-	if rec == nil {
+	if rec == nil || !rec.Recording(r.ID) {
 		return
 	}
 	r.mu.RLock()
@@ -196,31 +195,55 @@ func (m *Manager) Engine() *Engine { return m.engine }
 // remove 由 Room 在最后一个参与者离开时调用。
 func (m *Manager) remove(roomID string) {
 	m.mu.Lock()
-	if r, ok := m.rooms[roomID]; ok {
+	r, ok := m.rooms[roomID]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	// "房间已空"是在 Leave 的临界区里判定的，但那和这里删表之间还有窗口：
+	// GetOrCreate 在删表前仍会把这个 Room 对象发给新入会者，于是可能有人在窗口里 Join 回来。
+	// 旧实现直接删表 → 房间变成孤儿（人还在开会，Manager 却不认它：录制状态、快照、
+	// 空房回收全部失联）。所以在 m.mu + r.mu 下**重新确认**一次 emptiness 再删。
+	//
+	// 锁序固定为 m.mu → r.mu：反方向（持 r.mu 再取 m.mu）已在 Room.State 里消除，
+	// 其余 manager.* 调用要么在 r.mu 之外，要么只读无锁字段（maxParticipants/resumeGrace）。
+	r.mu.Lock()
+	empty := len(r.participants) == 0
+	if empty {
+		delete(m.rooms, roomID)
 		close(r.speakerStop) // 回收房间时停掉采样协程，避免泄漏
 	}
-	delete(m.rooms, roomID)
+	r.mu.Unlock()
 	n := len(m.rooms)
 	m.mu.Unlock()
+	if !empty {
+		log.Printf("sfu: 空房回收放弃 room=%s（期间有人重新加入，房间保留）", roomID)
+		return
+	}
 	log.Printf("sfu: 回收空房间 room=%s（当前房间数 %d）", roomID, n)
 
-	// 房间没了就没人可录：自动收尾当前会话。
+	// 房间没了就没人可录：**自动收尾这个房间**的会话。
 	// 必须放在解锁之后——StopRecording 自己也要拿 m.mu，锁内调用会死锁。
-	if rec := m.Recording(); rec != nil && rec.Recording() {
-		if sess := rec.CurrentSession(); sess != nil && sess.RoomID == roomID {
-			m.StopRecording()
+	// 只收本房间：其他房间正在进行的录制不能因为这里回收空房间而被停掉。
+	if rec := m.Recording(); rec != nil && rec.Recording(roomID) {
+		if sess := rec.CurrentSession(roomID); sess != nil {
+			m.StopRecording(roomID)
 			log.Printf("sfu: 房间回收，录制会话已自动收尾 room=%s session=%s", roomID, sess.ID)
 		}
 	}
 }
 
-// RecordingState 把录制会话映射成给客户端的录制状态（信令层广播与入会快照都用它）。
-func (m *Manager) RecordingState() *protocol.RecordingState {
+// RoomRecordingState 把**指定房间**的录制会话映射成给客户端的录制状态
+// （信令层广播与入会快照都用它）。
+//
+// 为什么必须带 roomID：录制是房间级状态，A 房在录不等于 B 房在录。
+// 旧实现取全局会话，于是 B 房的中途入会者会看到"录制中"红点（实际录的是 A 房）。
+func (m *Manager) RoomRecordingState(roomID string) *protocol.RecordingState {
 	rec := m.Recording()
-	if rec == nil || !rec.Recording() {
+	if rec == nil || !rec.Recording(roomID) {
 		return &protocol.RecordingState{Active: false}
 	}
-	sess := rec.CurrentSession()
+	sess := rec.CurrentSession(roomID)
 	if sess == nil {
 		return &protocol.RecordingState{Active: false}
 	}
@@ -230,6 +253,89 @@ func (m *Manager) RecordingState() *protocol.RecordingState {
 	}
 }
 
+// RecordingState 返回**全局**（任一房间正在录制时最近开始的那个）录制状态。
+//
+// 仅供 HTTP 的 /recordings 列表使用：它返回的是所有房间的会话，
+// 没有一个"当前房间"可归属。信令层与入会快照必须用 RoomRecordingState(roomID)。
+func (m *Manager) RecordingState() *protocol.RecordingState {
+	rec := m.Recording()
+	if rec == nil {
+		return &protocol.RecordingState{Active: false}
+	}
+	var latest *mediarec.Session
+	for _, id := range rec.RecordingRooms() {
+		if s := rec.CurrentSession(id); s != nil {
+			if latest == nil || s.StartedAt.After(latest.StartedAt) {
+				latest = s
+			}
+		}
+	}
+	if latest == nil {
+		return &protocol.RecordingState{Active: false}
+	}
+	return &protocol.RecordingState{
+		Active: true, SessionID: latest.ID,
+		StartedAt: latest.StartedAt.UnixMilli(), StartedBy: latest.StartedBy, Files: len(latest.Files),
+	}
+}
+
+// SetClientQuality 记录一个参与者上报的链路质量；返回是否被接受。
+//
+// 校验与限频都放在这里（而不是信令层）：房间状态是唯一事实源，
+// 任何入口（信令、将来的 HTTP/压测客户端）都该走同一套规则。
+//
+// 单位转换只做一次：协议里 lossRate 是**百分比 0–100**，内部存**比例 0–1**
+// （与 metric_samples.loss_rate 一致），前端展示时再乘回 100。
+func (r *Room) SetClientQuality(participantID string, q protocol.ClientQuality) bool {
+	if q.RTTMs < 0 || q.RTTMs > clientQualityMaxRTTMs {
+		return false
+	}
+	if q.LossRate < 0 || q.LossRate > 100 {
+		return false
+	}
+	if q.OutKbps < 0 || q.OutKbps > clientQualityMaxKbps ||
+		q.InKbps < 0 || q.InKbps > clientQualityMaxKbps {
+		return false
+	}
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, joined := r.participants[participantID]; !joined {
+		return false // 未入会/已离会：上报直接丢弃
+	}
+	if r.quality == nil {
+		r.quality = make(map[string]clientQuality)
+	}
+	if prev, ok := r.quality[participantID]; ok && now.Sub(prev.at) < clientQualityMinInterval {
+		return false // 限频：同一参与者每秒最多一条
+	}
+	r.quality[participantID] = clientQuality{
+		RTTMs: q.RTTMs, LossRate: q.LossRate / 100, OutKbps: q.OutKbps, InKbps: q.InKbps, at: now,
+	}
+	return true
+}
+
+// qualityAverageLocked 返回未过期样本的平均值；没有有效样本时 ok=false。
+// 调用方必须持有 r.mu（读锁即可：这里只读，过期条目留给后续上报覆盖）。
+func (r *Room) qualityAverageLocked(now time.Time) (rtt, loss, out, in float64, ok bool) {
+	n := 0
+	for _, q := range r.quality {
+		if now.Sub(q.at) > clientQualityStale {
+			continue
+		}
+		rtt += q.RTTMs
+		loss += q.LossRate
+		out += q.OutKbps
+		in += q.InKbps
+		n++
+	}
+	if n == 0 {
+		return 0, 0, 0, 0, false
+	}
+	f := float64(n)
+	return rtt / f, loss / f, out / f, in / f, true
+}
+
 // RoomSnapshot 是单个房间的轻量快照（供采样器与观测使用）。
 type RoomSnapshot struct {
 	ID           string
@@ -237,6 +343,12 @@ type RoomSnapshot struct {
 	Tracks       int
 	Packets      uint64
 	Bytes        uint64
+	// 以下四项来自**客户端上报**（client_metrics），没有上报时为 0。
+	// LossRate 是**比例 0–1**（与 metric_samples.loss_rate 同口径）。
+	RTTMs    float64
+	LossRate float64
+	OutKbps  float64
+	InKbps   float64
 }
 
 // RoomSnapshots 返回所有房间的轻量快照。
@@ -254,16 +366,34 @@ func (m *Manager) RoomSnapshots() []RoomSnapshot {
 
 	out := make([]RoomSnapshot, 0, len(rooms))
 	for _, r := range rooms {
-		participants, tracks, packets, bytes := r.Stats()
-		out = append(out, RoomSnapshot{
-			ID:           r.ID,
-			Participants: participants,
-			Tracks:       tracks,
-			Packets:      packets,
-			Bytes:        bytes,
-		})
+		out = append(out, r.Snapshot())
 	}
 	return out
+}
+
+// Snapshot 返回房间的一次性轻量快照（人数/轨道/累计流量 + 客户端上报质量的平均值）。
+//
+// 只拿一次读锁：采样器每 Interval 调一次，若分几次加锁会得到"人数是 A 时刻、
+// 质量是 B 时刻"的拼接结果（数值上无害，但排查时会对不上）。
+func (r *Room) Snapshot() RoomSnapshot {
+	now := time.Now()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	snap := RoomSnapshot{
+		ID:           r.ID,
+		Participants: len(r.participants),
+		Tracks:       len(r.tracks),
+	}
+	for _, t := range r.tracks {
+		p, b := t.Stats()
+		snap.Packets += p
+		snap.Bytes += b
+	}
+	if rtt, loss, out, in, ok := r.qualityAverageLocked(now); ok {
+		snap.RTTMs, snap.LossRate, snap.OutKbps, snap.InKbps = rtt, loss, out, in
+	}
+	return snap
 }
 
 // Stats 供 /healthz 与评测脚本观测。
@@ -280,15 +410,26 @@ func (m *Manager) RoomIDs() []string {
 	return ids
 }
 
+// Stats 供 /healthz 与评测脚本观测。
+//
+// 锁序约定：**先快照 m.rooms，释放 m.mu 之后再逐房间取 r.mu**。
+// 以前是持有 m.mu.RLock 时调用 r.counts()（m.mu → r.mu），
+// 而 Room.State 是持有 r.mu.RLock 时再取 m.mu（r.mu → m.mu）——两个方向同时出现
+// 就是经典的 ABBA 死锁；RWMutex 的写者优先会让它更容易触发。只保留一个方向即可。
 func (m *Manager) Stats() (rooms, participants, tracks int) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	roomsSnapshot := make([]*Room, 0, len(m.rooms))
 	for _, r := range m.rooms {
+		roomsSnapshot = append(roomsSnapshot, r)
+	}
+	m.mu.RUnlock()
+
+	for _, r := range roomsSnapshot {
 		p, t := r.counts()
 		participants += p
 		tracks += t
 	}
-	return len(m.rooms), participants, tracks
+	return len(roomsSnapshot), participants, tracks
 }
 
 // ---------- Room ----------
@@ -321,6 +462,10 @@ type Room struct {
 	// aiSummaryProvider 由 ai 包设置：返回当前 AI 总结状态（nil 表示未启用）。
 	// Room 本身不依赖 ai 包（避免循环依赖），只通过这个函数指针取状态进快照。
 	aiSummaryProvider func() *protocol.AISummaryState
+	// quality 是各参与者最近一次上报的链路质量（client_metrics）。
+	// 采样器在写 metric_samples 时取"未过期样本的平均值"——服务端自己测不到
+	// 到浏览器的 RTT/丢包（它不解码媒体），所以这几列的唯一来源就是这里。
+	quality map[string]clientQuality
 }
 
 // OnTrackEvent 注册轨道事件钩子（AI 转写用）。回调在轨道发布/下线后被调用，
@@ -384,6 +529,27 @@ func (r *Room) ParticipantName(id string) string {
 	return id
 }
 
+// clientQuality 是一条参与者上报的质量样本（内部表示，单位已归一到落库口径）。
+type clientQuality struct {
+	RTTMs    float64   // 毫秒
+	LossRate float64   // **比例 0–1**（协议里是百分比，入口处已除以 100）
+	OutKbps  float64   // 千比特/秒
+	InKbps   float64   // 千比特/秒
+	at       time.Time // 上报时刻，用于过期判断
+}
+
+const (
+	// clientQualityStale 是质量样本的有效期：客户端每 10s 上报一次，
+	// 超过 3 个周期没更新就视为过期（人走了/断线），避免用旧值画出一条"看起来正常"的平线。
+	clientQualityStale = 30 * time.Second
+	// clientQualityMinInterval 是同一参与者两次上报的最小间隔（限频）。
+	// 正常情况下 10s 一条；这里只防"被改过的客户端每包刷一条"把房间锁与库写打爆。
+	clientQualityMinInterval = time.Second
+	// 数值上限：超出视为异常数据直接丢弃（而不是截断后当真值落库）。
+	clientQualityMaxRTTMs = 60_000
+	clientQualityMaxKbps  = 1_000_000
+)
+
 func newRoom(id string, m *Manager) *Room {
 	r := &Room{
 		ID:            id,
@@ -395,6 +561,7 @@ func newRoom(id string, m *Manager) *Room {
 		grace:         make(map[string]*time.Timer),
 		speakerStop:   make(chan struct{}),
 		hands:         make(map[string]bool),
+		quality:       make(map[string]clientQuality),
 	}
 	safeGo("speaker-loop/"+r.ID, r.speakerLoop)
 	return r
@@ -550,17 +717,17 @@ func (r *Room) Resume(participantID string, n Notifier, resetMedia bool) (*Parti
 	p.setState(protocol.StateActive)
 
 	// 媒体面已死的重连：清掉旧轨道（保留身份），客户端随后用新连接重新发布。
-	stale := make([]string, 0, 4)
+	stale := make([]*PublishedTrack, 0, 4)
 	if resetMedia {
 		for id, t := range r.tracks {
 			if t.info.PublisherID == participantID {
 				delete(r.tracks, id)
-				stale = append(stale, id)
+				stale = append(stale, t)
 			}
 		}
 		for _, subs := range r.subscriptions {
-			for _, id := range stale {
-				delete(subs, id)
+			for _, t := range stale {
+				delete(subs, t.info.ID)
 			}
 		}
 	}
@@ -569,11 +736,14 @@ func (r *Room) Resume(participantID string, n Notifier, resetMedia bool) (*Parti
 
 	if resetMedia {
 		p.ResetMedia()
-		for _, id := range stale {
-			log.Printf("sfu: 重连清理旧轨道 room=%s track=%s（客户端将重新发布）", r.ID, id)
+		for _, t := range stale {
+			log.Printf("sfu: 重连清理旧轨道 room=%s track=%s（客户端将重新发布）", r.ID, t.info.ID)
 			for _, o := range others {
-				o.NotifyTo(&protocol.Message{Type: protocol.TypeTrackUnpublished, TrackID: id})
+				o.NotifyTo(&protocol.Message{Type: protocol.TypeTrackUnpublished, TrackID: t.info.ID})
 			}
+			// 同 finishLeave：这条路径绕过了 removeTrack，必须显式通知钩子，
+			// 否则 AI 转写器会一直挂在这条已死的轨道上（表现为总结里还在等旧音频）。
+			r.emitTrackEvent(t, false)
 		}
 	}
 
@@ -589,15 +759,23 @@ func (r *Room) Resume(participantID string, n Notifier, resetMedia bool) (*Parti
 }
 
 // expireDetached 由宽限期计时器触发：此时才真正把参与者移出房间。
+//
+// 必须与 Resume 互斥，而且**判定状态的那一刻就要在锁内**：旧实现先取锁确认
+// "参与者还在"，释放锁后再调 Leave；这中间的窗口里客户端可能刚好带着 resumeToken
+// 重连成功（Resume 把状态改回 active、停掉计时器），随后 Leave 仍然把这个人踢出房间——
+// 这就是"重连成功却被踢"的 TOCTOU。现在把"检查 state == reconnecting + 摘除"放进同一个临界区。
 func (r *Room) expireDetached(participantID string) {
 	r.mu.Lock()
-	_, ok := r.participants[participantID]
-	r.mu.Unlock()
-	if !ok {
+	p, ok := r.participants[participantID]
+	if !ok || p.State() != protocol.StateReconnecting {
+		// 已经离会，或已经在窗口内恢复成功：这是一次过期事件，直接丢弃。
+		r.mu.Unlock()
 		return
 	}
 	log.Printf("sfu: 恢复宽限期已过，参与者离会 room=%s participant=%s", r.ID, participantID)
-	r.Leave(participantID)
+	removed, others, empty := r.removeParticipantLocked(participantID)
+	r.mu.Unlock()
+	r.finishLeave(participantID, p, removed, others, empty)
 }
 
 // Leave 让参与者离开：清理其轨道与订阅关系，并广播事件。
@@ -608,6 +786,16 @@ func (r *Room) Leave(participantID string) {
 		r.mu.Unlock()
 		return
 	}
+	removed, others, empty := r.removeParticipantLocked(participantID)
+	r.mu.Unlock()
+	r.finishLeave(participantID, p, removed, others, empty)
+}
+
+// removeParticipantLocked 在**已持有 r.mu 写锁**时把参与者及其轨道/订阅从房间摘掉，
+// 只做内存操作，不做任何可能阻塞或再取锁的事（p.Close / 广播都在 finishLeave 里）。
+// 返回该参与者已下线的轨道（指针，收尾时要靠它触发轨道事件钩子）、
+// 其余参与者、以及"房间是否已空"。
+func (r *Room) removeParticipantLocked(participantID string) (removed []*PublishedTrack, others []*Participant, empty bool) {
 	if t, exists := r.grace[participantID]; exists {
 		t.Stop()
 		delete(r.grace, participantID)
@@ -615,35 +803,46 @@ func (r *Room) Leave(participantID string) {
 	delete(r.participants, participantID)
 	delete(r.subscriptions, participantID)
 	delete(r.hands, participantID)
+	// 离会后不能再让他的旧质量样本参与平均（否则人走了曲线还挂着他的 RTT）
+	delete(r.quality, participantID)
 
 	// 该参与者发布的轨道全部下线
-	removed := make([]string, 0, len(r.tracks))
+	removed = make([]*PublishedTrack, 0, len(r.tracks))
 	for id, t := range r.tracks {
 		if t.info.PublisherID == participantID {
 			delete(r.tracks, id)
-			removed = append(removed, id)
+			removed = append(removed, t)
 		}
 	}
 	// 其他人对该参与者的订阅关系一并清理
 	for _, subs := range r.subscriptions {
-		for _, id := range removed {
-			delete(subs, id)
+		for _, t := range removed {
+			delete(subs, t.info.ID)
 		}
 	}
-	others := r.othersLocked(participantID)
-	empty := len(r.participants) == 0
-	r.mu.Unlock()
+	others = r.othersLocked(participantID)
+	empty = len(r.participants) == 0
+	return removed, others, empty
+}
 
+// finishLeave 做离会后的收尾：关连接、广播事件、触发轨道事件钩子、必要时回收空房间。
+// 必须在释放 r.mu 之后调用——p.Close() 会关 PeerConnection（可能阻塞），
+// 广播与钩子回调都要回到别的组件，都不该持有房间写锁。
+func (r *Room) finishLeave(participantID string, p *Participant, removed []*PublishedTrack, others []*Participant, empty bool) {
 	p.Close()
 
 	for _, o := range others {
 		o.NotifyTo(&protocol.Message{Type: protocol.TypeParticipantLeave, ParticipantID: participantID})
 	}
-	for _, id := range removed {
-		log.Printf("sfu: 轨道下线 room=%s track=%s 原因=参与者离会", r.ID, id)
+	for _, t := range removed {
+		log.Printf("sfu: 轨道下线 room=%s track=%s 原因=参与者离会", r.ID, t.info.ID)
 		for _, o := range others {
-			o.NotifyTo(&protocol.Message{Type: protocol.TypeTrackUnpublished, TrackID: id})
+			o.NotifyTo(&protocol.Message{Type: protocol.TypeTrackUnpublished, TrackID: t.info.ID})
 		}
+		// 必须显式触发轨道下线钩子（AI 转写器靠它 detach）：
+		// 这条路径不走 removeTrack，而 p.Close() 之后 Pump 结束时 removeTrack 会发现
+		// 轨道已从 map 里删掉而提前返回——不在这里补发，转写器就永远不会被摘掉。
+		r.emitTrackEvent(t, false)
 	}
 	log.Printf("sfu: 参与者离会 room=%s participant=%s 剩余 %d 人", r.ID, participantID, len(others))
 
@@ -742,6 +941,10 @@ func (r *Room) Subscribe(subscriberID, trackID string) (string, error) {
 	r.subscriptions[subscriberID][trackID] = true
 	r.mu.Unlock()
 
+	// 空 offer = 参与者已经订阅过（幂等命中），不重复协商也不打"建立订阅"的日志。
+	if offer == "" {
+		return "", nil
+	}
 	log.Printf("sfu: 建立订阅 room=%s subscriber=%s track=%s", r.ID, subscriberID, trackID)
 	return offer, nil
 }
@@ -838,6 +1041,11 @@ func (r *Room) Track(trackID string) (*PublishedTrack, bool) {
 
 // State 生成房间快照：新成员入会或断线重连时下发。
 func (r *Room) State() *protocol.RoomState {
+	// 录制状态要在**取 r.mu 之前**读：RoomRecordingState 内部会拿 Manager.mu，
+	// 而 Manager 侧的部分方法（如 Stats）也会拿 r.mu——两个方向同时存在就是 ABBA 死锁。
+	// 这里统一成"r.mu 内不再取 Manager.mu"。
+	recording := r.manager.RoomRecordingState(r.ID)
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -847,7 +1055,7 @@ func (r *Room) State() *protocol.RoomState {
 		Tracks:       make([]*protocol.TrackInfo, 0, len(r.tracks)),
 		// 带上录制状态：中途入会的人也要能立刻看到"录制中"红点，
 		// 而不是等到下一次广播（否则"有人在录我"这件事对新来者不可见）
-		Recording: r.manager.RecordingState(),
+		Recording: recording,
 	}
 	for _, p := range r.participants {
 		state.Participants = append(state.Participants, p.Info())
@@ -1103,10 +1311,23 @@ func (r *Room) othersLocked(selfID string) []*Participant {
 type RoomDebug struct {
 	RoomID       string              `json:"roomId"`
 	Participants []*ParticipantDebug `json:"participants"`
+	// Quality 是房间内**客户端上报**质量的平均值（见 Room.SetClientQuality）；
+	// 没有任何有效上报时为 nil（区分"没人报"与"报了 0"）。
+	// 排查"画面卡但服务端指标正常"时，这里是判断"链路质量到底如何"的第一手数据。
+	Quality *QualityDebug `json:"quality,omitempty"`
+}
+
+// QualityDebug 是质量快照的 JSON 形态；LossRate 是**比例 0–1**（与落库口径一致）。
+type QualityDebug struct {
+	RTTMs    float64 `json:"rttMs"`
+	LossRate float64 `json:"lossRate"`
+	OutKbps  float64 `json:"outKbps"`
+	InKbps   float64 `json:"inKbps"`
 }
 
 // DebugInfo 输出房间内所有参与者的转发与连接状态。
 func (r *Room) DebugInfo() *RoomDebug {
+	now := time.Now()
 	r.mu.RLock()
 	participants := make([]*Participant, 0, len(r.participants))
 	for _, p := range r.participants {
@@ -1120,11 +1341,16 @@ func (r *Room) DebugInfo() *RoomDebug {
 		}
 		subs[pid] = ids
 	}
+	// 与参与者列表在同一次读锁里取质量：避免"人在这份快照里、质量在另一份里"的错位
+	rtt, loss, out, in, hasQuality := r.qualityAverageLocked(now)
 	r.mu.RUnlock()
 
 	debug := &RoomDebug{RoomID: r.ID, Participants: make([]*ParticipantDebug, 0, len(participants))}
 	for _, p := range participants {
 		debug.Participants = append(debug.Participants, p.DebugInfo(subs[p.ID]))
+	}
+	if hasQuality {
+		debug.Quality = &QualityDebug{RTTMs: rtt, LossRate: loss, OutKbps: out, InKbps: in}
 	}
 	return debug
 }

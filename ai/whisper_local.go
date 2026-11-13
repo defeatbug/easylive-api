@@ -14,6 +14,9 @@ import (
 //
 // 为什么用 CLI 而不是常驻 server：分片每 30~60 秒才来一次，CLI 启动开销（约 0.5 秒）
 // 相对转写本身可忽略；省掉了 server 进程的保活、健康检查与端口管理。真到高并发再换 server 模式。
+// whisperLocalTimeout 是单次本地转写的硬超时（与注释一致，见 Transcribe 里说明）。
+const whisperLocalTimeout = 60 * time.Second
+
 type whisperLocal struct {
 	bin   string // whisper-cli 可执行文件路径
 	model string // 模型文件路径（ggml-*.bin）
@@ -64,8 +67,11 @@ func (w *whisperLocal) Transcribe(ctx context.Context, wav []byte, language stri
 	if language != "" {
 		args = append(args, "-l", language)
 	}
-	// 60 秒硬超时：转写 30 秒音频正常 < 20 秒，超时说明卡住了
-	tctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	// 硬超时 60s：转写 30 秒音频正常 < 20 秒（见上面的 4 线程说明），
+	// 超过 60s 说明进程卡住/模型加载异常，必须放弃，否则 Stop 会一直等下去。
+	// 之前这里注释写 60s、代码却是 120s（注释与实现不一致，排查时被误导过），
+	// 现在用命名常量统一，避免再出现"改一处忘另一处"。
+	tctx, cancel := context.WithTimeout(ctx, whisperLocalTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(tctx, w.bin, args...)
 	cmd.Dir = dir

@@ -24,6 +24,11 @@ type Session struct {
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
 	StartedBy string     `json:"startedBy"`
 	Files     []FileInfo `json:"files"`
+
+	// stopping 表示该会话正在收尾（写入器正在 Close、统计正在回填）。
+	// 不落盘：它只是内存里的一小段过渡态。收尾期间该房间不接受新的开始请求，
+	// 也不会被当成"仍在录制"（否则两个主持人同时点开始/停止会拿到正在死亡的会话）。
+	stopping bool
 }
 
 // FileInfo 是会话里的一条轨道文件。
@@ -51,74 +56,117 @@ func IsSafeName(s string) bool {
 }
 
 // StartSession 开始一次录制。id 形如 20261013-101500-room-abc，天然按时间排序。
+//
+// 会话按 roomID 隔离：同一个房间重复开始是幂等的（返回已有会话），
+// 不同房间互不影响——见 Manager.sessions 的注释。
 func (m *Manager) StartSession(roomID, startedBy string) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return nil, fmt.Errorf("录制管理器已关闭")
 	}
-	if m.session != nil {
-		return m.session, nil // 已经在录：幂等，不重复开
+	if s := m.sessions[roomID]; s != nil {
+		if s.stopping {
+			// 收尾中：不把正在死亡的会话交出去（调用方会重新发布轨道，写进去也是白写）
+			return nil, fmt.Errorf("该房间正在停止录制，请稍后重试")
+		}
+		return s, nil // 该房间已经在录：幂等，不重复开
 	}
 	id := time.Now().Format("20060102-150405") + "-" + sanitize(roomID)
+	// 同名（同一秒内重复开始）时加序号，避免两个会话目录撞在一起
+	for i := 2; ; i++ {
+		if _, err := os.Stat(filepath.Join(m.dir, id)); os.IsNotExist(err) {
+			break
+		}
+		id = time.Now().Format("20060102-150405") + fmt.Sprintf("-%d-", i) + sanitize(roomID)
+	}
 	dir := filepath.Join(m.dir, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建录制会话目录失败: %w", err)
 	}
 	s := &Session{ID: id, RoomID: roomID, StartedAt: time.Now(), StartedBy: startedBy, Files: []FileInfo{}}
-	m.session = s
-	m.sessionDir = dir
+	m.sessions[roomID] = s
+	m.sessionDirs[roomID] = dir
 	m.persistLocked(s)
 	logf("录制开始 session=%s room=%s by=%s dir=%s", s.ID, roomID, startedBy, dir)
 	return s, nil
 }
 
-// StopSession 结束当前录制：关掉所有写入器并写清单。
+// StopSession 结束**指定房间**的录制：关掉该房间的写入器并写清单。
 // 没有在录时返回 nil，便于调用方做幂等处理。
-func (m *Manager) StopSession() *Session {
+func (m *Manager) StopSession(roomID string) *Session {
 	m.mu.Lock()
-	s := m.session
-	writers := make([]*Writer, 0, len(m.active))
-	for _, w := range m.active {
-		writers = append(writers, w)
-	}
-	m.active = map[string]*Writer{}
-	m.session = nil
-	m.sessionDir = ""
-	m.mu.Unlock()
+	s := m.sessions[roomID]
 	if s == nil {
+		m.mu.Unlock()
 		return nil
 	}
-	// 先关写入器（它们会在收尾时回填帧数/时长），再落清单
+	// 标记收尾中：这期间该房间不接新的开始请求，也对外报告"未在录制"。
+	// 注意**先不把会话从 map 里摘掉**：写入器 Close 时会把真实统计回调进 updateFile，
+	// 它要靠 map 找到会话。旧实现先摘会话再 Close，结果帧数/时长永远回填不进去
+	// （清单里全是 0 帧——测试正是这样抓到的）。
+	s.stopping = true
+	writers := make([]*Writer, 0, len(m.active))
+	for path, w := range m.active {
+		// 只收本房间的写入器：其他房间的录制必须继续（见 Manager.sessions 的注释）。
+		if w.roomID != roomID {
+			continue
+		}
+		writers = append(writers, w)
+		delete(m.active, path)
+	}
+	m.mu.Unlock()
+
+	// 先关写入器（它们在收尾时回填帧数/时长到清单）
 	for _, w := range writers {
 		w.Close()
 	}
+
 	now := time.Now()
-	s.EndedAt = &now
 	m.mu.Lock()
+	s.EndedAt = &now
+	s.stopping = false
+	delete(m.sessions, roomID)
+	delete(m.sessionDirs, roomID)
 	m.persistLocked(s)
 	m.mu.Unlock()
-	logf("录制结束 session=%s 文件=%d", s.ID, len(s.Files))
+	logf("录制结束 session=%s room=%s 文件=%d", s.ID, roomID, len(s.Files))
 	return s
 }
 
-// CurrentSession 返回当前录制中的会话（没有则 nil）。返回的是副本，调用方随便读。
-func (m *Manager) CurrentSession() *Session {
+// CurrentSession 返回指定房间当前录制中的会话（没有则 nil）。返回的是副本，调用方随便读。
+func (m *Manager) CurrentSession(roomID string) *Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.session == nil {
+	s := m.sessions[roomID]
+	if s == nil {
 		return nil
 	}
-	cp := *m.session
-	cp.Files = append([]FileInfo(nil), m.session.Files...)
+	cp := *s
+	cp.Files = append([]FileInfo(nil), s.Files...)
 	return &cp
 }
 
-// Recording 报告当前是否正在录制。
-func (m *Manager) Recording() bool {
+// Recording 报告指定房间当前是否正在录制（收尾中的会话不算"正在录制"）。
+func (m *Manager) Recording(roomID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.session != nil
+	s := m.sessions[roomID]
+	return s != nil && !s.stopping
+}
+
+// RecordingRooms 返回正在录制的房间 ID 列表（观测/收尾用；不含收尾中的会话）。
+func (m *Manager) RecordingRooms() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]string, 0, len(m.sessions))
+	for id, s := range m.sessions {
+		if s.stopping {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // ListSessions 从磁盘读取历史会话（按开始时间倒序）。
@@ -166,44 +214,49 @@ func (m *Manager) SessionPath(sessionID, name string) (string, bool) {
 
 // ---------- 内部：文件登记与清单落盘 ----------
 
-// registerFileLocked 在会话里登记一条文件（Open 时调用，此时大小还是 0）。
-func (m *Manager) registerFileLocked(fi FileInfo) {
-	if m.session == nil {
+// registerFileLocked 在指定房间的会话里登记一条文件（Open 时调用，此时大小还是 0）。
+func (m *Manager) registerFileLocked(roomID string, fi FileInfo) {
+	s := m.sessions[roomID]
+	if s == nil {
 		return
 	}
-	m.session.Files = append(m.session.Files, fi)
-	m.persistLocked(m.session)
+	s.Files = append(s.Files, fi)
+	m.persistLocked(s)
 }
 
 // updateFile 在文件收尾后用真实统计刷新清单（大小/帧数/丢帧/时长）。
-func (m *Manager) updateFile(name string, frames, dropped, corrupt uint64, duration time.Duration) {
+//
+// 带 roomID 而不是只靠文件名：同名文件理论上可能出现在不同房间的会话里，
+// 而暂停/收尾是并发的——按房间查会话，才不会把统计写到别人的清单上。
+func (m *Manager) updateFile(roomID, name string, frames, dropped, corrupt uint64, duration time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.session == nil {
+	s := m.sessions[roomID]
+	if s == nil {
+		// 会话已经被 StopSession 摘掉（收尾顺序保证先 Close 写入器再摘会话，
+		// 所以正常路径不会落在这里）；此时也不再回写，避免写坏已经结束的清单。
 		return
 	}
-	for i := range m.session.Files {
-		if m.session.Files[i].Name != name {
+	for i := range s.Files {
+		if s.Files[i].Name != name {
 			continue
 		}
-		fi := &m.session.Files[i]
+		fi := &s.Files[i]
 		fi.Frames, fi.Dropped, fi.Corrupt = frames, dropped, corrupt
 		fi.DurationMs = duration.Milliseconds()
-		if info, err := os.Stat(filepath.Join(m.sessionDir, name)); err == nil {
+		if info, err := os.Stat(filepath.Join(m.sessionDirs[roomID], name)); err == nil {
 			fi.SizeBytes = info.Size()
 		}
 		fi.FfmpegHint = muxHint(fi)
-		m.persistLocked(m.session)
+		m.persistLocked(s)
 		return
 	}
 }
 
 // persistLocked 把清单写到 <会话目录>/manifest.json（原子替换，避免半截文件）。
 func (m *Manager) persistLocked(s *Session) {
-	dir := m.dir
-	if m.sessionDir != "" {
-		dir = m.sessionDir
-	} else {
+	dir := m.sessionDirs[s.RoomID]
+	if dir == "" {
 		dir = filepath.Join(m.dir, s.ID)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {

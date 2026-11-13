@@ -49,9 +49,9 @@ type Config struct {
 	AutoMigrate bool
 	// RecordEnabled 打开会议录制：把每条视频轨的 RTP **原样落盘**（IVF/VP8，零转码）。
 	//
-	// **默认开启**：录制是本项目的核心功能之一，默认关掉会表现为"主持人看得到录制按钮、
-	// 一按就失败"——功能看起来是坏的。要关闭请显式设 RECORD_ENABLED=false。
-	// 默认关闭——录制要写磁盘，是否开启属于部署决策。
+	// **默认开启**（RECORD_ENABLED 默认 true）：录制是本项目的核心功能之一，默认关掉
+	// 会表现为"主持人看得到录制按钮、一按就失败"——功能看起来是坏的。
+	// 要关闭请显式设 RECORD_ENABLED=false（启动日志会明确报出"录制=关"）。
 	RecordEnabled bool
 	// RecordDir 录制文件输出目录
 	RecordDir string
@@ -256,6 +256,15 @@ func (c *Config) Validate() error {
 		log.Printf("config: 登录功能已关闭（AUTH_MODE=off）：/auth/login 返回 501，前端会以访客身份直接入会（不会出现登录页）。要启用请设 AUTH_MODE=required 并提供 JWT_SECRET（≥16 字符）")
 	default:
 		return fmt.Errorf("未知的 AUTH_MODE=%q（可选 off / optional / required）", c.AuthMode)
+	}
+	// SESSION_SECRET **显式配置**但过短时同样拒绝启动。
+	//
+	// 为什么单独校验它：SESSION_SECRET 允许留空（留空表示回落到 JWT_SECRET，见 sessionSecret），
+	// 所以能校验的只有"配了、但配得太弱"这一种情况。会话 Cookie 是**签名**的，
+	// 一个 1 字符的密钥等于没有签名——攻击者可以直接伪造任意用户（包括 admin）的会话，
+	// 绕过登录。阈值与 JWT_SECRET 保持一致（16 字符），避免两套标准。
+	if v := strings.TrimSpace(os.Getenv("SESSION_SECRET")); v != "" && len(v) < 16 {
+		return fmt.Errorf("SESSION_SECRET 显式配置时至少 16 字符（当前 %d）；拒绝以弱会话密钥启动（可被用来伪造任意账号的登录会话）", len(v))
 	}
 	// 自助注册**跟随鉴权开关**：鉴权开着就可用，没有任何额外开关。
 	// 曾经用 SIGNUP_ENABLED 单独控制，结果它同时决定了"能不能注册"和"界面上要不要显示注册入口"——

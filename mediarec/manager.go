@@ -18,17 +18,21 @@ import (
 // 由 dropped 指标对外暴露（"录到多少、丢了多少"是可解释的，而不是悄悄丢）。
 const queueSize = 120
 
-// Manager 管理一次录制会话的所有轨道文件。
+// Manager 管理所有房间的录制会话及其轨道文件。
 type Manager struct {
 	dir string
 
 	mu     sync.Mutex
 	active map[string]*Writer
 	closed bool
-	// session/sessionDir：当前录制会话（见 session.go）。为空时说明没在录，
-	// 此时 Open 仍可写文件（用于启动即录的旧行为），只是不登记到清单里。
-	session    *Session
-	sessionDir string
+	// sessions/sessionDirs 按 roomID 维护当前录制会话（见 session.go）。
+	//
+	// 为什么必须按房间而不是全局单例：录制开关是**房间级** API
+	// （主持人在自己房间里点录制），而同一节点上可以有多个房间同时开会。
+	// 旧实现用单字段 session/sessionDir，于是 B 房开始录制会拿到 A 房的会话
+	// （文件写进 A 的目录、清单也记在 A 上），A 房空房回收时还会把 B 房的录制一起停掉。
+	sessions    map[string]*Session
+	sessionDirs map[string]string
 	// rawDump 打开后，每条轨道额外落一份**原始 RTP 转储**（.rtp），
 	// 供离线分析/复盘使用。默认关闭：它会让磁盘占用翻倍。
 	rawDump bool
@@ -60,7 +64,12 @@ func New(dir string) (*Manager, error) {
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return nil, fmt.Errorf("创建录制目录失败: %w", err)
 	}
-	return &Manager{dir: abs, active: map[string]*Writer{}}, nil
+	return &Manager{
+		dir:         abs,
+		active:      map[string]*Writer{},
+		sessions:    map[string]*Session{},
+		sessionDirs: map[string]string{},
+	}, nil
 }
 
 // Dir 返回录制根目录。
@@ -74,8 +83,8 @@ func (m *Manager) Open(roomID, participantID, source string, c Codec) (*Writer, 
 		return nil, fmt.Errorf("录制已停止")
 	}
 	dir := m.dir
-	if m.sessionDir != "" {
-		dir = m.sessionDir
+	if d, ok := m.sessionDirs[roomID]; ok {
+		dir = d
 	}
 	// 同一会话里按毫秒区分，避免同名参与者多次发布会话内重名覆盖
 	name := fmt.Sprintf("%s-%s-%s-%s.%s",
@@ -93,16 +102,19 @@ func (m *Manager) Open(roomID, participantID, source string, c Codec) (*Writer, 
 	}
 	w := &Writer{
 		path:      path,
+		roomID:    roomID,
+		manager:   m,
 		file:      f,
 		codec:     c,
 		frames:    make(chan *rtp.Packet, queueSize),
+		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 		clockRate: c.ClockRate,
 		onClosed: func(frames, dropped, corrupt uint64, dur time.Duration) {
-			m.updateFile(name, frames, dropped, corrupt, dur)
+			m.updateFile(roomID, name, frames, dropped, corrupt, dur)
 		},
 	}
-	m.registerFileLocked(FileInfo{
+	m.registerFileLocked(roomID, FileInfo{
 		Name: name, Kind: kind, Source: source, Participant: participantID,
 		FfmpegHint: muxHint(&FileInfo{Name: name, Kind: kind}),
 	})
@@ -136,10 +148,18 @@ func (m *Manager) Open(roomID, participantID, source string, c Codec) (*Writer, 
 
 // CloseAll 结束所有录制（服务退出或录制被关闭时调用）。
 func (m *Manager) CloseAll() {
-	// 先正常收尾当前会话（写清单、回填统计），再关掉残余写入器
-	if m.Recording() {
-		m.StopSession()
+	// 先正常收尾**每个房间**的会话（各自写清单、回填统计），再关掉残余写入器。
+	// 不能只收一个：多房间同时录制时会把其他房间的清单丢掉。
+	m.mu.Lock()
+	roomIDs := make([]string, 0, len(m.sessions))
+	for id := range m.sessions {
+		roomIDs = append(roomIDs, id)
 	}
+	m.mu.Unlock()
+	for _, id := range roomIDs {
+		m.StopSession(id)
+	}
+
 	m.mu.Lock()
 	m.closed = true
 	writers := make([]*Writer, 0, len(m.active))
@@ -162,17 +182,30 @@ func (m *Manager) Active() int {
 
 // Writer 是一条轨道的落盘写入器：对外只暴露非阻塞的 Write。
 type Writer struct {
-	path  string
-	file  *os.File
-	codec Codec
-	ivf   *IVFWriter
-	ogg   *oggWriter
-	dump  *rawDump
+	path   string
+	roomID string
+	// manager 用于关闭后把自己从 Manager.active 摘掉（见 Close）。
+	// 观测计数必须如实反映"还在写的轨道"，否则 Active() 会长期虚高，
+	// 已关闭的 Writer 也会被 map 一直引用无法回收。
+	manager *Manager
+	file    *os.File
+	codec   Codec
+	ivf     *IVFWriter
+	ogg     *oggWriter
+	dump    *rawDump
 
 	frames chan *rtp.Packet
-	done   chan struct{}
-	// closeOnce 让 Close 幂等：管理器统一收尾时可能对同一条轨道再关一次，
-	// 直接 close 已关闭的 channel 会 panic（测试就抓到了这一点）。
+	// stop 用来通知写协程"收尾并退出"。
+	//
+	// **绝不能靠 close(frames) 收尾**：Write 在媒体热路径上，调用方顺序是
+	// 「热路径 Load 到写入器 → 调 Write」，中间没有同步点。若 Close 在此处
+	// close(w.frames)，Write 的 send 就会撞上已关闭的 channel 而 panic；
+	// 热路径跑在 safeGo 里，panic 被兜住后这条轨道再也不会转发——
+	// 表现是"停止录制之后，某个人的画面/声音对所有人永久消失"。
+	// 所以用单独的信号 channel：stop 只关一次，frames 永不关闭，
+	// 写协程收到 stop 后把队列里剩余的包写完再退出。
+	stop      chan struct{}
+	done      chan struct{}
 	closeOnce sync.Once
 
 	dropped atomic.Uint64
@@ -190,8 +223,20 @@ type Writer struct {
 
 // Write 把包交给后台写协程。**永不阻塞**：队列满时丢包并计数。
 func (w *Writer) Write(pkt *rtp.Packet) {
+	// 已停止：直接丢弃，不再入队（也避免与收尾流程竞争）。
 	select {
-	case w.frames <- pkt:
+	case <-w.stop:
+		return
+	default:
+	}
+	// 必须克隆：热路径在 Write 返回后会重写这个包的 Header（剥离头扩展），
+	// 而写协程是并发读它的另一个 goroutine。不克隆时 race detector 会直接报数据竞争
+	// （rawDump 的 Marshal 会把整个 header 读一遍，最容易命中）。
+	// 代价是录制期间每包一次分配——只在录制时付，且与远端磁盘 IO 同一量级。
+	cp := pkt.Clone()
+	select {
+	case w.frames <- cp:
+	case <-w.stop:
 	default:
 		// 队列满：丢帧。原因通常是磁盘慢，记下来而不是拖住转发。
 		if n := w.dropped.Add(1); n == 1 || n%500 == 0 {
@@ -203,10 +248,29 @@ func (w *Writer) Write(pkt *rtp.Packet) {
 // Close 停止写协程、flush 并关文件。可重复调用（幂等）。
 func (w *Writer) Close() error {
 	w.closeOnce.Do(func() {
-		close(w.frames)
+		close(w.stop)
 		<-w.done
+		// 写协程退出后再把自己从 active 表摘掉：
+		// 轨道结束（Pump 的 defer）、停止录制、空房回收都会走到 Close，但旧实现只有
+		// StopSession/CloseAll 清表，于是 active 里堆着已关闭的 Writer——Active() 虚高，
+		// 且这些对象永远不被回收（内存与文件句柄的观测口径都会被污染）。
+		if w.manager != nil {
+			w.manager.forgetWriter(w.path, w)
+		}
 	})
 	return nil
+}
+
+// forgetWriter 从 active 表里摘掉一个写入器。
+//
+// 必须比对指针：文件名带毫秒时间戳理论上可能复用（极端并发下），
+// 直接 delete(path) 有极小概率把刚注册的新 Writer 删掉。
+func (m *Manager) forgetWriter(path string, w *Writer) {
+	m.mu.Lock()
+	if cur, ok := m.active[path]; ok && cur == w {
+		delete(m.active, path)
+	}
+	m.mu.Unlock()
 }
 
 // Path / Dropped / Written 供日志与观测使用。
@@ -259,34 +323,59 @@ func (w *Writer) run() {
 		}
 	}()
 
-	for pkt := range w.frames {
-		var err error
-		if !w.haveTS {
-			w.firstTS, w.haveTS = pkt.Timestamp, true
-		}
-		w.lastTS = pkt.Timestamp
-		if w.dump != nil {
-			w.dump.write(pkt) // 原始包先落盘，供离线复盘
-		}
-		switch {
-		case w.ivf != nil:
-			err = w.ivf.WritePacket(pkt)
-		case w.ogg != nil:
-			// 空载荷包（padding/RTX 等）不是有效的 Opus 包，写进去会让 demuxer 直接报错
-			if len(pkt.Payload) == 0 {
-				continue
+	// 收尾协议见 Writer.stop 的注释：frames 永不关闭，收到 stop 后把剩余包写完再退出。
+	for {
+		select {
+		case pkt := <-w.frames:
+			if !w.writePacket(pkt) {
+				return
 			}
-			w.ogg.WritePacket(pkt.Payload, pkt.Timestamp)
-			err = nil
-		default:
-			continue
+		case <-w.stop:
+			// 把队列里已经入队的包排空（数量有界，≤ queueSize），
+			// 避免"停止录制时最后几帧被静默丢弃"。
+			for {
+				select {
+				case pkt := <-w.frames:
+					if !w.writePacket(pkt) {
+						return
+					}
+				default:
+					return
+				}
+			}
 		}
-		if err != nil {
-			logf("录制写入失败 file=%s: %v", filepath.Base(w.path), err)
-			return
-		}
-		w.written.Add(1)
 	}
+}
+
+// writePacket 处理一个包；返回 false 表示发生不可恢复的写入错误，写协程应退出。
+func (w *Writer) writePacket(pkt *rtp.Packet) bool {
+	var err error
+	if !w.haveTS {
+		w.firstTS, w.haveTS = pkt.Timestamp, true
+	}
+	w.lastTS = pkt.Timestamp
+	if w.dump != nil {
+		w.dump.write(pkt) // 原始包先落盘，供离线复盘
+	}
+	switch {
+	case w.ivf != nil:
+		err = w.ivf.WritePacket(pkt)
+	case w.ogg != nil:
+		// 空载荷包（padding/RTX 等）不是有效的 Opus 包，写进去会让 demuxer 直接报错
+		if len(pkt.Payload) == 0 {
+			return true
+		}
+		w.ogg.WritePacket(pkt.Payload, pkt.Timestamp)
+		err = nil
+	default:
+		return true
+	}
+	if err != nil {
+		logf("录制写入失败 file=%s: %v", filepath.Base(w.path), err)
+		return false
+	}
+	w.written.Add(1)
+	return true
 }
 
 func ext(codec string) string {

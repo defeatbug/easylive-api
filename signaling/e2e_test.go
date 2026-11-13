@@ -50,10 +50,12 @@ func freeTCPPort(t *testing.T) int {
 	return port
 }
 
-// testServer 是测试用服务器句柄（URL + 配置，鉴权测试需要拿配置签名令牌）。
+// testServer 是测试用服务器句柄（URL + 配置，鉴权测试需要拿配置签名令牌；
+// manager 供"上报后状态是否真的落到房间"这类断言使用）。
 type testServer struct {
-	url string
-	cfg *config.Config
+	url     string
+	cfg     *config.Config
+	manager *sfu.Manager
 }
 
 // startServer 启动测试服务器（ResumeGrace=0：连接断开即离会，便于测试"立即清理"语义）。
@@ -137,7 +139,7 @@ func startServerFull(t *testing.T, grace time.Duration, authMode, jwtSecret, app
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return &testServer{url: url, cfg: cfg}
+	return &testServer{url: url, cfg: cfg, manager: manager}
 }
 
 // peer 是测试用客户端：一条 WS + 两条 PeerConnection（与真实前端同构）

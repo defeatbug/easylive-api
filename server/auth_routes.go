@@ -30,18 +30,41 @@ import (
 //
 // 为什么必须限速：登录是最容易被离线/在线爆破的入口，
 // 而 argon2id 单次几十毫秒的设计目标是"让爆破变贵"，不是"让爆破不可能"。
+//
+// 为什么还要做容量兜底：键是"IP+用户名"，攻击者可以每换一个（伪造的）用户名
+// 就往 map 里留一把时间戳，而旧实现只增不减 → 内存无界增长（慢速 DoS）。
+// 现在做两件事：
+//  1. 判定时顺手清掉**过期**条目、并把清空的键整个删掉（窗口外的条目本来就不参与判定）；
+//  2. 键数到上限后先全表清一次过期条目，仍然满就淘汰"最久没出现过"的键。
+//     淘汰会让那个键的计数从头开始（短暂放宽限速），换来内存硬上限——
+//     真正的防线仍是"每个键每分钟 10 次"+ 全局 HTTP 限流，容量上限只防内存被灌爆。
 var (
 	loginMu       sync.Mutex
 	loginAttempts = map[string][]time.Time{}
 )
 
-const loginWindow = time.Minute
-const loginMaxPerWindow = 10
+const (
+	loginWindow       = time.Minute
+	loginMaxPerWindow = 10
+	// loginMaxKeys 是 map 的键数上限（不是尝试次数）：4096 个键最多约 4 万个时间戳，
+	// 内存量级几百 KB，同时远大于真实部署的并发登录账号数。
+	loginMaxKeys = 4096
+)
 
 func loginAllowed(key string) bool {
 	loginMu.Lock()
 	defer loginMu.Unlock()
 	now := time.Now()
+
+	// 只对"新键"做容量维护：已有键更新时不需要为它腾位置（否则满表时合法用户
+	// 每次登录都会误伤一个无辜的键）。
+	if _, exists := loginAttempts[key]; !exists && len(loginAttempts) >= loginMaxKeys {
+		pruneLoginAttemptsLocked(now)
+		if len(loginAttempts) >= loginMaxKeys {
+			evictOldestLoginKeyLocked()
+		}
+	}
+
 	kept := loginAttempts[key][:0:0]
 	for _, t := range loginAttempts[key] {
 		if now.Sub(t) < loginWindow {
@@ -52,9 +75,69 @@ func loginAllowed(key string) bool {
 		loginAttempts[key] = kept
 		return false
 	}
+	if len(kept) == 0 {
+		// 这个键在窗口内没有任何有效尝试：不保留空切片，避免"清空但不清键"
+		delete(loginAttempts, key)
+	}
 	loginAttempts[key] = append(kept, now)
 	return true
 }
+
+// pruneLoginAttemptsLocked 清掉所有窗口外的尝试记录，并删除清空了的键。
+// 调用方必须持有 loginMu。
+func pruneLoginAttemptsLocked(now time.Time) {
+	for k, ts := range loginAttempts {
+		kept := ts[:0]
+		for _, t := range ts {
+			if now.Sub(t) < loginWindow {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(loginAttempts, k)
+			continue
+		}
+		loginAttempts[k] = kept
+	}
+}
+
+// evictOldestLoginKeyLocked 淘汰最久没有新尝试的键，给新键腾出容量。
+// 调用方必须持有 loginMu，且应保证 map 非空。
+func evictOldestLoginKeyLocked() {
+	var (
+		oldestKey string
+		oldest    time.Time
+		found     bool
+	)
+	for k, ts := range loginAttempts {
+		var last time.Time
+		if n := len(ts); n > 0 {
+			// 时间戳按追加顺序保存，最后一个就是最近一次尝试
+			last = ts[n-1]
+		}
+		if !found || last.Before(oldest) {
+			oldestKey, oldest, found = k, last, true
+		}
+	}
+	if found {
+		delete(loginAttempts, oldestKey)
+	}
+}
+
+// 口令长度上下限。
+//
+// 上限为什么必须有：注册/改密/登录三个入口都在**验证之前**接收任意长度的口令；
+// 没有上限时，一个几 MB 的"密码"能稳定消耗 CPU 与内存（登录入口还会拿它去跑 argon2），
+// 是极廉价的 DoS 入口。128 字符远超正常人会用的长度，对真实用户没有可感知限制。
+// 下限保持原有的"至少 8"语义（HashPassword 也有同样兜底），口径不变。
+const (
+	minPasswordLen = 8
+	maxPasswordLen = 128
+)
+
+// passwordTooLong 按**字符数**判断（不是字节数）：中文等非 ASCII 口令不该被
+// 按 3 倍字节数误伤（128 个汉字的口令没有理由拒绝）。
+func passwordTooLong(p string) bool { return len([]rune(p)) > maxPasswordLen }
 
 // userJSON 是返回给前端的用户视图：**永不包含口令哈希**，也不含头像字节。
 //
@@ -152,6 +235,11 @@ func (s *Server) handleLogin(c *fiber.Ctx) error {
 	if req.Username == "" || req.Password == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "username 与 password 必填"})
 	}
+	// 超长口令不可能是合法凭据（注册/改密端已限制 128 字符），直接拒绝：
+	// 既不给 argon2 喂大输入，也不泄露任何账号存在性（判断只看请求形状）。
+	if passwordTooLong(req.Password) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "密码过长"})
+	}
 	if !loginAllowed(c.IP() + "|" + strings.ToLower(req.Username)) {
 		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "尝试过于频繁，请稍后再试"})
 	}
@@ -168,13 +256,17 @@ func (s *Server) handleLogin(c *fiber.Ctx) error {
 		log.Printf("server: 查询用户失败 username=%s ip=%s err=%v", req.Username, c.IP(), err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "查询用户失败"})
 	}
-	if u.Disabled {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "账号已停用"})
-	}
+	// 先验口令、再判停用。顺序很重要：如果先看 disabled 就返回 403，
+	// 攻击者只要试一个用户名，就能从 401/403 的差异判断"账号存在且已停用"
+	// （未登录即可触发，是账号存在性泄露）。把口令校验放前面后，403 只会在
+	// "口令确实正确、但账号被停用"时出现，拿到这个信息的前提是先知道正确口令。
 	ok, verr := auth.VerifyPassword(req.Password, u.PasswordHash)
 	if verr != nil || !ok {
 		// 对外只给一句话：不区分"用户不存在"与"口令错误"，避免透露账号是否存在
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "用户名或密码错误"})
+	}
+	if u.Disabled {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "账号已停用"})
 	}
 
 	// 单点登录：版本 +1 让此前所有会话 Cookie 失效，并踢掉该账号已建立的连接
@@ -249,8 +341,10 @@ func (s *Server) handleRegister(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "用户名长度需在 3–32 个字符之间"})
 	case !usernameRe.MatchString(req.Username):
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "用户名只能包含字母、数字与 . _ -"})
-	case len(req.Password) < 8:
+	case len(req.Password) < minPasswordLen:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "密码至少 8 个字符"})
+	case passwordTooLong(req.Password):
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "密码最长 128 个字符"})
 	case len([]rune(req.DisplayName)) > maxDisplayNameLen:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "昵称最长 32 个字符"})
 	}

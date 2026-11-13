@@ -98,9 +98,13 @@ func (s *Server) build() *fiber.App {
 		Output:     os.Stdout,
 	}))
 	app.Use(cors.New(cors.Config{
-		AllowOrigins:     strings.Join(cfg.WebOrigins, ","),
-		AllowMethods:     "GET, POST, OPTIONS",
-		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
+		AllowOrigins: strings.Join(cfg.WebOrigins, ","),
+		// PATCH/DELETE 是现有接口真实使用的方法（PATCH /auth/profile、DELETE /auth/avatar）；
+		// 漏了它们，浏览器预检会直接拦下请求，表现为"接口写了但前端一调就 CORS 报错"。
+		AllowMethods: "GET, POST, PATCH, DELETE, OPTIONS",
+		// X-API-Key 供运维/评测脚本从跨源页面调用受保护端点（/metrics/*、/token 等）；
+		// 不列在这里，预检会拒绝该请求头，脚本侧只能看到 CORS 失败。
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-API-Key",
 		AllowCredentials: true,
 		MaxAge:           86400,
 	}))
@@ -130,6 +134,10 @@ func (s *Server) build() *fiber.App {
 	// 数据库不可用时**不报错**，只把 dbAvailable 置为 false —— 媒体面永远优先，
 	// 报表页应当显示"无历史数据"而不是整页崩掉。
 	router.Get("/metrics/overview", func(c *fiber.Ctx) error {
+		// 访问控制：运维密钥 / 开发环境免登录 / 已登录会话，三者之一（见 metricsAccessAllowed）。
+		if !s.metricsAccessAllowed(c) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "需要登录（或有效的 X-API-Key）"})
+		}
 		minutes := c.QueryInt("minutes", 30)
 		if minutes < 1 {
 			minutes = 1
@@ -210,6 +218,10 @@ func (s *Server) build() *fiber.App {
 	})
 
 	router.Get("/metrics/tracks", func(c *fiber.Ctx) error {
+		// 同 /metrics/overview：CSV 导出会一次性吐出全部轨道统计，同样属于运维数据。
+		if !s.metricsAccessAllowed(c) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "需要登录（或有效的 X-API-Key）"})
+		}
 		rows := s.manager.AllTrackStats()
 		if c.Query("format") != "csv" {
 			return c.JSON(fiber.Map{"tracks": rows, "count": len(rows)})
@@ -283,8 +295,16 @@ func (s *Server) build() *fiber.App {
 	// 关注点：receivedFromPublisher（服务端到底有没有收到发布端的媒体）
 	//        published.packets（转发热路径读到了多少包）
 	//        sentToSubscriber（有没有真的发给订阅端）
+	//
+	// 它默认关闭，但"临时打开来跑实验"正是最容易被忘掉的时候：这里会输出
+	// 每个参与者的 IP 级连接状态、轨道 SSRC 与逐轨包数，和 /metrics/tracks 同级敏感。
+	// 因此和 /metrics/* 用同一套访问控制（运维密钥 / 开发且免鉴权 / 已登录会话），
+	// 不能因为"它是调试端点"就裸奔。
 	if cfg.EnableDebugEndpoint {
 		router.Get("/debug/stats", func(c *fiber.Ctx) error {
+			if !s.metricsAccessAllowed(c) {
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "需要登录（或有效的 X-API-Key）"})
+			}
 			return c.JSON(fiber.Map{
 				"generatedAt": time.Now().Format(time.RFC3339),
 				"rooms":       s.manager.DebugInfo(),
@@ -343,7 +363,7 @@ func (s *Server) build() *fiber.App {
 					"error": "服务端未配置 TOKEN_API_KEY，拒绝签发令牌",
 				})
 			}
-			if c.Get("X-API-Key") != cfg.TokenAPIKey {
+			if !apiKeyMatches(c.Get("X-API-Key"), cfg.TokenAPIKey) {
 				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "X-API-Key 无效"})
 			}
 		}
@@ -466,7 +486,7 @@ func (s *Server) build() *fiber.App {
 	// 所以非开发环境要求 X-API-Key；开发环境保持可直接用（含 GraphiQL 调试）。
 	router.All("/graphql", func(c *fiber.Ctx) error {
 		if cfg.AppEnv != "development" {
-			if cfg.TokenAPIKey == "" || c.Get("X-API-Key") != cfg.TokenAPIKey {
+			if !apiKeyMatches(c.Get("X-API-Key"), cfg.TokenAPIKey) {
 				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "GraphQL 需要有效的 X-API-Key"})
 			}
 		}

@@ -174,9 +174,19 @@ mutation { createRoom(id: "demo-room", title: "答辩演示", createdBy: "defend
 { "roomMetrics": { "sampleCount": 1628, "avgParticipants": 1.36, "peakTracks": 5, "totalBytes": 8620166647 } }
 ```
 
-**已知缺口（如实标注）**：`metric_samples` 的质量列（`avg_rtt_ms` / `avg_loss_rate` / `avg_in_kbps`）
-服务端不填——服务端只统计人数/轨道/包数/字节数（它不解码、也不逐包测 RTT）。
-这几个指标由**客户端侧统计**提供：浏览器看「指标」面板，批量数据用 `cmd/loadtest` 采集（见 `docs/evaluation.md`）。
+**质量四列的数据来源（客户端上报，不是服务端测的）**：`rtt_ms` / `loss_rate` / `in_kbps` / `out_kbps`
+在物理上只能由**端侧**测量——服务端只转发、不解码媒体，测不到"自己到某个浏览器"的 RTT 与丢包。
+所以浏览器每 10s 通过信令上报一条 `client_metrics`（`{quality:{rttMs, lossRate, outKbps, inKbps}}`）：
+
+- 协议里 `lossRate` 是**百分比 0–100**；落库前服务端统一除以 100，`metric_samples.loss_rate` 是**比例 0–1**
+  （前端图表展示时再乘回 100）。单位只在这一个入口转换一次。
+- 服务端做范围校验 + 每参与者 1s 限频 + 30s 过期；采样器只对**未过期样本取平均**写库。
+- 没有人在会（或客户端刚进会还没产出 getStats）时这几列就是 0——历史曲线会断开，
+  这是"如实反映没有数据"，而不是伪造一条健康平线。
+- 压测链路（`cmd/loadtest`）也可以复用同一条消息上报，把合成客户端的 RTT/丢包写进同一张表。
+
+实现位置：`protocol.ClientQuality` → `signaling.handleClientMetrics` → `sfu.Room.SetClientQuality`
+→ `recorder` 采样器 → `metric_samples`。口径说明见 `docs/evaluation.md`。
 
 **连库集成测试**（默认跳过，因为"没有数据库"是合法开发状态）：
 
@@ -190,13 +200,17 @@ DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/sfu_dev?sslmode=disabl
 
 ## 信令协议速览
 
-请求（客户端 → 服务端）：`join`、`leave`、`publish`、`answer`、`candidate`、`subscribe`、`unsubscribe`、`unpublish`、`mute`、`chat`、`ping`、`moderate`
-响应 / 事件（服务端 → 客户端）：`joined`、`publish_answer`、`subscribe_offer`、`participant_joined`、`participant_left`、`participant_state`、`track_published`、`track_unpublished`、`track_muted`、`active_speakers`、`hand_state`、`chat_message`、`force_mute`、`pong`、`error`
+请求（客户端 → 服务端）：`join`、`leave`、`publish`、`answer`、`candidate`、`subscribe`、`unsubscribe`、`unpublish`、`mute`、`chat`、`flash`、`hand_state`、`whiteboard`、`record`、`client_metrics`、`ping`、`moderate`
+响应 / 事件（服务端 → 客户端）：`joined`、`publish_answer`、`subscribe_offer`、`participant_joined`、`participant_left`、`participant_state`、`track_published`、`track_unpublished`、`track_muted`、`active_speakers`、`hand_state`、`chat_message`、`flash_message`、`force_mute`、`recording_state`、`whiteboard_op`、`pong`、`error`
 
 约定：
 - 消息是**扁平结构**，按 `type` 取字段；`id` 是幂等键，响应原样带回（客户端据此匹配）。
 - `sessionId ≠ participantId`：前者绑定连接，后者绑定会议身份（为断线重连预留）。
 - `publish` 可重复发送 —— 第二次即**重协商**（开始/停止屏幕共享走这条路）。
+- `subscribe` 是**幂等**的：同一条轨道重复订阅时，服务端返回 `sdp` 为空的 `subscribe_offer`
+  （表示"已订阅，无需再协商"），不会重复 `AddTrack` 或多出一条 m-line。
+- `client_metrics` 是**单向、无响应**的观测上报（浏览器每 10s 一条，见下文"质量四列"）：
+  非法值/未入会/过于频繁的上报会被静默丢弃，不会给客户端回 `error`。
 - **断线重连（M4）**：`joined` 会下发 `resumeToken`。信令连接意外断开时服务端**不立即视为离会**，
   而是把参与者标记为 `reconnecting`（广播 `participant_state`）并保留轨道与订阅，
   宽限期（`RESUME_GRACE`，默认 30s）内带 `resumeToken` 重连即可恢复**同一个 participantId**。
@@ -257,8 +271,9 @@ DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/sfu_dev?sslmode=disabl
 
 ## 会议录制（转发即录制，零转码）
 
-**开启**：服务端 `.env` 设 `RECORD_ENABLED=true`（可选 `RECORD_DIR`，默认 `recordings/`）后重启 api，
-**主持人在会中**点工具栏的"录制"即可开始/停止；房间空了会自动收尾。
+**默认开启**：`RECORD_ENABLED` 默认就是 `true`（要关请显式设 `false`；启动日志会报"录制=开/关"）；
+输出目录用 `RECORD_DIR` 指定（默认 `recordings/`），改完重启 api 生效。
+**任意已入会成员**在会中触发 `record` 即可开始/停止（默认不要求主持人，见 `signaling/handler.go` 的说明）；房间空了会自动收尾。
 主持人按钮的显示与操作都受服务端 `roomAdmin` 校验；录制红点**全员可见**（状态随 `joined` 快照下发，中途入会的人也看得到）。
 
 **为什么这么设计**
@@ -275,6 +290,12 @@ DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/sfu_dev?sslmode=disabl
 5. **挂上录制时主动回 PLI**：与"新订阅者上线要关键帧"同理，否则"开始录制"之后可能好几秒里文件都是 0 字节。
 6. **一次录制 = 一个会话**：每次开始建一个目录（`20261015-203249-<房间>`），内含每轨一个文件与 `manifest.json`
    （文件、大小、帧数、丢帧、时长、现成的 ffmpeg 命令）。清单**原子写入**，进程被强杀也留得下可用记录。
+7. **会话按房间隔离**：录制开关是房间级 API，同一节点上多个房间可以各自录制、互不影响。
+   停止/空房回收只收尾**本房间**的写入器与清单（早期全局单会话的实现会让两个房间串台，
+   见 `mediarec/manager.go` 里 `sessions` 的注释与 `sfu/record_test.go` 的回归测试）。
+8. **停止录制不会伤害转发**：写入器用独立 stop 信号收尾、`frames` 队列永不 close，
+   热路径的 `Write` 不会撞上已关闭的 channel；录制期间收到的包会先克隆再入队，
+   避免与热路径改写 RTP 头构成数据竞争。
 
 **取回与播放**
 
@@ -314,17 +335,22 @@ ffmpeg -i <camera>.ivf -i <microphone>.ogg -c copy -shortest out.webm
 | `go vet ./...` | 通过 |
 | `go build ./...` | 通过 |
 | `go test ./signaling/ -v` | 全部 PASS：信令链路、媒体转发（订阅端实收 RTP 包）、屏幕共享关键帧、轨道下线、断线恢复（含 `resetMedia`）、活跃说话人 |
+| `go test -race ./...` | 全部 PASS（`make test` 已默认带 `-race`）：并发收尾/订阅幂等/多房间录制均有回归测试 |
 | 运行期 | `/healthz` 返回 JSON 指标；数据库不可用时降级继续；`SIGTERM` 优雅退出正常 |
 
-## 尚未实现（对应开发计划的后续里程碑）
+## 尚未实现 / 已知边界
 
-- [ ] **断线重连**：会话快照恢复、`sessionId` 复用（M4）
-- [ ] **gqlgen 接入**：`server/server.go` 里已留好 `adaptor.HTTPHandler` 的挂载点（M3）
+以下条目是**当前真实状态**（早前版本的"尚未实现"清单已过期：断线重连、gqlgen、`/ws` 鉴权都已落地并有端到端测试）：
+
+- [x] **断线重连（M4）**：`resumeToken` + 30s 宽限期 + `resetMedia`，`signaling/e2e_resume_test.go` 覆盖
+- [x] **gqlgen 接入（M3）**：`graph/` 下 4 个查询 + 3 个变更，resolver 全部真实实现
+- [x] **`/ws` 鉴权**：JWT `VideoGrant` 三态（off/optional/required），逐条消息校验权限，`signaling/e2e_auth_test.go` 覆盖
 - [ ] **GOP 缓存**：让新订阅者首帧更快；以及 NACK 合并/抑制（M6 优化项，也是论文的消融实验）
 - [ ] **simulcast / 自适应码率**：当前每位发布者只有一路码流
-- [ ] **鉴权**：房间口令 + coturn 临时凭证已就绪，但 `/ws` 尚未校验 token
-- [ ] **多房间隔离与容量保护**：目前只有每房间人数上限与全局连接数上限
+- [ ] **多房间容量保护**：目前只有每房间人数上限与全局连接数上限（录制已按房间隔离）
 - [ ] **拥塞控制**：已启用 Pion 默认拦截器（NACK/Report/TWCC），但尚未在 SFU 侧终结订阅腿的带宽估计
+- [ ] **`metric_samples` 的质量列**：服务端不填 `avg_rtt_ms` / `avg_loss_rate` / `avg_in_kbps`
+      （服务端不解码、不逐包测 RTT，这几个指标由客户端侧统计提供）
 
 ## 常见坑
 

@@ -12,6 +12,7 @@ package recorder
 import (
 	"context"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -175,12 +176,19 @@ func (s *Sampler) Tick(ctx context.Context) {
 
 		// 指标样本走 sqlc；数值直接取内存计数（不调用 GetStats，避免干扰转发）
 		_ = s.call(ctx, "写入指标样本", func(c context.Context) error {
+			// 质量四列来自**客户端上报**（见 sfu.Room.SetClientQuality）：
+			// 服务端不解码媒体、也不逐流测 RTT，这里只负责把房间内未过期样本的
+			// 平均值落库。没有上报时是 0（历史曲线会表现为 0，而不是伪造的"健康"值）。
 			return s.store.RecordMetricSample(c, store.MetricSample{
 				RoomID:       snap.ID,
 				Participants: snap.Participants,
 				Tracks:       snap.Tracks,
 				Packets:      int64(snap.Packets),
 				Bytes:        int64(snap.Bytes),
+				RTTMs:        int(math.Round(snap.RTTMs)),
+				LossRate:     snap.LossRate,
+				OutKbps:      int(math.Round(snap.OutKbps)),
+				InKbps:       int(math.Round(snap.InKbps)),
 			})
 		})
 	}

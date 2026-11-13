@@ -116,6 +116,8 @@ docker run --rm coturn/coturn:4.6 turnutils_uclient -T -u "$USER" -w "$CRED" -p 
 - 平时 `ENABLE_DEBUG_ENDPOINT=false`；**跑实验时临时改成 `true`** 并重启 api，
   即可用 `/debug/stats` 拿到每个参与者的 `receivedFromPublisher` / `published.packets` /
   `sentToSubscriber` 三组计数，用来区分"发布端没出帧 / 服务端没转发 / 转发到订阅端失败"。
+  非 `development` 环境下它和 `/metrics/*` 一样需要鉴权，采集命令要带运维密钥：
+  `curl -H "X-API-Key: $TOKEN_API_KEY" https://<域名>/debug/stats`。
 - 带宽对比实验：静音后服务端**停止转发该音频轨**（`dropped` 计数会增长），
   所以"静音省多少带宽"可以直接量出来，不需要估算。
 - 中继 vs 直连对比：把 `TURN_URLS` 临时改成只给 `?transport=udp` 并用防火墙丢掉 7881/udp，

@@ -136,6 +136,9 @@ func (h *Hub) dispatch(c *Client, msg *protocol.Message) {
 	case protocol.TypeHandState:
 		h.handleHandState(c, msg)
 
+	case protocol.TypeClientMetrics:
+		h.handleClientMetrics(c, msg)
+
 	default:
 		c.fail(msg, protocol.ErrBadRequest, "未知消息类型: "+string(msg.Type))
 	}
@@ -361,7 +364,10 @@ func (h *Hub) handleSubscribe(c *Client, msg *protocol.Message) {
 		c.fail(msg, protocol.ErrInternal, err.Error())
 		return
 	}
-	// 订阅由服务端发起 offer（sub 连接），客户端回 answer
+	// 订阅由服务端发起 offer（sub 连接），客户端回 answer。
+	// offer 为空表示**该轨道已经订阅过**（幂等命中）：不再重复 AddTrack / 重协商，
+	// 但仍要回一条 subscribe_offer 作为应答，否则客户端会一直等到请求超时。
+	// 客户端把 "sdp 为空" 当作 ack 处理即可。
 	c.reply(msg, &protocol.Message{Type: protocol.TypeSubscribeOffer, SDP: offer, Track: track.Info()})
 }
 
@@ -645,7 +651,8 @@ func (h *Hub) handleRecord(c *Client, msg *protocol.Message) {
 		}
 		log.Printf("signaling: 录制开始 room=%s by=%s", roomID, pid)
 	case protocol.ActionRecordStop:
-		if sess := h.manager.StopRecording(); sess != nil {
+		// 只停本房间：多房间同时录制时，A 房停止不能把 B 房正在进行的录制一起关掉。
+		if sess := h.manager.StopRecording(roomID); sess != nil {
 			log.Printf("signaling: 录制结束 room=%s by=%s session=%s 文件=%d", roomID, pid, sess.ID, len(sess.Files))
 		}
 	default:
@@ -654,8 +661,8 @@ func (h *Hub) handleRecord(c *Client, msg *protocol.Message) {
 	}
 
 	// 广播给**所有人**（含操作者自己）：红点是所有人都该看到的房间状态，
-	// 不是操作者的私人反馈。
-	st := h.manager.RecordingState()
+	// 不是操作者的私人反馈。状态按房间取——A 房在录不代表 B 房也在录。
+	st := h.manager.RoomRecordingState(roomID)
 	if room, ok := h.manager.Get(roomID); ok {
 		room.Broadcast(&protocol.Message{Type: protocol.TypeRecordingState, Recording: st, TargetID: msg.TargetID}, "")
 	}
@@ -699,6 +706,24 @@ func (h *Hub) handleAISummary(c *Client, msg *protocol.Message) {
 	st := h.ai.State(roomID)
 	room.Broadcast(&protocol.Message{Type: protocol.TypeAISummaryState, AISummary: st}, "")
 	c.reply(msg, &protocol.Message{Type: protocol.TypeAISummary, Action: msg.Action, AISummary: st})
+}
+
+// handleClientMetrics 接收客户端上报的链路质量（fire-and-forget，不回响应）。
+//
+// 为什么静默：这是**观测数据**，不是业务操作。客户端可能因为 getStats 尚未产出而
+// 上报全 0，也可能在断线边缘写出半条消息；这些都不该让用户看到一条错误提示
+// （否则"网络差"会表现为"弹出一堆报错"）。服务端只做校验与聚合。
+func (h *Hub) handleClientMetrics(c *Client, msg *protocol.Message) {
+	roomID, pid, _ := c.session()
+	if roomID == "" || msg.Quality == nil {
+		return
+	}
+	room, ok := h.manager.Get(roomID)
+	if !ok {
+		return
+	}
+	// 范围校验/限频/未入会过滤都在 Room.SetClientQuality 里（单一事实源）
+	room.SetClientQuality(pid, *msg.Quality)
 }
 
 func (h *Hub) handleModerate(c *Client, msg *protocol.Message) {

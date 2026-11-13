@@ -19,6 +19,28 @@
 1. **RTT 不能取"所有 succeeded 候选对的最大值"**。ICE 会保留多条连通性检查对，其中有些 RTT 高达 90ms+（例如 ICE-TCP 兜底路径受 TCP 延迟 ACK 影响），而真正承载体的是**被提名那一对**（本机 loopback 实测 0.2—0.4ms）。取最大值会让 RTT 虚高约 500 倍。
 2. **单向延迟必须用同一个时钟原点**。发送端与接收端如果各用"自己的启动时刻"做基准，差值会带常量偏差甚至为负，表现为"协商成功但一个样本都没有"。
 
+### 1.1 质量四列从哪来（客户端上报）
+
+`metric_samples` 的 `rtt_ms` / `loss_rate` / `in_kbps` / `out_kbps` 不由服务端测量——
+SFU 只转发、不解码，无法测出到某个浏览器的 RTT/丢包。它们来自客户端每 10s 的一条
+`client_metrics` 信令消息：
+
+| 字段 | 单位 | 来源（浏览器侧） |
+|---|---|---|
+| `rttMs` | 毫秒 | **被提名**（nominated）候选对的 `currentRoundTripTime` |
+| `lossRate` | **百分比 0–100**（落库转成比例 0–1） | 本窗口 `packetsLost / (packetsLost + packetsReceived)`，跨所有 inbound-rtp 求和 |
+| `outKbps` / `inKbps` | 千比特/秒 | `bytesSent`/`bytesReceived` 按真实采样间隔差分 |
+
+服务端侧规则（都在 `sfu.Room.SetClientQuality` 一处）：
+
+- 范围校验：RTT ≤ 60s、丢包 ≤ 100%、码率 ≤ 1Gbps，超出直接丢弃（不截断）；
+- 限频：同一参与者 1s 最多一条；
+- 过期：30s 未更新（≈3 个上报周期）不参与平均；
+- 采样器对房间内**未过期样本取平均**写入 `metric_samples`（每 `METRICS_INTERVAL`，默认 5s）。
+
+因此在论文里引用这几列时必须写明口径：**它们是端侧观测值，包含客户端到服务端的网络路径，
+不包含采集/编码/解码/渲染耗时**；没有客户端在会时这些列为 0。
+
 ## 2. 工具
 
 ```bash
@@ -35,6 +57,11 @@ go run ./cmd/loadtest \
 
 输出：`results/<时间戳>-<tag>/` 下 `lanes.csv`（每路每秒一行）、`server.csv`（服务端每秒一行）、
 `summary.json`、`summary.md`。
+
+压测客户端也会每 10s 发一条 `client_metrics`（与浏览器同一条消息、同一套单位），
+所以压测期间 `metric_samples` 的 `rtt_ms / loss_rate / in_kbps / out_kbps` 会被真实写入——
+纯压测场景下质量列不再是 0。服务端做范围校验、每参与者 1s 限频、30s 过期，
+口径见 §1.1。
 
 常用参数：
 

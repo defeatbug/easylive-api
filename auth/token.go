@@ -17,6 +17,13 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+// Issuer 是本服务签发令牌的发行方标识，签发与校验两端必须一致。
+//
+// 为什么校验它：只校验签名与有效期时，任何用同一密钥签出的 JWT 都会被当作合法入会凭据。
+// 把 iss 也纳入校验（jwt.WithIssuer）可以拒绝"同密钥、不同用途/来源"的令牌，
+// 属于纵深防御；签发端早就写了 iss=easylive-api，这里把校验端补齐。
+const Issuer = "easylive-api"
+
 // Mode 是鉴权强度。
 //
 // 之所以设计成三态而不是简单的"开/关"：开题阶段的演示环境（局域网、无 HTTPS、随时要跑给别人看）
@@ -110,7 +117,7 @@ func (a *Authenticator) Issue(identity, name string, g VideoGrant) (string, time
 		Name:  name,
 		Video: g,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    "easylive-api",
+			Issuer:    Issuer,
 			Subject:   identity,
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now.Add(-time.Minute)), // 容忍轻微时钟偏差
@@ -139,6 +146,7 @@ func (a *Authenticator) Verify(token string) (*Claims, error) {
 		claims,
 		func(*jwt.Token) (interface{}, error) { return a.secret, nil },
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer(Issuer), // 校验端补 issuer：与签发端一致，拒绝其它来源的令牌
 		jwt.WithLeeway(30*time.Second),
 	)
 	if err != nil {

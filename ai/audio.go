@@ -42,9 +42,15 @@ type Transcriber struct {
 
 	ch   chan []byte // Opus payload 队列；满则丢包（计数），绝不卡住转发热路径
 	done chan struct{}
-	wg   sync.WaitGroup
+	// stopOnce 保证 Stop 幂等。Stop 会在两条路径上被调用：
+	//   1) 房间停止 AI 总结（manager.Stop → session.Stop → 每条轨道的 transcriber.Stop）
+	//   2) 轨道本身下线（session 收到 track 事件后又对同一轨道 Stop 一次）
+	// 旧实现直接 close(t.done)，第二次调用就是 panic: close of closed channel——
+	// 而且它发生在信令/媒体回调里，会带走整个进程（不是只坏一条轨道）。
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 
-	dropped    atomic.Uint64
+	dropped      atomic.Uint64
 	chunkSeconds int
 	stt          STTBackend
 	lang         string
@@ -81,12 +87,15 @@ func (t *Transcriber) Write(pkt *rtp.Packet) {
 }
 
 // Stop 停止转写器：把缓冲里剩下的音频做最后一次转写，然后返回。
+// 可重复调用（幂等）：见 stopOnce 的注释。
 func (t *Transcriber) Stop() {
-	close(t.done)
-	t.wg.Wait()
-	if d := t.dropped.Load(); d > 0 {
-		log.Printf("ai: 转写器 %s 丢包 %d（队列满，转发不受影响）", t.speaker, d)
-	}
+	t.stopOnce.Do(func() {
+		close(t.done)
+		t.wg.Wait()
+		if d := t.dropped.Load(); d > 0 {
+			log.Printf("ai: 转写器 %s 丢包 %d（队列满，转发不受影响）", t.speaker, d)
+		}
+	})
 }
 
 func (t *Transcriber) loop() {

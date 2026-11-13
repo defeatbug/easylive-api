@@ -31,7 +31,7 @@
 
 ```json
 {
-  "user": { "id": 1, "username": "teacher", "displayName": "teacher", "role": "host" },
+  "user": { "id": 1, "username": "teacher", "displayName": "teacher", "role": "member" },
   "expiresAt": 1792175428240
 }
 ```
@@ -42,9 +42,9 @@
 
 | 状态 | 含义 | 界面建议 |
 |---|---|---|
-| `400` | `username`/`password` 为空或请求体不是 JSON | 提示补全 |
+| `400` | `username`/`password` 为空、请求体不是 JSON，或密码超过 128 字符 | 提示补全/检查输入长度 |
 | `401` | 用户名或密码错误（**刻意不区分两者**，避免枚举账号） | 提示"用户名或密码错误" |
-| `403` | 账号已停用 | 提示联系管理员 |
+| `403` | **口令正确但账号已停用**（服务端先验口令、再判停用，未登录时无法仅凭用户名探出账号是否存在） | 提示联系管理员 |
 | `429` | 尝试过于频繁（同一 IP+用户名 每分钟 10 次） | 提示稍后再试 |
 | `501` | 服务端未启用鉴权（`AUTH_MODE=off`）—— 此时**不需要登录**，直接入会 | 隐藏/跳过登录页 |
 | `503` | 数据层不可用（未配数据库） | 提示服务暂不可用 |
@@ -80,7 +80,9 @@
 }
 ```
 
-**主持人权限由服务端按账号角色判定**：`role=host` 才会得到 `roomAdmin: true`。
+**主持人权限由服务端按账号角色 + 会议归属判定**：
+`role=admin` 的账号在**任何**会议里都是主持人（`roomAdmin: true`）；
+`role=member` 的普通用户**只在本人创建的那个会议**里是主持人。
 前端**不要**在请求体里传 `roomAdmin`（传了也不生效），更不要自己伪造权限位。
 
 失败：`401`（无会话且无运维密钥）、`403`（服务端未配置密钥）、`501`（未启用鉴权，无需令牌）。
@@ -90,9 +92,19 @@
 
 ## 5. 运维/脚本路径（前端不要用）
 
-`POST /token` 与 `GET /recordings`、`/graphql` 在非 development 环境下也接受
+`POST /token`、`GET /recordings`、`/graphql` 在非 development 环境下也接受
 `X-API-Key: <TOKEN_API_KEY>`。这是给评测脚本与运维用的**服务端到服务端**凭据，
-**绝不能**放进浏览器（那就等于把令牌签发权公开）。
+**绝不能**放进浏览器（那就等于把令牌签发权公开）。比较是常量时间的（防逐字节计时攻击）。
+
+指标报表接口同样需要授权：
+
+| 接口 | 授权规则 |
+|---|---|
+| `GET /metrics/overview` | ① 有效 `X-API-Key`；或 ② development 且鉴权关闭（本地演示/探针）；或 ③ **已登录会话**（报表页用同源 Cookie 调它） |
+| `GET /metrics/tracks`（含 `?format=csv`） | 同上 |
+
+三者都不满足时返回 `401 {"error":"需要登录（或有效的 X-API-Key）"}`。
+注意 ② 只在"开发环境 **且** 鉴权关闭"时成立：一旦开了鉴权，开发环境也不再免登录。
 
 ## 6. 启用登录需要哪些环境变量
 
@@ -100,14 +112,15 @@
 |---|---|
 | `AUTH_MODE=required` | 打开鉴权（非开发环境未设置时会**默认按 required**） |
 | `JWT_SECRET` | 令牌密钥；同时作为会话密钥的兜底（≥16 字符，否则**拒绝启动**） |
-| `SESSION_SECRET` | 可选：单独指定会话签名密钥 |
+| `SESSION_SECRET` | 可选：单独指定会话签名密钥；**一旦显式设置就必须 ≥16 字符**，否则拒绝启动（留空则回落到 `JWT_SECRET`） |
 | `SESSION_TTL` | 会话有效期，默认 `12h` |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | **引导第一个主持人账号**（仅当该用户名不存在时创建；绝不覆盖已有口令） |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | **引导第一个管理员账号**（`role=admin`；仅当该用户名不存在时创建，绝不覆盖已有口令） |
 | （无） | **自助注册跟随鉴权开关**：`AUTH_MODE != off` 即开放，不需要额外变量。注册出来的账号一律 `role=member` |
-| `DATABASE_URL` | 数据库（`users` 表在 `migrations/004_users.sql`） |
+| `DATABASE_URL` | 数据库（`users` 表在 `migrations/004_users.sql`，角色与会议归属在 `007_roles_and_room_owner.sql`） |
 
 首次启动后即可用该账号登录；之后再要加人，直接在 `users` 表插一行
-（`password_hash` 用 argon2id，`role` 取 `host` 或 `member`）。
+（`password_hash` 用 argon2id，`role` 取 `admin` 或 `member`；全站只允许一个 `admin`，
+由部分唯一索引 `idx_users_single_admin` 兜底）。
 
 ---
 
@@ -137,7 +150,10 @@
 ```json
 { "currentPassword": "……", "newPassword": "……" }
 ```
-成功 `204`。失败：`400`（新密码过短/与当前相同）、`401`（当前密码错）、`429`。
+成功 `204`。失败：`400`（新密码过短、**超过 128 字符**、或与当前相同）、`401`（当前密码错）、`429`。
+
+口令长度口径：**至少 8 字符、最多 128 字符**（注册、改密、登录三个入口一致；
+登录遇到超长口令直接返回 `400`，不会拿它去跑哈希）。
 
 改完密码**旧密码立即失效**（已实测）。已签发的会话仍然有效（会话按用户 ID 签名）。
 
@@ -145,7 +161,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/auth/avatar` | `multipart/form-data`，字段名 **`file`**；只接受 `image/png`、`image/jpeg`、`image/webp`；上限 **512KB** |
+| `POST` | `/auth/avatar` | `multipart/form-data`，字段名 **`file`**；**按文件头魔数**只接受真实 PNG/JPEG/WebP（声明的 `Content-Type` 只用于预筛，不可信）；上限 **512KB** |
 | `DELETE` | `/auth/avatar` | 恢复默认头像，`204` |
 | `GET` | `/auth/avatar/:id` | 取头像字节。**需要已登录会话**（未登录 `401`） |
 
@@ -162,11 +178,13 @@ const res = await fetch('/auth/avatar', { method: 'POST', credentials: 'include'
 
 `avatarUrl` 里带了 `?v=<更新时间>`：换头像后 URL 会变，浏览器不会用旧缓存。
 `<img src={user.avatarUrl}>` 直接可用（同源、带 Cookie 即可）。
+`GET /auth/avatar/:id` 的响应按**真实字节**设置 `Content-Type`，并带
+`X-Content-Type-Options: nosniff`（避免把伪装成图片的 HTML/JS 当页面解释）。
 
 ### 7.4 用户对象（`/auth/me`、登录、改资料、上传头像都返回它）
 
 ```json
-{ "id": 1, "username": "teacher", "displayName": "李老师", "role": "host",
+{ "id": 1, "username": "teacher", "displayName": "李老师", "role": "admin",
   "avatarUrl": "/auth/avatar/1?v=1792147936" }
 ```
 `avatarUrl` **仅在设置过头像时出现**（没有该字段就显示默认头像：昵称首字母）。

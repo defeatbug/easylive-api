@@ -39,6 +39,38 @@ func TestValidateFailsClosed(t *testing.T) {
 	}
 }
 
+// TestValidateSessionSecret 显式配置的会话密钥过短必须拒绝启动。
+//
+// 会话 Cookie 是签名而非服务端会话表：密钥太弱 = 可被离线爆破/伪造，
+// 伪造出来的会话等价于"任意账号已登录"（包括唯一管理员）。
+// 留空是合法的（回落到 JWT_SECRET），所以关键在于区分"没配"与"配了但太弱"。
+func TestValidateSessionSecret(t *testing.T) {
+	t.Setenv("AUTH_MODE", "off")
+	t.Setenv("JWT_SECRET", "")
+
+	// 显式设置但过短：拒绝
+	t.Setenv("SESSION_SECRET", "short")
+	c := &Config{AppEnv: "development", AuthMode: "off", SessionSecret: "short"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("显式配置的 SESSION_SECRET 过短应当拒绝启动")
+	}
+
+	// 未设置：允许（回落 JWT_SECRET 的逻辑在 Load/sessionSecret 里）
+	t.Setenv("SESSION_SECRET", "")
+	c = &Config{AppEnv: "development", AuthMode: "off"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("未设置 SESSION_SECRET 不应报错: %v", err)
+	}
+
+	// 足够长：通过
+	long := strings.Repeat("s", 32)
+	t.Setenv("SESSION_SECRET", long)
+	c = &Config{AppEnv: "development", AuthMode: "off", SessionSecret: long}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("足够长的 SESSION_SECRET 不应报错: %v", err)
+	}
+}
+
 // TestValidateSecureDefaultOutsideDev 非开发环境未设置 AUTH_MODE 时按 required 处理。
 //
 // "忘了配"必须走失败路径，而不是变成"完全开放"。

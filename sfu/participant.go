@@ -35,7 +35,13 @@ type Participant struct {
 
 	engine   *Engine
 	notifier Notifier
-	room     *Room // 由 Room.Join 注入，Participant 不反向持有 manager
+	// room 由 Room.Join 注入，Participant 不反向持有 manager。
+	//
+	// 用 atomic.Pointer 而不是普通字段：写入只发生在 Room.Join（持 r.mu 时），
+	// 但读取发生在 Pion 的回调协程里（OnTrack / OnConnectionStateChange / 数据通道），
+	// 这些协程与 Join 没有任何共同锁——普通字段就是一个实打实的数据竞争，
+	// 只有 `go test -race` 才抓得到，线上表现为"极小概率读到 nil 或半初始化指针"。
+	room atomic.Pointer[Room]
 
 	mu        sync.RWMutex
 	pubPC     *webrtc.PeerConnection // 发布者连接：客户端 offer / 服务端 answer
@@ -192,7 +198,13 @@ func (p *Participant) CanPublishData() bool {
 }
 
 // Confirm 把房间引用交给参与者（在 Room.Join 内部调用）。
-func (p *Participant) Confirm(room *Room) { p.room = room }
+func (p *Participant) Confirm(room *Room) { p.room.Store(room) }
+
+// roomRef 返回参与者所属房间；未入会时返回 nil。
+//
+// 所有读取都必须走这里（而不是直接读字段）：字段已被改成 atomic.Pointer，
+// 见 Participant.room 的注释。
+func (p *Participant) roomRef() *Room { return p.room.Load() }
 
 // ---------- 发布：客户端发起 offer，服务端回 answer ----------
 
@@ -246,6 +258,24 @@ func (p *Participant) takePendingSource() string {
 	return src
 }
 
+// currentPubPC / currentSubPC 在锁内读取"当前正在用的"连接。
+//
+// 为什么需要它们：PeerConnection 会在重连/重置媒体时被整体替换，而旧连接注册的回调
+// 仍然活着（Pion 的协程不会因为应用侧把字段置空就停下来）。回调里必须先确认
+// "我还是那个当前连接"再动共享状态，否则一个迟到的旧连接事件会把新连接打掉
+// （典型症状：重连成功后几秒又被莫名其妙地 Close，用户看到"刚恢复又断了"）。
+func (p *Participant) currentPubPC() *webrtc.PeerConnection {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.pubPC
+}
+
+func (p *Participant) currentSubPC() *webrtc.PeerConnection {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.subPC
+}
+
 // createPubPC 创建发布者连接并注册回调。
 func (p *Participant) createPubPC() (*webrtc.PeerConnection, error) {
 	pc, err := p.engine.NewPeerConnection(p.ID)
@@ -254,6 +284,9 @@ func (p *Participant) createPubPC() (*webrtc.PeerConnection, error) {
 	}
 
 	pc.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		if p.currentPubPC() != pc {
+			return // 旧连接的迟到事件：它的轨道不该再登记到房间里
+		}
 		// 必须持续读取接收端 RTCP：Pion 的拦截器链路是"有人读才流动"，
 		// 不读的话发布端回来的 RR/SR/NACK 会一直堆在缓冲里（RTT 统计也不会有值）。
 		safeGo("rtcp-receiver/"+p.ID, func() { drainReceiverRTCP(receiver) })
@@ -270,8 +303,8 @@ func (p *Participant) createPubPC() (*webrtc.PeerConnection, error) {
 			log.Printf("sfu: 登记轨道失败 participant=%s: %v", p.ID, err)
 			return
 		}
-		if p.room != nil {
-			p.room.onTrackPublished(p, track)
+		if room := p.roomRef(); room != nil {
+			room.onTrackPublished(p, track)
 		}
 		// 唯一的转发热路径：一条轨道一个协程，必须隔离——它 panic 会打掉所有人的会议
 		safeGo("pump/"+track.info.ID, track.Pump)
@@ -279,7 +312,12 @@ func (p *Participant) createPubPC() (*webrtc.PeerConnection, error) {
 
 	// 数据通道：客户端在 pub 连接上创建（客户端是 offerer），这里接收。
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		// 同上：旧连接的通道不能覆盖当前连接的 pubDC（否则推送会发到已死的关联上）
 		p.mu.Lock()
+		if p.pubPC != pc {
+			p.mu.Unlock()
+			return
+		}
 		p.pubDC = dc
 		p.mu.Unlock()
 		log.Printf("sfu: 数据通道已建立 participant=%s label=%s", p.ID, dc.Label())
@@ -305,8 +343,8 @@ func (p *Participant) createPubPC() (*webrtc.PeerConnection, error) {
 	})
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil {
-			return
+		if c == nil || p.currentPubPC() != pc {
+			return // 旧连接的候选发给客户端只会让它连到一条已被替换的路径上
 		}
 		init := c.ToJSON()
 		p.NotifyTo(&protocol.Message{
@@ -322,9 +360,15 @@ func (p *Participant) createPubPC() (*webrtc.PeerConnection, error) {
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("sfu: pub 连接状态 participant=%s state=%s", p.ID, state.String())
-		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
-			p.Close()
+		if state != webrtc.PeerConnectionStateFailed && state != webrtc.PeerConnectionStateClosed {
+			return
 		}
+		// 只有"当前连接"失败才应该把整个参与者关掉：否则重连后新建的连接
+		// 会被上一条连接迟到的 closed 事件立刻带走（见 currentPubPC 的注释）。
+		if p.currentPubPC() != pc {
+			return
+		}
+		p.Close()
 	})
 
 	p.mu.Lock()
@@ -345,29 +389,32 @@ func (p *Participant) addPublishedTrack(source string, remote *webrtc.TrackRemot
 	// 音频要等 Ogg/Opus 封装实现（见 mediarec 包说明），当前只录视频轨。
 	// 只有**当前确实有一个录制会话在跑**才挂写入器：录制已经改成主持人运行时可启停，
 	// 光有 recorder（功能可用）不等于"现在正在录"。
-	if rec := p.room.manager.Recording(); rec != nil && rec.Recording() {
-		codec := mediarec.Codec{
-			Name:        "VP8",
-			ClockRate:   90000,
-			PayloadType: uint8(remote.PayloadType()),
-			SSRC:        uint32(remote.SSRC()),
-		}
-		if track.info.Kind == protocol.KindAudio {
-			codec = mediarec.Codec{
-				Name:        "opus",
-				ClockRate:   48000,
+	room := p.roomRef()
+	if room != nil {
+		if rec := room.manager.Recording(); rec != nil && rec.Recording(room.ID) {
+			codec := mediarec.Codec{
+				Name:        "VP8",
+				ClockRate:   90000,
 				PayloadType: uint8(remote.PayloadType()),
 				SSRC:        uint32(remote.SSRC()),
 			}
-		}
-		w, werr := rec.Open(p.room.ID, p.ID, source, codec)
-		if werr != nil {
-			log.Printf("sfu: 开启录制失败 track=%s: %v", track.info.ID, werr)
-		} else {
-			track.attachRecorder(w)
-			// 录制器要等第一个关键帧才落盘，这里主动要一个，避免录制开头是空文件
-			track.RequestKeyframe()
-			log.Printf("sfu: 录制已开启 track=%s → %s", track.info.ID, w.Path())
+			if track.info.Kind == protocol.KindAudio {
+				codec = mediarec.Codec{
+					Name:        "opus",
+					ClockRate:   48000,
+					PayloadType: uint8(remote.PayloadType()),
+					SSRC:        uint32(remote.SSRC()),
+				}
+			}
+			w, werr := rec.Open(room.ID, p.ID, source, codec)
+			if werr != nil {
+				log.Printf("sfu: 开启录制失败 track=%s: %v", track.info.ID, werr)
+			} else {
+				track.attachRecorder(w)
+				// 录制器要等第一个关键帧才落盘，这里主动要一个，避免录制开头是空文件
+				track.RequestKeyframe()
+				log.Printf("sfu: 录制已开启 track=%s → %s", track.info.ID, w.Path())
+			}
 		}
 	}
 	p.mu.Lock()
@@ -380,7 +427,21 @@ func (p *Participant) addPublishedTrack(source string, remote *webrtc.TrackRemot
 
 // Subscribe 把某条已发布轨道加到订阅者连接上，并返回需要发给客户端的 offer。
 // 服务端始终是 sub 连接的 offerer，因此不会与客户端的 publish offer 冲突（无 glare）。
+//
+// 幂等：同一条轨道重复订阅返回**空 offer**（调用方据此知道"无需再协商"）。
+// 这不是理论问题：入会快照与 track_published 可能对同一条轨道各触发一次订阅，
+// 重复 AddTrack 会多加一条 m-line，并且把 subSenders 里的旧 sender 覆盖掉——
+// 旧 sender 从此永远无法 RemoveTrack，subscribers 计数也会漂移。
 func (p *Participant) Subscribe(track *PublishedTrack) (string, error) {
+	// subSenders 是"已订阅"的权威记录，先查它（在 ensureSubPC 之前，
+	// 避免为一个重复订阅多建一条订阅连接）。
+	p.mu.Lock()
+	_, already := p.subSenders[track.info.ID]
+	p.mu.Unlock()
+	if already {
+		return "", nil
+	}
+
 	pc, err := p.ensureSubPC()
 	if err != nil {
 		return "", err
@@ -481,7 +542,7 @@ func (p *Participant) ensureSubPC() (*webrtc.PeerConnection, error) {
 		return nil, err
 	}
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil {
+		if c == nil || p.currentSubPC() != pc {
 			return
 		}
 		init := c.ToJSON()
@@ -497,10 +558,15 @@ func (p *Participant) ensureSubPC() (*webrtc.PeerConnection, error) {
 	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("sfu: sub 连接状态 participant=%s state=%s", p.ID, state.String())
-		if state == webrtc.PeerConnectionStateConnected && p.room != nil {
-			// 传输建立完成：向已订阅的发布者再要一次关键帧，
-			// 补上"订阅时发出的关键帧被 SRTP 未就绪窗口吞掉"的那个洞。
-			p.room.requestKeyframesFor(p.ID)
+		if p.currentSubPC() != pc {
+			return
+		}
+		if state == webrtc.PeerConnectionStateConnected {
+			if room := p.roomRef(); room != nil {
+				// 传输建立完成：向已订阅的发布者再要一次关键帧，
+				// 补上"订阅时发出的关键帧被 SRTP 未就绪窗口吞掉"的那个洞。
+				room.requestKeyframesFor(p.ID)
+			}
 		}
 	})
 
@@ -591,7 +657,8 @@ func (p *Participant) handleDataMessage(data []byte) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return
 	}
-	if p.room == nil {
+	room := p.roomRef()
+	if room == nil {
 		return
 	}
 	// 数据面同样受权限约束：表情/举手属于"发布数据"，令牌没给就在这一层拦掉。
@@ -615,12 +682,12 @@ func (p *Participant) handleDataMessage(data []byte) {
 		if kind != "" && kind != protocol.ReactionKindAction {
 			kind = ""
 		}
-		p.room.OnReaction(p.ID, m.Emoji, text, kind)
+		room.OnReaction(p.ID, m.Emoji, text, kind)
 	case protocol.DataRaiseHand:
 		if m.Raised == nil {
 			return
 		}
-		p.room.SetHand(p.ID, *m.Raised)
+		room.SetHand(p.ID, *m.Raised)
 	default:
 		// 未知类型忽略：数据面允许演进，不能因为新类型让旧服务端报错
 	}

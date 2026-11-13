@@ -29,8 +29,8 @@ func TestSessionManifestAndList(t *testing.T) {
 	if again, _ := m.StartSession("room-1", "p-admin"); again.ID != sess.ID {
 		t.Fatalf("重复开始应为同一会话，实际 %s vs %s", again.ID, sess.ID)
 	}
-	if !m.Recording() {
-		t.Fatal("会话开始后 Recording() 应为 true")
+	if !m.Recording("room-1") {
+		t.Fatal("会话开始后 Recording(room-1) 应为 true")
 	}
 
 	// 视频轨：5 帧，时间戳跨 36000（90kHz → 0.4s）
@@ -56,12 +56,12 @@ func TestSessionManifestAndList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stopped := m.StopSession()
+	stopped := m.StopSession("room-1")
 	if stopped == nil || stopped.EndedAt == nil {
 		t.Fatal("停止后应带回 EndedAt")
 	}
-	if m.Recording() {
-		t.Fatal("停止后 Recording() 应为 false")
+	if m.Recording("room-1") {
+		t.Fatal("停止后 Recording(room-1) 应为 false")
 	}
 
 	// 磁盘上的清单
@@ -149,11 +149,11 @@ func TestStopWithoutStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := m.StopSession(); s != nil {
+	if s := m.StopSession("room-1"); s != nil {
 		t.Fatalf("未开始录制时停止应返回 nil，实际 %+v", s)
 	}
-	if m.Recording() {
-		t.Fatal("未开始录制时 Recording() 应为 false")
+	if m.Recording("room-1") {
+		t.Fatal("未开始录制时 Recording(room-1) 应为 false")
 	}
 	if list, err := m.ListSessions(); err != nil || len(list) != 0 {
 		t.Fatalf("空目录应列出 0 个会话，实际 %d err=%v", len(list), err)
