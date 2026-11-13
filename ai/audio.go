@@ -44,7 +44,7 @@ type Transcriber struct {
 	done chan struct{}
 	wg   sync.WaitGroup
 
-	dropped    atomic.Uint64
+	dropped      atomic.Uint64
 	chunkSeconds int
 	stt          STTBackend
 	lang         string

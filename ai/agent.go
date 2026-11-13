@@ -23,11 +23,12 @@ const agentQueueSize = 8
 // opusPayloadType 是服务端生成音频的 RTP payload type（Opus 动态类型的事实标准值）。
 const opusPayloadType = 111
 
-// askRequest 是一次 @AI 提问。
+// askRequest 是一次 @AI 提问；forgetRoom 非空时表示"忘掉这个房间的状态"（控制消息）。
 type askRequest struct {
-	room     *sfu.Room
-	fromName string
-	question string
+	room       *sfu.Room
+	fromName   string
+	question   string
+	forgetRoom string
 }
 
 // rtpState 是虚拟参会者在单个房间的 RTP 序列状态。
@@ -126,6 +127,10 @@ func (a *Agent) loop() {
 
 // handle 串行处理一次提问。
 func (a *Agent) handle(req askRequest) {
+	if req.forgetRoom != "" { // 控制消息：只删状态，不回答
+		delete(a.rtp, req.forgetRoom)
+		return
+	}
 	room := req.room
 	if err := a.buildTTS(); err != nil {
 		a.chat(room, fmt.Sprintf("AI 助手语音未就绪：%v", err))
@@ -229,6 +234,18 @@ func (a *Agent) speak(room *sfu.Room, text string) error {
 	track.NoteAudioLevel(0)
 	log.Printf("ai-agent: 语音回答已发送 room=%s frames=%d", room.ID, len(frames))
 	return nil
+}
+
+// ForgetRoom 让助手忘掉某个房间的 RTP 状态（房间被回收、或同一 roomId 换了新房间时调）。
+//
+// 不直接删 a.rtp：那个 map 只归 worker 协程所有，跨协程删会数据竞争。
+// 这里把"忘记"当成一条控制消息塞进队列，由 worker 串行处理。
+// 队列满时直接放弃——泄漏的只是几十字节的计数器状态，不值得阻塞调用方。
+func (a *Agent) ForgetRoom(roomID string) {
+	select {
+	case a.queue <- askRequest{forgetRoom: roomID}:
+	default:
+	}
 }
 
 // rtpStateFor 取（或创建）房间的 RTP 状态。只由 worker 调用。

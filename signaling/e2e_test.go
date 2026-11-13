@@ -85,7 +85,7 @@ func apiKeyForEnv(appEnv string) string {
 	return testAPIKey
 }
 
-func startServerFull(t *testing.T, grace time.Duration, authMode, jwtSecret, appEnv string) *testServer {
+func startServerFull(t *testing.T, grace time.Duration, authMode, jwtSecret, appEnv string, opts ...func(*sfu.Manager)) *testServer {
 	t.Helper()
 	port := freeTCPPort(t)
 	cfg := &config.Config{
@@ -121,6 +121,10 @@ func startServerFull(t *testing.T, grace time.Duration, authMode, jwtSecret, app
 	t.Cleanup(func() { _ = engine.Close() })
 
 	manager := sfu.NewManager(engine, cfg.RoomMaxParticipants, cfg.ResumeGrace)
+	// 可选：让个别用例打开录制等能力（默认不打开，保持其它用例的既有前提）
+	for _, opt := range opts {
+		opt(manager)
+	}
 	hub := signaling.NewHub(manager, cfg)
 	srv := server.New(cfg, manager, hub, nil) // nil store：测试不依赖数据库
 

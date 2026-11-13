@@ -2,6 +2,7 @@ package mediarec
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,17 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrRoomBusy 表示当前录制会话属于**另一个房间**。
+//
+// 录制会话是进程级单例（一次只录一个房间，见 Manager.session），所以第二个房间
+// 来开会话时必须失败。早先这里直接返回已有会话，后果有两层：
+//   - 用户在 B 房间看到"已开始录制"，实际一个字节都不会落盘（静默丢数据）；
+//   - B 房间新发布的轨道因为只看"全局是否在录"，会被写进 A 房间的会话目录（串数据）。
+//
+// 彻底的修法是把 session 改成 map[roomID]*Session；在那之前，这里必须先失败，
+// 把"悄悄出错"变成"明确报错"。
+var ErrRoomBusy = errors.New("另一个房间正在录制：录制会话当前是进程级单例，请先停止")
 
 // Session 是一次录制：一个房间、从开始到停止这一段时间。
 //
@@ -58,7 +70,12 @@ func (m *Manager) StartSession(roomID, startedBy string) (*Session, error) {
 		return nil, fmt.Errorf("录制管理器已关闭")
 	}
 	if m.session != nil {
-		return m.session, nil // 已经在录：幂等，不重复开
+		// 同一房间重复开启：幂等，不重复开。
+		// 别的房间：必须报错，不能把别人的会话"借"给它（见 ErrRoomBusy）。
+		if m.session.RoomID != roomID {
+			return nil, ErrRoomBusy
+		}
+		return m.session, nil
 	}
 	id := time.Now().Format("20060102-150405") + "-" + sanitize(roomID)
 	dir := filepath.Join(m.dir, id)
@@ -119,6 +136,17 @@ func (m *Manager) Recording() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.session != nil
+}
+
+// RecordingFor 报告 roomID 是否**正是**当前录制会话的房间。
+//
+// 用它替代"全局是否在录"来做"要不要给这条新轨道挂写入器"的判断：
+// 录制是单例，只看全局的话，别的房间新发布的轨道也会被挂上写入器，
+// 于是它的 RTP 被写进当前会话（别的房间）的目录里。
+func (m *Manager) RecordingFor(roomID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.session != nil && m.session.RoomID == roomID
 }
 
 // ListSessions 从磁盘读取历史会话（按开始时间倒序）。

@@ -343,9 +343,10 @@ func (p *Participant) addPublishedTrack(source string, remote *webrtc.TrackRemot
 	}
 	// 开启录制时，给视频轨挂一个落盘写入器（零转码：把已经在转发的 RTP 多写一份）。
 	// 音频要等 Ogg/Opus 封装实现（见 mediarec 包说明），当前只录视频轨。
-	// 只有**当前确实有一个录制会话在跑**才挂写入器：录制已经改成主持人运行时可启停，
-	// 光有 recorder（功能可用）不等于"现在正在录"。
-	if rec := p.room.manager.Recording(); rec != nil && rec.Recording() {
+	// 只有**当前确实有一个录制会话在跑、且这个会话属于本房间**才挂写入器：
+	// 录制是主持人运行时可启停的，光有 recorder（功能可用）不等于"现在正在录"；
+	// 而录制会话是进程级单例，只看全局的话本房间的媒体会被写进另一个房间的会话目录。
+	if rec := p.room.manager.Recording(); rec != nil && rec.RecordingFor(p.room.ID) {
 		codec := mediarec.Codec{
 			Name:        "VP8",
 			ClockRate:   90000,

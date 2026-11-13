@@ -10,10 +10,10 @@ import (
 	fiberws "github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 
+	"easylive-api/ai"
 	"easylive-api/auth"
 	"easylive-api/protocol"
 	"easylive-api/sfu"
-	"easylive-api/ai"
 )
 
 // Mount 把信令入口挂到 Fiber 路由（约定：GET <basePath>/ws）。
@@ -628,21 +628,25 @@ func (h *Hub) handleWhiteboard(c *Client, msg *protocol.Message) {
 	room.Broadcast(&protocol.Message{Type: protocol.TypeWhiteboardOp, Op: &accepted}, "")
 }
 
-// handleRecord 是录制开关（**任何已入会的成员**都可以用）。
+// handleRecord 是录制开关（需要 `roomAdmin`）。
 //
 // 设计上与 moderate 完全一致：**权限在服务端强制校验**，前端隐藏按钮只是体验。
 // 录制是"转发即录制"（零转码），所以启停都是即时的：
 // 开始 = 给房间里**已经在发布**的轨道挂上写入器；停止 = 摘掉并收尾清单。
+//
+// 曾经有一版去掉了这道校验（理由是"主持人可能不在线，录个记录不应该做不到"），
+// 但前端按钮只对主持人显示、注释还写着"服务端仍会独立校验"，README 也这么写——
+// 结果就是三处口径互相矛盾，而且非主持人手工发一条 record 就能录，
+// 还能停掉**别的房间**正在进行的录制。凡是会写进文档/论文的权限口径，必须由服务端兜住。
 func (h *Hub) handleRecord(c *Client, msg *protocol.Message) {
 	roomID, pid, _ := c.session()
 	if roomID == "" {
 		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
 		return
 	}
-	// **任何已入会的成员都可以录制**（不再要求主持人）：
-	// 录制是"转发即录制"，不额外消耗转码资源；会议内容对参与者本来就是可见的，
-	// 而且主持人不一定在线——把录制权限只给主持人，反而会让"想留个记录"变成做不到的事。
-	// 仍然要求已入会（上面已经校验），所以房间外的人无法操作。
+	if !c.requireGrant(msg, c.grants().RoomAdmin, "录制操作") {
+		return
+	}
 
 	switch msg.Action {
 	case protocol.ActionRecordStart:
@@ -652,7 +656,14 @@ func (h *Hub) handleRecord(c *Client, msg *protocol.Message) {
 		}
 		log.Printf("signaling: 录制开始 room=%s by=%s", roomID, pid)
 	case protocol.ActionRecordStop:
-		if sess := h.manager.StopRecording(); sess != nil {
+		// 只允许停本房间自己的会话：录制会话是进程级单例，不做归属核对的话
+		// B 房间的人按一下就把 A 房间的录制停了。
+		sess, err := h.manager.StopRecordingIn(roomID)
+		if err != nil {
+			c.fail(msg, protocol.ErrForbidden, "停止录制失败: "+err.Error())
+			return
+		}
+		if sess != nil {
 			log.Printf("signaling: 录制结束 room=%s by=%s session=%s 文件=%d", roomID, pid, sess.ID, len(sess.Files))
 		}
 	default:
@@ -661,8 +672,9 @@ func (h *Hub) handleRecord(c *Client, msg *protocol.Message) {
 	}
 
 	// 广播给**所有人**（含操作者自己）：红点是所有人都该看到的房间状态，
-	// 不是操作者的私人反馈。
-	st := h.manager.RecordingState()
+	// 不是操作者的私人反馈。注意用**本房间**的视图：录制会话是进程级单例，
+	// 直接播全局状态会让别的房间也亮红点。
+	st := h.manager.RecordingStateFor(roomID)
 	if room, ok := h.manager.Get(roomID); ok {
 		room.Broadcast(&protocol.Message{Type: protocol.TypeRecordingState, Recording: st, TargetID: msg.TargetID}, "")
 	}
