@@ -8,7 +8,7 @@ SHELL := /bin/sh
 POSTGRES_USER ?= postgres
 POSTGRES_DB_NAME ?= sfu_dev
 
-.PHONY: help up down logs psql run gen test build lint prod-up prod-down prod-logs prod-ps prod-check turn-check
+.PHONY: help up down logs psql run gen test test-fast build lint build-arm64
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-8s\033[0m %s\n", $$1, $$2}'
@@ -46,7 +46,13 @@ db-test: ## 连库集成测试（需要 DATABASE_URL）
 	@test -n "$$DATABASE_URL" || { echo "用法：DATABASE_URL='postgres://...' make db-test"; exit 1; }
 	go test ./store/ -run Integration -v -count=1
 
-test: ## [容器内] 单元测试
+test: ## [容器内] 单元测试（带 race detector）
+	@# 默认带 -race：媒体热路径与录制收尾/订阅列表都是并发面，
+	@# 普通 go test 抓不到 send-on-closed-channel、包共享改写这类问题。
+	@# 需要更快跑一遍时用：make test-fast
+	go test -race ./...
+
+test-fast: ## [容器内] 单元测试（不带 race，快速反馈）
 	go test ./...
 
 build: ## [容器内] 构建二进制
@@ -55,28 +61,7 @@ build: ## [容器内] 构建二进制
 lint: ## [容器内] go vet
 	go vet ./...
 
-# ---- 生产（在服务器上执行；compose 文件在 deploy/）----
-COMPOSE_PROD := docker compose -f deploy/compose.prod.yml --env-file deploy/.env.prod
-
-prod-up: ## [服务器] 构建并启动 api + web + postgres + coturn
-	$(COMPOSE_PROD) up -d --build
-
-prod-down: ## [服务器] 停止生产编排（保留数据卷）
-	$(COMPOSE_PROD) down
-
-prod-logs: ## [服务器] 跟踪生产日志
-	$(COMPOSE_PROD) logs -f --tail=100
-
-prod-ps: ## [服务器] 查看生产容器状态
-	$(COMPOSE_PROD) ps
-
-prod-check: ## [服务器] 验收：健康检查 + ICE 配置是否下发 TURN 凭证
-	@curl -fsS "https://$(DOMAIN)/healthz" && echo
-	@curl -fsS "https://$(DOMAIN)/ice?identity=smoke" && echo
-
-turn-check: ## [服务器] 用 coturn 自带客户端验证中继（需要 SECRET/IP 变量）
-	@test -n "$(SECRET)" && test -n "$(IP)" || (echo "用法：make turn-check SECRET=<TURN_SECRET> IP=<公网IP>"; exit 1)
-	@U="$$(($$(date +%s)+3600)):smoke"; \
-	 C="$$(printf '%s' "$$U" | openssl dgst -sha1 -hmac "$(SECRET)" -binary | base64)"; \
-	 docker run --rm coturn/coturn:4.6 turnutils_uclient -T -u "$$U" -w "$$C" -p 3478 "$(IP)"
+# ---- 生产部署（宿主机二进制，见 deployment-example/）----
+build-arm64: ## 交叉编译 linux/arm64 部署二进制（./build.sh）
+	./build.sh
 
