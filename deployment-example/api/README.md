@@ -29,8 +29,8 @@
 ## 1. 构建（构建机上执行，不需要在服务器上装 Go）
 
 ```bash
-./build.sh             # 产出 build/bin/easylive-api（linux/arm64 静态二进制）
-./fetch-ai-assets.sh   # 下载 Piper arm64 + 语音模型 + Whisper 模型到 build/ai/
+bash build.sh             # 产出 build/bin/easylive-api（linux/arm64 静态二进制）
+bash fetch-ai-assets.sh   # 下载 Piper arm64 + 语音模型 + Whisper 模型到 build/ai/
 ```
 
 ## 2. 传到服务器（scp）
@@ -82,7 +82,7 @@ whisper 只在本地转写时用（录音转写、后续的纪要功能）；v1 
 可以先不装。需要时在服务器上跑：
 
 ```bash
-cd /opt/easylive/api && sudo ./build-whisper.sh
+cd /opt/easylive/api && sudo bash ./build-whisper.sh
 ```
 
 ## 6. systemd 服务 + nginx
@@ -105,7 +105,7 @@ sudo nginx -t && sudo systemctl reload nginx
 ## 7. 日常更新
 
 ```bash
-# 构建机：./build.sh
+# 构建机：bash build.sh
 # 传新二进制并重启：
 scp build/bin/easylive-api user@10.1.0.202:/opt/easylive/api/bin/
 ssh user@10.1.0.202 'sudo systemctl restart easylive-api'

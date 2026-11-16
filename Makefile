@@ -63,5 +63,5 @@ lint: ## [容器内] go vet
 
 # ---- 生产部署（宿主机二进制，见 deployment-example/）----
 build-arm64: ## 交叉编译 linux/arm64 部署二进制（./build.sh）
-	./build.sh
+	bash ./build.sh
 
