@@ -28,6 +28,9 @@ type Hub struct {
 	// ai 是 AI 会议总结管理器（房间级会话）。配置缺失时 Start 会明确报错，
 	// 不影响正常信令流程。
 	ai *ai.Manager
+	// agent 是 AI 问答助手（虚拟参会者，常驻）。未就绪时 Ask 会在聊天框说明原因，
+	// 同样不影响正常信令流程。
+	agent *ai.Agent
 
 	mu      sync.RWMutex
 	clients map[string]*Client // sessionID -> client
@@ -43,11 +46,33 @@ func NewHub(manager *sfu.Manager, cfg *config.Config) *Hub {
 	} else {
 		log.Printf("signaling: AI 总结已就绪（转写=%s，DeepSeek=%s）", aiCfg.STTBackend, aiCfg.DeepSeekModel)
 	}
+	aiMgr := ai.New(aiCfg)
+	if !aiCfg.AgentReady() {
+		log.Printf("signaling: AI 问答助手未配置（%s），@AI 提问会被拒绝并在聊天框说明", aiCfg.AgentUnreadyReason())
+	} else {
+		log.Printf("signaling: AI 问答助手已就绪（TTS=%s，DeepSeek=%s）", aiCfg.TTSBackend, aiCfg.DeepSeekModel)
+	}
+	// 房间被回收（人走空了）时，把挂在里面的 AI 会话与助手状态一起收掉。
+	//
+	// 不加这个钩子的话：AI 总结会话永远留在 sessions map 里，summarizeLoop 空转到进程结束；
+	// 而且同一个 roomId 再开会时 Start 命中旧会话直接幂等返回，用户看到"已开启 AI 总结"
+	// 却永远等不到纪要——只能重启进程才能恢复。助手那边的每房间 RTP 状态同理。
+	agent := ai.NewAgent(aiCfg, aiMgr.SummaryMarkdown)
+	// manager 可能为 nil（例如只用 Hub 的 Authenticator 做鉴权单测）：
+	// 没有房间管理器就无从注册回收钩子，直接跳过。
+	if manager != nil {
+		manager.OnRoomRemoved(func(roomID string) {
+			aiMgr.Stop(roomID)
+			agent.ForgetRoom(roomID)
+		})
+	}
+
 	return &Hub{
 		manager: manager,
 		cfg:     cfg,
 		auth:    auth.New(cfg.JWTSecret, cfg.TokenTTL, auth.ParseMode(cfg.AuthMode)),
-		ai:      ai.New(aiCfg),
+		ai:      aiMgr,
+		agent:   agent,
 		clients: make(map[string]*Client),
 		resumes: make(map[string]resumeEntry),
 	}

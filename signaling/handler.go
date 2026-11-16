@@ -10,6 +10,7 @@ import (
 	fiberws "github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 
+	"easylive-api/ai"
 	"easylive-api/auth"
 	"easylive-api/protocol"
 	"easylive-api/sfu"
@@ -479,6 +480,12 @@ func (h *Hub) handleChat(c *Client, msg *protocol.Message) {
 			TS:       time.Now().UnixMilli(),
 		},
 	}, "")
+
+	// @AI 问答：原消息照常广播（大家能看到问了什么），同时转给 AI 助手。
+	// Ask 非阻塞（未就绪/队列满时自己在聊天框说明原因），不会卡住信令读循环。
+	if ai.IsAIMention(msg.Text) {
+		h.agent.Ask(room, p.Name, msg.Text)
+	}
 }
 
 // maxFlashTextRunes 是弹幕文字上限（超出截断，不丢弃）。
@@ -627,21 +634,25 @@ func (h *Hub) handleWhiteboard(c *Client, msg *protocol.Message) {
 	room.Broadcast(&protocol.Message{Type: protocol.TypeWhiteboardOp, Op: &accepted}, "")
 }
 
-// handleRecord 是录制开关（**任何已入会的成员**都可以用）。
+// handleRecord 是录制开关（需要 `roomAdmin`）。
 //
 // 设计上与 moderate 完全一致：**权限在服务端强制校验**，前端隐藏按钮只是体验。
 // 录制是"转发即录制"（零转码），所以启停都是即时的：
 // 开始 = 给房间里**已经在发布**的轨道挂上写入器；停止 = 摘掉并收尾清单。
+//
+// 曾经有一版去掉了这道校验（理由是"主持人可能不在线，录个记录不应该做不到"），
+// 但前端按钮只对主持人显示、注释还写着"服务端仍会独立校验"，README 也这么写——
+// 结果就是三处口径互相矛盾，而且非主持人手工发一条 record 就能录，
+// 还能停掉**别的房间**正在进行的录制。凡是会写进文档/论文的权限口径，必须由服务端兜住。
 func (h *Hub) handleRecord(c *Client, msg *protocol.Message) {
 	roomID, pid, _ := c.session()
 	if roomID == "" {
 		c.fail(msg, protocol.ErrNotJoined, "尚未加入房间")
 		return
 	}
-	// **任何已入会的成员都可以录制**（不再要求主持人）：
-	// 录制是"转发即录制"，不额外消耗转码资源；会议内容对参与者本来就是可见的，
-	// 而且主持人不一定在线——把录制权限只给主持人，反而会让"想留个记录"变成做不到的事。
-	// 仍然要求已入会（上面已经校验），所以房间外的人无法操作。
+	if !c.requireGrant(msg, c.grants().RoomAdmin, "录制操作") {
+		return
+	}
 
 	switch msg.Action {
 	case protocol.ActionRecordStart:

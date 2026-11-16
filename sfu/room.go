@@ -1,6 +1,8 @@
 package sfu
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pion/webrtc/v4"
 
 	"easylive-api/mediarec"
 	"easylive-api/protocol"
@@ -27,9 +31,25 @@ type Manager struct {
 	// recorder 非 nil 时开启录制：每条轨道多写一份到磁盘（见 mediarec 包）。
 	// 它对转发是"旁路"：写队列满就丢帧，绝不阻塞媒体。
 	recorder *mediarec.Manager
+	// onRoomRemoved 在房间被回收（人走空了）时调用，由上层注册。
+	// 用途：让不属于 sfu 的子系统跟着收尾（AI 总结会话就是这样挂进来的）。
+	// 不注册也不会错，只是那些子系统得自己找别的时机收尾。
+	onRoomRemoved func(roomID string)
 
 	mu    sync.RWMutex
 	rooms map[string]*Room
+}
+
+// OnRoomRemoved 注册"房间被回收"的回调。传 nil 取消注册。
+//
+// 为什么需要它：房间对象是 sfu 私有的，上层（signaling/ai）拿不到"这个房间没了"的
+// 事件，只能靠客户端消息猜。AI 总结会话因此曾经在房间回收后继续挂着——协程空转，
+// 而且同一个 roomId 再开会时 Start 会命中旧会话直接幂等返回，用户看到"已开启"却
+// 永远没有纪要，只能重启进程。
+func (m *Manager) OnRoomRemoved(fn func(roomID string)) {
+	m.mu.Lock()
+	m.onRoomRemoved = fn
+	m.mu.Unlock()
 }
 
 // EnableRecording 打开会议录制（传 nil 表示关闭）。
@@ -112,6 +132,13 @@ func (r *Room) attachRecorders() {
 	r.mu.RUnlock()
 	for _, t := range tracks {
 		if t.recording() {
+			continue
+		}
+		// 虚拟轨道（AI 助手的语音）没有远端：它的 RTP 是服务端自己生成的，
+		// t.remote 为 nil。这里必须跳过，否则下面取 PayloadType/SSRC 直接 nil 解引用 panic。
+		// 曾经的表现是：房间里用过一次 @AI 之后，任何人点"开始录制"都会把自己的连接打断。
+		if t.remote == nil {
+			log.Printf("sfu: 跳过虚拟轨道（无远端，不落盘）track=%s", t.info.ID)
 			continue
 		}
 		codec := mediarec.Codec{
@@ -230,6 +257,14 @@ func (m *Manager) remove(roomID string) {
 			m.StopRecording(roomID)
 			log.Printf("sfu: 房间回收，录制会话已自动收尾 room=%s session=%s", roomID, sess.ID)
 		}
+	}
+
+	// 通知上层：这个房间没了。同样放在解锁之后（回调可能反过来调 Manager 的方法）。
+	m.mu.RLock()
+	onRemoved := m.onRoomRemoved
+	m.mu.RUnlock()
+	if onRemoved != nil {
+		onRemoved(roomID)
 	}
 }
 
@@ -462,6 +497,10 @@ type Room struct {
 	// aiSummaryProvider 由 ai 包设置：返回当前 AI 总结状态（nil 表示未启用）。
 	// Room 本身不依赖 ai 包（避免循环依赖），只通过这个函数指针取状态进快照。
 	aiSummaryProvider func() *protocol.AISummaryState
+	// agentTrack / agentPeer 是 AI 问答助手的虚拟参会者状态：
+	// 一条服务端生成的音频轨 + 合成身份。ai 包通过 PublishAgentTrack 按需创建（幂等）。
+	agentTrack *PublishedTrack
+	agentPeer  *protocol.PeerInfo
 	// quality 是各参与者最近一次上报的链路质量（client_metrics）。
 	// 采样器在写 metric_samples 时取"未过期样本的平均值"——服务端自己测不到
 	// 到浏览器的 RTT/丢包（它不解码媒体），所以这几列的唯一来源就是这里。
@@ -504,6 +543,77 @@ func (r *Room) SetAISummaryProvider(fn func() *protocol.AISummaryState) {
 	r.mu.Unlock()
 }
 
+// PublishAgentTrack 发布（或复用）AI 问答助手的虚拟音频轨。幂等。
+//
+// 虚拟参会者没有真实连接：轨道是服务端本地生成的（newLocalPublishedTrack），
+// 订阅者走正常订阅流程收听。与普通轨道的区别：
+//   - 身份是合成的 protocol.PeerInfo（进房间快照 + participant_joined 广播）；
+//   - 没有 Pump 循环，AI 通过 WriteAgentRTP 按 20ms 起搏写入；
+//   - RequestKeyframe 对无 pubPC 的轨道是 no-op，订阅端无需处理。
+func (r *Room) PublishAgentTrack() (*PublishedTrack, error) {
+	r.mu.Lock()
+	if r.agentTrack != nil {
+		t := r.agentTrack
+		r.mu.Unlock()
+		return t, nil
+	}
+	// SSRC 由服务端选：订阅端 PLI 按 SSRC 查表，虚拟轨同样适用（trackBySSRC 映射）。
+	// 用 crypto 强随机避免与真实轨道碰撞（概率可忽略，但零成本）。
+	var ssrcBuf [4]byte
+	if _, err := rand.Read(ssrcBuf[:]); err != nil {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("生成 SSRC 失败: %w", err)
+	}
+	ssrc := binary.BigEndian.Uint32(ssrcBuf[:])
+	if ssrc == 0 {
+		ssrc = 1
+	}
+	codec := webrtc.RTPCodecCapability{
+		MimeType:    webrtc.MimeTypeOpus,
+		ClockRate:   48000,
+		Channels:    2, // RFC 7587：SDP 里 opus 固定声明为 48000/2
+		SDPFmtpLine: "minptime=10;useinbandfec=1",
+	}
+	track, err := newLocalPublishedTrack(protocol.AIAgentID, "microphone", codec, ssrc)
+	if err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+	rememberSSRC(ssrc, track)
+	track.onEnd = r.onTrackEnded
+	r.tracks[track.info.ID] = track
+	r.agentTrack = track // 幂等复用的锚点
+	if r.agentPeer == nil {
+		r.agentPeer = &protocol.PeerInfo{
+			ID:       protocol.AIAgentID,
+			Name:     protocol.AIAgentName,
+			Identity: protocol.AIAgentID,
+			JoinedAt: time.Now().UnixMilli(),
+			State:    protocol.StateActive,
+		}
+	}
+	peer := *r.agentPeer
+	info := track.Info()
+	targets := r.allLocked()
+	r.mu.Unlock()
+
+	log.Printf("sfu: AI 助手虚拟轨道已发布 room=%s track=%s ssrc=%d", r.ID, info.ID, ssrc)
+	for _, p := range targets {
+		peerCopy := peer
+		p.NotifyTo(&protocol.Message{Type: protocol.TypeParticipantJoin, Participant: &peerCopy})
+		p.NotifyTo(&protocol.Message{Type: protocol.TypeTrackPublished, Track: info})
+	}
+	r.emitTrackEvent(track, true)
+	return track, nil
+}
+
+// AgentPeer 返回 AI 助手的合成身份（未激活时 nil）。
+func (r *Room) AgentPeer() *protocol.PeerInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.agentPeer
+}
+
 // AudioTracks 返回当前所有音频轨道的快照。
 func (r *Room) AudioTracks() []*PublishedTrack {
 	r.mu.RLock()
@@ -519,6 +629,9 @@ func (r *Room) AudioTracks() []*PublishedTrack {
 
 // ParticipantName 返回参与者的显示名，找不到返回 ID 本身。
 func (r *Room) ParticipantName(id string) string {
+	if id == protocol.AIAgentID {
+		return protocol.AIAgentName
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if p, ok := r.participants[id]; ok && p != nil {
@@ -603,12 +716,20 @@ func (r *Room) detectSpeakers() []protocol.SpeakerInfo {
 	for _, p := range r.participants {
 		participants = append(participants, p)
 	}
+	agentTrack := r.agentTrack // 锁内取值：PublishAgentTrack 与并发读之间不能有竞争
 	r.mu.RUnlock()
 
 	out := make([]protocol.SpeakerInfo, 0, len(participants))
 	for _, p := range participants {
 		if level := p.AudioLevel(); level >= audioLevelThreshold {
 			out = append(out, protocol.SpeakerInfo{ParticipantID: p.ID, Level: level})
+		}
+	}
+	// AI 助手：虚拟轨的电平由 AI 侧按 PCM RMS 上报（NoteAudioLevel），
+	// 同样参与说话人判定，前端高亮复用同一套 active_speakers。
+	if agentTrack != nil {
+		if level := agentTrack.AudioLevel(); level >= audioLevelThreshold {
+			out = append(out, protocol.SpeakerInfo{ParticipantID: protocol.AIAgentID, Level: level})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Level > out[j].Level })
@@ -1040,6 +1161,11 @@ func (r *Room) Track(trackID string) (*PublishedTrack, bool) {
 }
 
 // State 生成房间快照：新成员入会或断线重连时下发。
+//
+// 锁顺序：**锁内只做"拷贝引用/值"，解锁后再调外部东西**（manager 的录制状态、ai 的
+// 纪要 provider、各参与者的 Info()）。以前整段都在 r.mu.RLock 里，而 manager 那边
+// （Stats/录制路径）是持 m.mu 取 r.mu —— 两条相反顺序在某些交错下会 ABBA 死锁；
+// 同理 ai provider 内部要取 session 锁，也会引入 room → session 的反向依赖。
 func (r *Room) State() *protocol.RoomState {
 	// 录制状态要在**取 r.mu 之前**读：RoomRecordingState 内部会拿 Manager.mu，
 	// 而 Manager 侧的部分方法（如 Stats）也会拿 r.mu——两个方向同时存在就是 ABBA 死锁。
@@ -1047,29 +1173,52 @@ func (r *Room) State() *protocol.RoomState {
 	recording := r.manager.RoomRecordingState(r.ID)
 
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	participants := make([]*Participant, 0, len(r.participants))
+	for _, p := range r.participants {
+		participants = append(participants, p)
+	}
+	tracks := make([]*PublishedTrack, 0, len(r.tracks))
+	for _, t := range r.tracks {
+		tracks = append(tracks, t)
+	}
+	var agent *protocol.PeerInfo
+	if r.agentPeer != nil {
+		cp := *r.agentPeer
+		agent = &cp
+	}
+	whiteboard := append([]protocol.WhiteboardOp(nil), r.whiteboard...)
+	hands := make([]string, 0, len(r.hands))
+	for id, up := range r.hands {
+		if up {
+			hands = append(hands, id)
+		}
+	}
+	aiSummaryProvider := r.aiSummaryProvider
+	r.mu.RUnlock()
 
 	state := &protocol.RoomState{
 		RoomID:       r.ID,
-		Participants: make([]*protocol.PeerInfo, 0, len(r.participants)),
-		Tracks:       make([]*protocol.TrackInfo, 0, len(r.tracks)),
+		Participants: make([]*protocol.PeerInfo, 0, len(participants)+1),
+		Tracks:       make([]*protocol.TrackInfo, 0, len(tracks)),
 		// 带上录制状态：中途入会的人也要能立刻看到"录制中"红点，
 		// 而不是等到下一次广播（否则"有人在录我"这件事对新来者不可见）
 		Recording: recording,
 	}
-	for _, p := range r.participants {
+	for _, p := range participants {
 		state.Participants = append(state.Participants, p.Info())
 	}
-	for _, t := range r.tracks {
+	// AI 助手：虚拟参会者同样进快照，中途入会的人能看到它（及其轨道）
+	if agent != nil {
+		state.Participants = append(state.Participants, agent)
+	}
+	for _, t := range tracks {
 		state.Tracks = append(state.Tracks, t.Info())
 	}
-	state.Whiteboard = append([]protocol.WhiteboardOp(nil), r.whiteboard...)
-	for id := range r.hands {
-		state.Hands = append(state.Hands, id)
-	}
+	state.Whiteboard = whiteboard
+	state.Hands = hands
 	// 带上 AI 总结状态：中途入会的人能立刻看到当前纪要，而不是等下一次更新
-	if r.aiSummaryProvider != nil {
-		state.AISummary = r.aiSummaryProvider()
+	if aiSummaryProvider != nil {
+		state.AISummary = aiSummaryProvider()
 	}
 	return state
 }
