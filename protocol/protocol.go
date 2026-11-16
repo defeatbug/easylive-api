@@ -49,6 +49,14 @@ const (
 	TypeHandState MsgType = "hand_state" // 见上方双向说明
 	TypePing      MsgType = "ping"       // {}
 	TypeModerate  MsgType = "moderate"   // {targetId, action}  action: mute | kick（需要 roomAdmin 权限）
+	// TypeClientMetrics 由客户端上报**端侧观测到的链路质量**（浏览器 getStats 采样）。
+	//
+	// 为什么必须由客户端报：服务端只转发、不解码媒体，它在物理上测不到
+	// "自己到某个浏览器"的 RTT 与丢包（那要靠 RTCP SR/RR 的完整回路，且只覆盖
+	// SFU→客户端一个方向）。因此 metric_samples 的 rtt_ms / loss_rate / in_kbps /
+	// out_kbps 四列以客户端上报为唯一来源，服务端只做校验、聚合与落库。
+	// 这是一条 fire-and-forget 消息：服务端不回响应，非法值静默丢弃（观测数据不该刷错误）。
+	TypeClientMetrics MsgType = "client_metrics" // {quality:{rttMs, lossRate, outKbps, inKbps}}
 )
 
 // ---------- 服务端 → 客户端 ----------
@@ -114,6 +122,19 @@ const (
 	KindScreen = "screen"
 )
 
+// ClientQuality 是客户端上报的一次链路质量采样（单位约定见各字段）。
+//
+// **注意 lossRate 的单位与数据库列不同**：协议里是**百分比 0–100**（浏览器侧
+// 天然算出的就是百分比），落库前由服务端除以 100 转成比例（metric_samples.loss_rate
+// 是 0–1 的比例，前端图表展示时再乘回 100）。单位不一致是这类指标最常见的错误来源，
+// 所以这里显式写死并在 handler 里做唯一一次转换。
+type ClientQuality struct {
+	RTTMs    float64 `json:"rttMs"`    // 毫秒（被提名候选对的 currentRoundTripTime）
+	LossRate float64 `json:"lossRate"` // **百分比 0–100**
+	OutKbps  float64 `json:"outKbps"`  // 上行千比特/秒
+	InKbps   float64 `json:"inKbps"`   // 下行千比特/秒
+}
+
 // Message 是协议里唯一的消息结构。
 type Message struct {
 	Type MsgType `json:"type"`
@@ -155,6 +176,8 @@ type Message struct {
 	AISummary *AISummaryState `json:"aiSummary,omitempty"`
 	// AIAgent 是 AI 问答助手状态载荷（ai_agent_state 消息）
 	AIAgent *AIAgentState `json:"aiAgent,omitempty"`
+	// Quality 是客户端上报的链路质量（client_metrics）。
+	Quality *ClientQuality `json:"quality,omitempty"`
 
 	// Flash 是服务端广播出去的弹幕/互动（fromId/fromName 由服务端填，客户端无法伪造）
 	Flash *FlashMessage `json:"flash,omitempty"`

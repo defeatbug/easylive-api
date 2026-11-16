@@ -50,12 +50,15 @@ func TestE2ERecordRequiresRoomAdmin(t *testing.T) {
 	}
 }
 
-// TestE2ERecordingRoomScoped 是"录制是进程级单例"这条现状的端到端护栏。
+// TestE2ERecordingRoomScoped 是"录制按房间隔离"的端到端护栏。
 //
 // 它同时盯住三件曾经出过问题的事：
 //  1. 主持人开录 → 本房间全员看到红点（成员看得见，但自己开不了）；
-//  2. 另一个房间开录 → **明确报错**，而不是"显示已开始录制却一个字节不落盘"；
-//  3. 另一个房间既不能停别人的录制，也不该在入会快照里看到别人的红点。
+//  2. 另一个房间开录 → **拿到属于自己的会话**，两边互不影响；
+//  3. 另一个房间停掉自己的录制，也不影响本房间的录制与入会快照。
+//
+// 旧的单例实现里，第 2 步必须明确报错（ErrRoomBusy）；改成 map[roomID]*Session 后，
+// 每个房间独立录制，这条护栏改成验证"独立会话、独立状态、独立收尾"。
 func TestE2ERecordingRoomScoped(t *testing.T) {
 	rec, err := mediarec.New(t.TempDir())
 	if err != nil {
@@ -90,11 +93,16 @@ func TestE2ERecordingRoomScoped(t *testing.T) {
 
 	// 1) 主持人开录：本房间全员（含普通成员）都该看到红点
 	host.send(&protocol.Message{Type: protocol.TypeRecord, Action: protocol.ActionRecordStart})
+	var sessionR1 string
 	for _, p := range []*peer{host, member} {
 		st := p.waitType(protocol.TypeRecordingState, 5*time.Second)
 		if st.Recording == nil || !st.Recording.Active {
 			t.Fatalf("[%s] 应收到录制中状态，实际 %+v", p.name, st.Recording)
 		}
+		sessionR1 = st.Recording.SessionID
+	}
+	if sessionR1 == "" {
+		t.Fatal("room-r1 的录制状态应带会话 ID")
 	}
 
 	// 2) 普通成员自己开不了（前端隐藏按钮只是体验）
@@ -103,19 +111,30 @@ func TestE2ERecordingRoomScoped(t *testing.T) {
 		t.Fatalf("成员被拒原因应说明是录制权限，实际 %q", ev.Reason)
 	}
 
-	// 3) 另一个房间开录：必须明确失败（单例），不能"静默成功"
+	// 3) 另一个房间开录：拿到属于自己的会话，与 room-r1 的会话不同
 	host2.send(&protocol.Message{Type: protocol.TypeRecord, Action: protocol.ActionRecordStart})
-	if ev := waitError(t, host2, protocol.ErrInternal, 5*time.Second); !strings.Contains(ev.Reason, "另一个房间正在录制") {
-		t.Fatalf("别的房间开录应明确报「另一个房间正在录制」，实际 %q", ev.Reason)
+	st2 := host2.waitType(protocol.TypeRecordingState, 5*time.Second)
+	if st2.Recording == nil || !st2.Recording.Active {
+		t.Fatalf("room-r2 开录后主持人2应收到录制中状态，实际 %+v", st2.Recording)
+	}
+	if st2.Recording.SessionID == "" || st2.Recording.SessionID == sessionR1 {
+		t.Fatalf("room-r2 应拿到独立的会话 ID，room-r1=%q room-r2=%q", sessionR1, st2.Recording.SessionID)
 	}
 
-	// 4) 另一个房间也不能停掉别人的录制
+	// 4) 另一个房间停掉自己的录制：只影响自己，room-r1 必须继续录
 	host2.send(&protocol.Message{Type: protocol.TypeRecord, Action: protocol.ActionRecordStop})
-	if ev := waitError(t, host2, protocol.ErrForbidden, 5*time.Second); !strings.Contains(ev.Reason, "另一个房间正在录制") {
-		t.Fatalf("别的房间停录应被拒绝，实际 %q", ev.Reason)
+	if st := host2.waitType(protocol.TypeRecordingState, 5*time.Second); st.Recording == nil || st.Recording.Active {
+		t.Fatalf("room-r2 停止后应为未录制状态，实际 %+v", st.Recording)
+	}
+	lateR1Tok := issueToken(t, ts.cfg, "u-late1", "迟到者1", grant("room-r1", true))
+	lateR1 := dial(t, ts.url, "late1")
+	defer lateR1.close()
+	joinedR1 := joinWithToken(lateR1, "room-r1", "迟到者1", lateR1Tok)
+	if joinedR1.Room == nil || joinedR1.Room.Recording == nil || !joinedR1.Room.Recording.Active {
+		t.Fatalf("room-r1 的录制不应被 room-r2 的停止影响，入会快照应为录制中，实际 %+v", joinedR1.Room)
 	}
 
-	// 5) 别的房间的新入会者，快照里不该带"录制中"红点
+	// 5) room-r2 的新入会者，快照里不该带"录制中"红点（room-r2 已经停了）
 	lateTok := issueToken(t, ts.cfg, "u-late", "迟到者", grant("room-r2", true))
 	late := dial(t, ts.url, "late")
 	defer late.close()
@@ -124,7 +143,7 @@ func TestE2ERecordingRoomScoped(t *testing.T) {
 		t.Fatalf("joined 缺少录制状态字段: %+v", joined.Room)
 	}
 	if joined.Room.Recording.Active {
-		t.Fatal("另一个房间的新入会者不应看到录制中红点")
+		t.Fatal("room-r2 已停止录制，新入会者不应看到录制中红点")
 	}
 
 	// 6) 归属房间自己停：全员回到未录制

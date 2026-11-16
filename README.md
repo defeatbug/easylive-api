@@ -187,9 +187,19 @@ mutation { createRoom(id: "demo-room", title: "答辩演示", createdBy: "defend
 { "roomMetrics": { "sampleCount": 1628, "avgParticipants": 1.36, "peakTracks": 5, "totalBytes": 8620166647 } }
 ```
 
-**已知缺口（如实标注）**：`metric_samples` 的质量列（`avg_rtt_ms` / `avg_loss_rate` / `avg_in_kbps`）
-服务端不填——服务端只统计人数/轨道/包数/字节数（它不解码、也不逐包测 RTT）。
-这几个指标由**客户端侧统计**提供：浏览器看「指标」面板，批量数据用 `cmd/loadtest` 采集（见 `docs/evaluation.md`）。
+**质量四列的数据来源（客户端上报，不是服务端测的）**：`rtt_ms` / `loss_rate` / `in_kbps` / `out_kbps`
+在物理上只能由**端侧**测量——服务端只转发、不解码媒体，测不到"自己到某个浏览器"的 RTT 与丢包。
+所以浏览器每 10s 通过信令上报一条 `client_metrics`（`{quality:{rttMs, lossRate, outKbps, inKbps}}`）：
+
+- 协议里 `lossRate` 是**百分比 0–100**；落库前服务端统一除以 100，`metric_samples.loss_rate` 是**比例 0–1**
+  （前端图表展示时再乘回 100）。单位只在这一个入口转换一次。
+- 服务端做范围校验 + 每参与者 1s 限频 + 30s 过期；采样器只对**未过期样本取平均**写库。
+- 没有人在会（或客户端刚进会还没产出 getStats）时这几列就是 0——历史曲线会断开，
+  这是"如实反映没有数据"，而不是伪造一条健康平线。
+- 压测链路（`cmd/loadtest`）也可以复用同一条消息上报，把合成客户端的 RTT/丢包写进同一张表。
+
+实现位置：`protocol.ClientQuality` → `signaling.handleClientMetrics` → `sfu.Room.SetClientQuality`
+→ `recorder` 采样器 → `metric_samples`。口径说明见 `docs/evaluation.md`。
 
 **连库集成测试**（默认跳过，因为"没有数据库"是合法开发状态）：
 
@@ -203,13 +213,17 @@ DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/sfu_dev?sslmode=disabl
 
 ## 信令协议速览
 
-请求（客户端 → 服务端）：`join`、`leave`、`publish`、`answer`、`candidate`、`subscribe`、`unsubscribe`、`unpublish`、`mute`、`chat`、`ping`、`moderate`
-响应 / 事件（服务端 → 客户端）：`joined`、`publish_answer`、`subscribe_offer`、`participant_joined`、`participant_left`、`participant_state`、`track_published`、`track_unpublished`、`track_muted`、`active_speakers`、`hand_state`、`chat_message`、`force_mute`、`pong`、`error`
+请求（客户端 → 服务端）：`join`、`leave`、`publish`、`answer`、`candidate`、`subscribe`、`unsubscribe`、`unpublish`、`mute`、`chat`、`flash`、`hand_state`、`whiteboard`、`record`、`client_metrics`、`ping`、`moderate`
+响应 / 事件（服务端 → 客户端）：`joined`、`publish_answer`、`subscribe_offer`、`participant_joined`、`participant_left`、`participant_state`、`track_published`、`track_unpublished`、`track_muted`、`active_speakers`、`hand_state`、`chat_message`、`flash_message`、`force_mute`、`recording_state`、`whiteboard_op`、`pong`、`error`
 
 约定：
 - 消息是**扁平结构**，按 `type` 取字段；`id` 是幂等键，响应原样带回（客户端据此匹配）。
 - `sessionId ≠ participantId`：前者绑定连接，后者绑定会议身份（为断线重连预留）。
 - `publish` 可重复发送 —— 第二次即**重协商**（开始/停止屏幕共享走这条路）。
+- `subscribe` 是**幂等**的：同一条轨道重复订阅时，服务端返回 `sdp` 为空的 `subscribe_offer`
+  （表示"已订阅，无需再协商"），不会重复 `AddTrack` 或多出一条 m-line。
+- `client_metrics` 是**单向、无响应**的观测上报（浏览器每 10s 一条，见下文"质量四列"）：
+  非法值/未入会/过于频繁的上报会被静默丢弃，不会给客户端回 `error`。
 - **断线重连（M4）**：`joined` 会下发 `resumeToken`。信令连接意外断开时服务端**不立即视为离会**，
   而是把参与者标记为 `reconnecting`（广播 `participant_state`）并保留轨道与订阅，
   宽限期（`RESUME_GRACE`，默认 30s）内带 `resumeToken` 重连即可恢复**同一个 participantId**。
@@ -286,20 +300,14 @@ DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/sfu_dev?sslmode=disabl
 
 ## 会议录制（转发即录制，零转码）
 
-**开启**：**默认就是开的**（`RECORD_ENABLED` 默认 `true`）；要关显式设 `RECORD_ENABLED=false`。
+**开启**：**默认就是开的**（`RECORD_ENABLED` 默认 `true`；要关显式设 `RECORD_ENABLED=false`，启动日志会报"录制=开/关"）。
 可选 `RECORD_DIR`（默认 `recordings/`）。**主持人在工具栏点"录制"**即可开始/停止；房间空了会自动收尾。
 录制红点**本房间全员可见**（状态随 `joined` 快照下发，中途入会的人也看得到）；别的房间不会亮红点——
-录制状态按房间核对，虽然会话本身是单例。
+录制状态按房间隔离，**多房间可以同时录制，互不影响**。
 
 > **权限口径**：`handleRecord` 由服务端强制校验 `roomAdmin`（前端只对主持人显示按钮，那只是体验）。
-> 停止也只允许停**本房间自己**的会话——曾有一版既不校验权限、`stop` 也不看归属，
+> 停止也只影响**本房间自己**的会话——曾有一版既不校验权限、`stop` 也不看归属，
 > 结果非主持人能手工发消息开录、还能停掉别的房间正在进行的录制。
->
-> **当前限制（单例）**：录制会话是**进程级单例**，同一时间只能录一个房间。
-> 别的房间点"开始录制"会**明确报错**（"另一个房间正在录制"），而不是假装成功——
-> 早先那样会静默丢数据：用户看到"已开始录制"，实际一个字节都不落盘，
-> 而该房间新发布的轨道还会被写进另一个房间的会话目录。
-> 改成 `map[roomID]*Session` 才是彻底修法（见技术债清单 H3）。
 
 > 早先这个开关默认 `false`，表现为"主持人在菜单里看得到录制、一按就失败"。
 > 现在的原则见 **[docs/feature-flags.md](docs/feature-flags.md)**：功能开关默认站在"可用"的一侧，
@@ -319,6 +327,12 @@ DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/sfu_dev?sslmode=disabl
 5. **挂上录制时主动回 PLI**：与"新订阅者上线要关键帧"同理，否则"开始录制"之后可能好几秒里文件都是 0 字节。
 6. **一次录制 = 一个会话**：每次开始建一个目录（`20261015-203249-<房间>`），内含每轨一个文件与 `manifest.json`
    （文件、大小、帧数、丢帧、时长、现成的 ffmpeg 命令）。清单**原子写入**，进程被强杀也留得下可用记录。
+7. **会话按房间隔离**：录制开关是房间级 API，同一节点上多个房间可以各自录制、互不影响。
+   停止/空房回收只收尾**本房间**的写入器与清单（早期全局单会话的实现会让两个房间串台，
+   见 `mediarec/manager.go` 里 `sessions` 的注释与 `sfu/record_test.go` 的回归测试）。
+8. **停止录制不会伤害转发**：写入器用独立 stop 信号收尾、`frames` 队列永不 close，
+   热路径的 `Write` 不会撞上已关闭的 channel；录制期间收到的包会先克隆再入队，
+   避免与热路径改写 RTP 头构成数据竞争。
 
 **取回与播放**
 
@@ -360,6 +374,7 @@ ffmpeg -i <camera>.ivf -i <microphone>.ogg -c copy -shortest out.webm
 | `go vet ./...` | 通过（无输出） |
 | `go build ./...` | 通过 |
 | `go test ./...` | 11 个包全部 PASS。`signaling` 约 10s，含真实 Pion 客户端的 e2e：媒体转发（订阅端实收 RTP）、屏幕共享关键帧、轨道下线、断线恢复（含 `resetMedia`）、数据通道双向中继、活跃说话人、鉴权、GraphQL |
+| `go test -race ./...` | 全部 PASS（`make test` 已默认带 `-race`）：并发收尾/订阅幂等/多房间录制均有回归测试 |
 | 前端配套 | 在 `easylive-web` 下 `npx tsc --noEmit` 通过 |
 
 **此前实测、本次未复跑**（都依赖真实部署环境，需要时按对应章节的步骤重来）：
@@ -372,11 +387,17 @@ ffmpeg -i <camera>.ivf -i <microphone>.ogg -c copy -shortest out.webm
 
 ## 尚未实现 / 已知限制
 
-> 这份清单按**当前代码**核实过（2026-10-19）。已经做完的里程碑不再列在这里——
+> 这份清单按**当前代码**核实过（2026-11-16）。已经做完的里程碑不再列在这里——
 > 断线重连（M4）见「信令协议速览」，gqlgen（M3）见「GraphQL 接口」，鉴权与账号体系见「准入与权限」。
 >
 > 一个反例值得记下来：本段此前长期写着"断线重连未实现 / gqlgen 未接入 / `/ws` 未校验 token"，
 > 而这三项代码与测试都已交付。**文档落后于代码，会让人重做已经做完的事**——所以这里只写核实过的缺口。
+
+### 已完成（此前清单里的旧项）
+
+- [x] **断线重连（M4）**：`resumeToken` + 30s 宽限期 + `resetMedia`，`signaling/e2e_resume_test.go` 覆盖
+- [x] **gqlgen 接入（M3）**：`graph/` 下 4 个查询 + 3 个变更，resolver 全部真实实现
+- [x] **`/ws` 鉴权**：JWT `VideoGrant` 三态（off/optional/required），逐条消息校验权限，`signaling/e2e_auth_test.go` 覆盖
 
 ### 功能缺口
 
@@ -399,13 +420,15 @@ ffmpeg -i <camera>.ivf -i <microphone>.ogg -c copy -shortest out.webm
       `WS_MAX_CONNECTIONS`（默认 200）、`HTTP_RATE_LIMIT_PER_IP`（默认每秒 50 次/IP，`/ws` 不受它限制）。
       缺：房间总数上限、每房间带宽/轨道配额、单发布者上行配额。
       一个房间打满上行会拖累同一进程里的其他房间（共用事件循环与网卡）。
+      录制本身已按房间隔离，不再是容量瓶颈。
 - [ ] **水平扩展**：媒体与房间状态都在进程内存里（ADR D8 的取舍），因此**只能单节点**。
       多节点需要房间归属路由 + 跨节点转发，不在当前设计范围内。
 
 ### 已知的指标口径边界
 
-`metric_samples` 的质量列（`avg_rtt_ms` / `avg_loss_rate` / `avg_in_kbps`）服务端**不填**：
-它不解码媒体、也不逐包测 RTT。这几个数由浏览器「指标」面板和 `cmd/loadtest` 采集，
+`metric_samples` 的质量列（`avg_rtt_ms` / `avg_loss_rate` / `avg_in_kbps`）由客户端上报的
+`client_metrics` 填充（`sfu.Room.SetClientQuality` 校验后记入房间状态，采样器取未过期样本的平均值写库）：
+服务端本身不解码媒体、也不逐包测 RTT，所以这些数反映的是**客户端视角**的链路质量。
 口径见 `docs/evaluation.md`——写论文引用这些数字时必须以该文档的边界为准。
 
 ## 常见坑

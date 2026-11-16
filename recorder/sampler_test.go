@@ -306,3 +306,41 @@ func TestRunShutdownEndsActiveMeetings(t *testing.T) {
 		t.Fatalf("退出收尾也应带上峰值，实际 %+v", ends[0])
 	}
 }
+
+// TestSampleCarriesClientQuality 钉住"客户端上报的质量真正落库"这条链路：
+//
+// 采样器只负责搬运 RoomSnapshot；如果这里丢了字段，metric_samples 的
+// rtt_ms/loss_rate/out_kbps/in_kbps 会永远写 0 —— 界面上的历史曲线就成了
+// "看起来一切健康"的假数据。所以必须有一个断言把四个字段都覆盖到。
+func TestSampleCarriesClientQuality(t *testing.T) {
+	ctx := context.Background()
+	st := &fakeStore{}
+	rooms := &fakeRooms{}
+	clk := &testClock{t: time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)}
+	s := newTestSampler(st, rooms, clk, 0)
+
+	rooms.set(sfu.RoomSnapshot{
+		ID: "room-q", Participants: 2, Tracks: 3, Packets: 10, Bytes: 100,
+		// LossRate 是比例（0–1），这里 0.0125 = 1.25%
+		RTTMs: 41.6, LossRate: 0.0125, OutKbps: 799.4, InKbps: 1601.5,
+	})
+	s.Tick(ctx)
+
+	_, _, _, samples, _ := st.snapshot()
+	if len(samples) != 1 {
+		t.Fatalf("应写入 1 条样本，实际 %d", len(samples))
+	}
+	got := samples[0]
+	if got.RTTMs != 42 {
+		t.Fatalf("RTT 应四舍五入为 42，实际 %d", got.RTTMs)
+	}
+	if got.LossRate != 0.0125 {
+		t.Fatalf("丢包率应以比例原样落库，实际 %v", got.LossRate)
+	}
+	if got.OutKbps != 799 {
+		t.Fatalf("上行码率应四舍五入为 799，实际 %d", got.OutKbps)
+	}
+	if got.InKbps != 1602 {
+		t.Fatalf("下行码率应四舍五入为 1602，实际 %d", got.InKbps)
+	}
+}

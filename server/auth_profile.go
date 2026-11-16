@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"log"
@@ -37,6 +38,33 @@ var allowedAvatarMime = map[string]bool{
 	"image/png":  true,
 	"image/jpeg": true,
 	"image/webp": true,
+}
+
+// 头像的真实格式只认文件头（魔数），不认 multipart 里声明的 Content-Type。
+//
+// 为什么必须这样：Content-Type 由客户端随便写（curl -F 'file=@x.html;type=image/png' 就能骗过
+// 只查声明的实现），而 /auth/avatar/:id 会把存下来的 MIME 原样回给浏览器——
+// 这正是"存储型 XSS"的经典路径（上传 HTML/JS，诱导别人打开头像 URL）。
+// 真实字节只有三种可能：PNG / JPEG / WebP。
+var (
+	pngMagic  = []byte("\x89PNG\r\n\x1a\n")
+	jpegMagic = []byte{0xFF, 0xD8, 0xFF}
+)
+
+// sniffAvatarMime 按文件头判定真实类型；不认识的格式返回 ok=false。
+//
+// WebP 的结构是 "RIFF" + 4 字节长度 + "WEBP" 容器标识，这里检查首尾两个魔数；
+// 前 4 字节之后的大小字段不参与判断（它与文件是否完整无关，这里不做完整解码）。
+func sniffAvatarMime(data []byte) (string, bool) {
+	switch {
+	case len(data) >= len(pngMagic) && bytes.Equal(data[:len(pngMagic)], pngMagic):
+		return "image/png", true
+	case len(data) >= len(jpegMagic) && bytes.Equal(data[:len(jpegMagic)], jpegMagic):
+		return "image/jpeg", true
+	case len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")):
+		return "image/webp", true
+	}
+	return "", false
 }
 
 // requireUser 取当前登录用户；未登录时已经回了 401，调用方直接 return。
@@ -137,6 +165,10 @@ func (s *Server) handleChangePassword(c *fiber.Ctx) error {
 	if !loginAllowed(c.IP() + "|password|" + strings.ToLower(u.Username)) {
 		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "尝试过于频繁，请稍后再试"})
 	}
+	// 上限与注册/登录一致：不给 argon2 喂超大输入（登录入口已限制，这里补齐）。
+	if passwordTooLong(req.NewPassword) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "新密码最长 128 个字符"})
+	}
 	if !s.verifyCurrentPassword(u, req.CurrentPassword) {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "当前密码不正确"})
 	}
@@ -188,6 +220,16 @@ func (s *Server) handleUploadAvatar(c *fiber.Ctx) error {
 	if len(data) > maxAvatarBytes {
 		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "头像不能超过 512KB"})
 	}
+	// 声明的 Content-Type 只用于上面的快速预筛；**真正落库的类型由文件头决定**。
+	realMime, sniffed := sniffAvatarMime(data)
+	if !sniffed {
+		return c.Status(fiber.StatusUnsupportedMediaType).JSON(fiber.Map{"error": "只支持 PNG / JPEG / WebP（文件内容不是这三种格式）"})
+	}
+	if realMime != mime {
+		// 声明与真实不一致本身不必拒绝（我们只存真实类型），但留痕便于排查客户端问题
+		log.Printf("server: 头像声明类型 %s 与真实类型 %s 不一致 user=%s", mime, realMime, u.Username)
+		mime = realMime
+	}
 	if err := s.st.SetAvatar(c.UserContext(), u.ID, mime, data); err != nil {
 		log.Printf("server: 保存头像失败 user=%s err=%v", u.Username, err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "保存失败，请稍后重试"})
@@ -197,6 +239,8 @@ func (s *Server) handleUploadAvatar(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "保存成功但读取失败，请刷新"})
 	}
 	log.Printf("server: 头像已更新 user=%s mime=%s bytes=%d", u.Username, mime, len(data))
+	// 上传响应是 JSON，但仍显式声明 nosniff：浏览器对同一路径的响应不应做类型猜测。
+	c.Set(fiber.HeaderXContentTypeOptions, "nosniff")
 	return c.JSON(fiber.Map{"user": userJSON(updated)})
 }
 
@@ -231,6 +275,12 @@ func (s *Server) handleGetAvatar(c *fiber.Ctx) error {
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "读取头像失败"})
 	}
+	// 按**真实字节**重新判定类型：库里老的 avatar_mime 是"客户端声明值"，不可信；
+	// 即使判定不出来，也照样带 nosniff，浏览器不会按内容把响应猜成 HTML/JS。
+	if realMime, ok := sniffAvatarMime(data); ok {
+		mime = realMime
+	}
+	c.Set(fiber.HeaderXContentTypeOptions, "nosniff")
 	c.Set("Content-Type", mime)
 	// 内容不会变（换了头像 URL 也会变），可以放心长缓存
 	c.Set("Cache-Control", "private, max-age=86400")

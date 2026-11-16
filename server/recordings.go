@@ -32,8 +32,9 @@ type recordingAccess struct {
 
 // recordingAccessFor 判定本次请求的访问范围。
 func (s *Server) recordingAccessFor(c *fiber.Ctx) recordingAccess {
-	// ① 运维密钥（与 /token、/graphql 同一套凭据）
-	if s.cfg.TokenAPIKey != "" && c.Get("X-API-Key") == s.cfg.TokenAPIKey {
+	// ① 运维密钥（与 /token、/graphql、/metrics 同一套凭据）。
+	// 用 apiKeyMatches 做常量时间比较：== 的逐字节耗时差可被用来还原密钥。
+	if apiKeyMatches(c.Get("X-API-Key"), s.cfg.TokenAPIKey) {
 		return recordingAccess{ok: true, all: true}
 	}
 	// 开发环境 + 鉴权关闭（免登录演示 / 本地探针）：放行。

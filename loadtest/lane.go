@@ -237,6 +237,8 @@ func RunLane(ctx context.Context, opts Options, index int, sink func(Sample)) {
 	acc := &rateAccumulator{}
 	var lastSentBytes uint64
 	lastAt := time.Now()
+	// metricsTick 用来把"每 10s 上报一次质量"摊在 1s 的采样循环里（不额外起定时器）。
+	metricsTick := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -272,6 +274,27 @@ func RunLane(ctx context.Context, opts Options, index int, sink func(Sample)) {
 				}
 			}
 			sink(out)
+
+			// 每 10 个采样周期（默认 10s）向服务端上报一条 client_metrics。
+			//
+			// 为什么压测客户端也要报：`metric_samples` 的 rtt_ms/loss_rate/in_kbps/out_kbps
+			// 以"客户端上报"为唯一来源（服务端不解码媒体、测不到端到端质量）。如果只有
+			// 浏览器报，纯压测跑出来的实验数据里质量列就永远是 0——而压测恰恰是论文里
+			// 量化 RTT/丢包的主要手段。这里复用与浏览器**完全相同**的消息与单位：
+			//   RTTMs 毫秒；LossRate 百分比 0–100（服务端落库时转比例）；码率 kbps。
+			// 只报"已连接且确实有样本"的周期：全 0 会把历史曲线画成一条假的健康平线。
+			metricsTick++
+			if metricsTick%10 == 0 && out.Connected && (out.RTTMs > 0 || out.InKbps > 0) {
+				_ = lane.ws.send(&protocol.Message{
+					Type: protocol.TypeClientMetrics,
+					Quality: &protocol.ClientQuality{
+						RTTMs:    out.RTTMs,
+						LossRate: out.LossRate, // Sample.LossRate 本身就是百分比（见 rateAccumulator.fill）
+						OutKbps:  out.OutKbps,
+						InKbps:   out.InKbps,
+					},
+				})
+			}
 		}
 	}
 }

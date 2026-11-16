@@ -7,7 +7,6 @@ package sfu
 // 房间用过一次 @AI 之后，任何人点"开始录制"都会 nil 解引用 panic、自己的连接被打断。
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -52,9 +51,10 @@ func TestAttachRecordersSkipsVirtualTrack(t *testing.T) {
 	}
 }
 
-// TestRecordingBelongsToOneRoom 回归：录制会话是进程级单例，别的房间不能"借用"，
-// 也不能用"停止录制"去停别人的会话。
-func TestRecordingBelongsToOneRoom(t *testing.T) {
+// TestRecordingIsolatedPerRoom 回归：录制按房间隔离——
+// 每个房间有自己的会话，别的房间开始/停止录制都互不影响，
+// 录制状态也按房间取：A 在录，B 的新入会者不该看到"录制中"红点。
+func TestRecordingIsolatedPerRoom(t *testing.T) {
 	m, _ := newTestManagerWithRecording(t)
 	a := m.GetOrCreate("room-rec-a")
 	defer close(a.speakerStop)
@@ -68,32 +68,36 @@ func TestRecordingBelongsToOneRoom(t *testing.T) {
 	if _, err := m.StartRecording("room-rec-a", "p-a"); err != nil {
 		t.Fatalf("同房间重复开始录制应幂等成功: %v", err)
 	}
-	// 别的房间：必须明确报错，而不是"假装成功但一个字节都不落盘"
-	if _, err := m.StartRecording("room-rec-b", "p-b"); !errors.Is(err, mediarec.ErrRoomBusy) {
-		t.Fatalf("room-rec-b 应被拒绝（ErrRoomBusy），实际 err=%v", err)
+	// 别的房间：独立会话，不再被拒绝
+	sessB, err := m.StartRecording("room-rec-b", "p-b")
+	if err != nil {
+		t.Fatalf("room-rec-b 开始录制失败: %v", err)
 	}
-	// 别的房间也不能停掉 room-rec-a 的录制
-	if _, err := m.StopRecordingIn("room-rec-b"); !errors.Is(err, mediarec.ErrRoomBusy) {
-		t.Fatalf("room-rec-b 停止录制应被拒绝（ErrRoomBusy），实际 err=%v", err)
+	if sessB.RoomID != "room-rec-b" {
+		t.Fatalf("room-rec-b 应拿到自己的会话，实际 %+v", sessB)
 	}
-	if sess := m.RecordingSession(); sess == nil || sess.RoomID != "room-rec-a" {
+	// 停掉 room-rec-b 不能停掉 room-rec-a 的录制
+	if sess := m.StopRecording("room-rec-b"); sess == nil || sess.RoomID != "room-rec-b" {
+		t.Fatalf("停止 room-rec-b 应返回它自己的会话，实际 %+v", sess)
+	}
+	if sess := m.RecordingSession("room-rec-a"); sess == nil || sess.RoomID != "room-rec-a" {
 		t.Fatalf("room-rec-a 的会话不应被停掉，实际 %+v", sess)
 	}
 	// 录制状态也要按房间隔离：A 在录，B 的新入会者不该看到"录制中"红点
-	if st := m.RecordingStateFor("room-rec-a"); !st.Active {
+	if st := m.RoomRecordingState("room-rec-a"); !st.Active {
 		t.Fatal("room-rec-a 应看到录制中")
 	}
-	if st := m.RecordingStateFor("room-rec-b"); st.Active {
+	if st := m.RoomRecordingState("room-rec-b"); st.Active {
 		t.Fatalf("room-rec-b 不应看到录制中，实际 %+v", st)
 	}
 	if b.State().Recording.Active {
 		t.Fatal("room-rec-b 的入会快照不应带录制中红点")
 	}
 	// 归属房间自己停：正常结束
-	if sess, err := m.StopRecordingIn("room-rec-a"); err != nil || sess == nil {
-		t.Fatalf("room-rec-a 停止录制失败: sess=%v err=%v", sess, err)
+	if sess := m.StopRecording("room-rec-a"); sess == nil {
+		t.Fatal("room-rec-a 停止录制失败：应返回会话")
 	}
-	if m.RecordingSession() != nil {
+	if m.RecordingSession("room-rec-a") != nil {
 		t.Fatal("停止后不应还有会话")
 	}
 }
