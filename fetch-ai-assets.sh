@@ -23,7 +23,9 @@ PIPER_VER="2023.11.14-2"
 echo "1. Piper (linux_aarch64) ------------------------------"
 curl -fL -o /tmp/piper.tar.gz \
   "https://github.com/rhasspy/piper/releases/download/${PIPER_VER}/piper_linux_aarch64.tar.gz"
-tar xzf /tmp/piper.tar.gz -C "$OUT/piper"
+# 压缩包顶层是个 piper/ 目录；--strip-components=1 去掉它，让二进制与
+# espeak-ng-data 直接落在 $OUT/piper/ 下（与 .env 里的 PIPER_BIN 路径一致）
+tar xzf /tmp/piper.tar.gz -C "$OUT/piper" --strip-components=1
 rm -f /tmp/piper.tar.gz
 echo -e "\tPiper 完成 $OUT/piper"
 
