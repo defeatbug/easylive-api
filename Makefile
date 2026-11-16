@@ -8,7 +8,7 @@ SHELL := /bin/sh
 POSTGRES_USER ?= postgres
 POSTGRES_DB_NAME ?= sfu_dev
 
-.PHONY: help up down logs psql run gen test build lint prod-up prod-down prod-logs prod-ps prod-check turn-check
+.PHONY: help up down logs psql run gen test test-fast build lint prod-up prod-down prod-logs prod-ps prod-check turn-check
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-8s\033[0m %s\n", $$1, $$2}'
@@ -46,7 +46,13 @@ db-test: ## 连库集成测试（需要 DATABASE_URL）
 	@test -n "$$DATABASE_URL" || { echo "用法：DATABASE_URL='postgres://...' make db-test"; exit 1; }
 	go test ./store/ -run Integration -v -count=1
 
-test: ## [容器内] 单元测试
+test: ## [容器内] 单元测试（带 race detector）
+	@# 默认带 -race：媒体热路径与录制收尾/订阅列表都是并发面，
+	@# 普通 go test 抓不到 send-on-closed-channel、包共享改写这类问题。
+	@# 需要更快跑一遍时用：make test-fast
+	go test -race ./...
+
+test-fast: ## [容器内] 单元测试（不带 race，快速反馈）
 	go test ./...
 
 build: ## [容器内] 构建二进制

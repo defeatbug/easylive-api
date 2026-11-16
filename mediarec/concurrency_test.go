@@ -6,7 +6,6 @@ package mediarec
 // 而它和媒体转发热路径是并发的。
 
 import (
-	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -17,8 +16,11 @@ import (
 // TestWriteAfterCloseIsIgnored 是回归测试：写入器被关闭后，转发协程可能还拿着
 // 旧指针再写一次（`if w := t.rec.Load(); w != nil { w.Write(pkt) }` 的窗口）。
 //
-// 没有保护时这里是 send on closed channel → panic。panic 会被 sfu.safeGo 兜住，
-// 进程不崩，但那条轨道的 Pump 就此永久退出——房间里所有人从此收不到这个人的媒体。
+// Close 之后 Write 必须静默丢弃、不 panic、不阻塞：frames 永不关闭，
+// 收尾靠 stop 信号，写协程收到 stop 后把队列里剩余的包写完再退出。
+// 旧实现靠 close(frames) 收尾时这里是 send on closed channel → panic，
+// panic 会被 sfu.safeGo 兜住，进程不崩，但那条轨道的 Pump 就此永久退出——
+// 房间里所有人从此收不到这个人的媒体。
 func TestWriteAfterCloseIsIgnored(t *testing.T) {
 	m, err := New(t.TempDir())
 	if err != nil {
@@ -81,11 +83,12 @@ func TestWriteConcurrentWithClose(t *testing.T) {
 	}
 }
 
-// TestStartSessionRejectsOtherRoom 锁定"录制会话是进程级单例"这条现状的**错误行为**：
-// 同一个房间重复开启是幂等的，但**别的房间**必须明确失败。
+// TestStartSessionIsolatedPerRoom 锁定"录制按房间隔离"：
+// 同一个房间重复开启是幂等的，不同房间各自独立、互不影响。
 //
-// 早先这里直接返回已有会话，于是 B 房间显示"已开始录制"却一个字节都不落盘。
-func TestStartSessionRejectsOtherRoom(t *testing.T) {
+// 旧的单例实现里，第二个房间必须明确失败（ErrRoomBusy）；改成 map[roomID]*Session 后，
+// B 房间开始录制会拿到属于自己的会话，A 房间的录制不受影响，停止也是按房间收尾。
+func TestStartSessionIsolatedPerRoom(t *testing.T) {
 	m, err := New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -94,8 +97,13 @@ func TestStartSessionRejectsOtherRoom(t *testing.T) {
 	if err != nil {
 		t.Fatalf("room-A 开始录制失败: %v", err)
 	}
-	if _, err := m.StartSession("room-B", "p-2"); !errors.Is(err, ErrRoomBusy) {
-		t.Fatalf("第二个房间应被拒绝（ErrRoomBusy），实际 err=%v", err)
+	// 别的房间：独立会话，不再被拒绝
+	b, err := m.StartSession("room-B", "p-2")
+	if err != nil {
+		t.Fatalf("room-B 开始录制失败: %v", err)
+	}
+	if b.ID == a.ID {
+		t.Fatalf("不同房间应有独立会话，room-A 与 room-B 拿到了同一个 %s", a.ID)
 	}
 	// 同一房间重复开启：幂等，拿到同一个会话
 	again, err := m.StartSession("room-A", "p-1")
@@ -105,15 +113,23 @@ func TestStartSessionRejectsOtherRoom(t *testing.T) {
 	if again.ID != a.ID {
 		t.Fatalf("同房间应复用会话 %s，实际 %s", a.ID, again.ID)
 	}
-	// RecordingFor 是"新轨道要不要挂写入器"的判断依据，必须只认归属房间
-	if !m.RecordingFor("room-A") {
-		t.Fatal("room-A 正在录制，RecordingFor 应为 true")
+	// Recording(roomID) 是"新轨道要不要挂写入器"的判断依据，必须只认归属房间
+	if !m.Recording("room-A") {
+		t.Fatal("room-A 正在录制，Recording(room-A) 应为 true")
 	}
-	if m.RecordingFor("room-B") {
-		t.Fatal("room-B 没有录制会话，RecordingFor 应为 false")
+	if !m.Recording("room-B") {
+		t.Fatal("room-B 正在录制，Recording(room-B) 应为 true")
 	}
-	m.StopSession()
-	if m.RecordingFor("room-A") {
-		t.Fatal("停止后 RecordingFor 应为 false")
+	// 停掉 A 只影响 A：B 的录制必须继续
+	m.StopSession("room-A")
+	if m.Recording("room-A") {
+		t.Fatal("停止后 Recording(room-A) 应为 false")
+	}
+	if !m.Recording("room-B") {
+		t.Fatal("停掉 room-A 不应影响 room-B 的录制")
+	}
+	m.StopSession("room-B")
+	if m.Recording("room-B") {
+		t.Fatal("停止后 Recording(room-B) 应为 false")
 	}
 }

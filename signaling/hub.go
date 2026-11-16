@@ -58,10 +58,14 @@ func NewHub(manager *sfu.Manager, cfg *config.Config) *Hub {
 	// 而且同一个 roomId 再开会时 Start 命中旧会话直接幂等返回，用户看到"已开启 AI 总结"
 	// 却永远等不到纪要——只能重启进程才能恢复。助手那边的每房间 RTP 状态同理。
 	agent := ai.NewAgent(aiCfg, aiMgr.SummaryMarkdown)
-	manager.OnRoomRemoved(func(roomID string) {
-		aiMgr.Stop(roomID)
-		agent.ForgetRoom(roomID)
-	})
+	// manager 可能为 nil（例如只用 Hub 的 Authenticator 做鉴权单测）：
+	// 没有房间管理器就无从注册回收钩子，直接跳过。
+	if manager != nil {
+		manager.OnRoomRemoved(func(roomID string) {
+			aiMgr.Stop(roomID)
+			agent.ForgetRoom(roomID)
+		})
+	}
 
 	return &Hub{
 		manager: manager,
