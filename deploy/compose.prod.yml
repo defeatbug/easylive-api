@@ -10,7 +10,11 @@
 #   docker compose -f deploy/compose.prod.yml --env-file deploy/.env.prod up -d --build
 #
 # 说明：coturn 用 host 网络——它需要一大段 UDP 端口，桥接模式下映射几十个端口既慢又难维护；
-#       媒体端口（7881/udp、7882/tcp）留在 api 服务上做端口映射即可，因为它们是单端口 mux。
+#       api 也用 host 网络——Docker 默认桥接只有 IPv4，媒体端口（7881/udp、7882/tcp）
+#       必须同时监听公网 IPv6 才能让网外用户直连 SFU；host 模式下 api 直接监听宿主机端口。
+#       注意：host 模式下容器解析不到 compose 的服务名，数据库改走 127.0.0.1:5432
+#       （postgres 只映射到回环地址，不对外暴露）；web 的 nginx 通过
+#       host.docker.internal 访问 api（见 web 仓库的 deploy/nginx.conf）。
 name: easylive
 
 services:
@@ -19,15 +23,14 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.api
     restart: always
+    network_mode: host
     env_file:
       - .env.prod
     # 容器里必须把 advertise IP 设成公网地址，否则浏览器拿到的是 172.x 内网候选，必然连不通
     environment:
       APP_ENV: production
-      POSTGRES_HOST: postgresql
-    ports:
-      - "7881:7881/udp" # 单端口媒体 mux
-      - "7882:7882/tcp" # ICE-TCP 兜底
+      POSTGRES_HOST: 127.0.0.1
+    # host 模式：7881/udp、7882/tcp 与 APP_PORT 直接监听在宿主机上，不做端口映射
     depends_on:
       postgresql:
         condition: service_healthy
@@ -40,6 +43,9 @@ services:
       context: ../../easylive-web
       dockerfile: deploy/Dockerfile.web
     restart: always
+    # api 用 host 网络后，nginx 只能通过宿主机网关访问它（见 web 的 nginx.conf）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "80:80"
       - "443:443"
@@ -57,6 +63,9 @@ services:
   postgresql:
     image: postgres:17.2-alpine3.20
     restart: always
+    # 只绑回环地址：供 host 网络的 api 通过 127.0.0.1:5432 访问，不对外暴露
+    ports:
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
