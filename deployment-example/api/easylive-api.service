@@ -1,0 +1,24 @@
+[Unit]
+Description=easylive-api - WebRTC SFU signaling & media server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 二进制监听的都是非特权端口（3000、7881/udp、7882/tcp），理论上不需要 root；
+# 这里用 root 是为了省掉 /opt/easylive 的属主折腾。想换专用用户时，
+# 建一个 easylive 用户并把 /opt/easylive 整个 chown 给它，再改这里的 User。
+User=root
+WorkingDirectory=/opt/easylive/api
+# .env 与 systemd 的 EnvironmentFile 是同一个文件；程序启动时也会用 godotenv
+# 从工作目录再读一次 .env（已存在的环境变量不会被覆盖）。
+EnvironmentFile=/opt/easylive/api/.env
+ExecStart=/opt/easylive/api/bin/easylive-api
+Restart=always
+RestartSec=5
+# 日志进 journald：journalctl -u easylive-api -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
