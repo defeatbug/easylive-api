@@ -13,7 +13,7 @@
 
 ## 部署
 
-单节点生产部署（HTTPS/WSS + coturn 中继 + 一键起服务）见 **[deploy/README.md](deploy/README.md)**。
+单节点生产部署（宿主机二进制 + systemd + nginx）见 **[deployment-example/README.md](deployment-example/README.md)**。
 
 ## 快速开始
 
@@ -46,6 +46,8 @@ go test ./signaling/ -v -timeout 180s
 
 ```
 main.go                 装配顺序：配置 → 数据库(可选) → Pion 引擎 → 房间管理器 → 信令 Hub → Fiber → 优雅关闭
+build.sh                部署构建：交叉编译 linux/arm64 静态二进制到 build/bin/
+fetch-ai-assets.sh      下载 AI 语音产物（Piper arm64 + 语音模型 + Whisper 模型）到 build/ai/
 config/                 环境变量读取（含默认值）与关键配置打印
 protocol/               信令协议的**唯一事实源**（Go 侧），与 web/src/lib/protocol.ts 1:1 对齐
 sfu/
@@ -74,7 +76,7 @@ store/queries/         sqlc 的查询定义（指标时序的写入与聚合）
 store/sqlcgen/         sqlc 生成代码（勿手改）
 ent/schema/            Ent 实体定义（rooms / meetings），`go generate ./ent` 生成 ent/
 graph/                 gqlgen：schema.graphqls + resolver + 生成代码
-deploy/                生产部署（Dockerfile / compose / Nginx / coturn / 部署指南）
+deployment-example/    生产部署（二进制 + systemd + nginx + .env 模板，见 deployment-example/README.md）
 loadtest/              合成压测客户端（只收发 RTP，不编码/解码）
 cmd/loadtest/          压测入口（CLI：路数/码率/时长 → CSV + P50/P95 汇总）
 cmd/dbcheck/           连库自检：Ent 与 sqlc 各跑一遍读写并逐项打印（`make db-check`）

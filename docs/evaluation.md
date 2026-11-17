@@ -45,7 +45,7 @@ SFU 只转发、不解码，无法测出到某个浏览器的 RTT/丢包。它�
 
 ```bash
 # 服务端（被压测方）
-go run .            # 或 docker compose -f deploy/compose.prod.yml up -d
+go run .            # 或按 deployment-example 跑宿主机二进制
 
 # 压测端（合成客户端：只收发 RTP，不编码/解码）
 go run ./cmd/loadtest \
@@ -119,7 +119,7 @@ LANES="2 4 8" VIDEO_KBPS="800 1500" ./scripts/matrix.sh
 
 ## 5. 与 LiveKit 对比的操作步骤
 
-1. 同一台服务器上准备两份编排（本项目 `deploy/compose.prod.yml`；LiveKit 用其官方 compose），**逐个启动、不要同时跑**。
+1. 同一台服务器上准备两份部署（本项目用宿主机二进制，见 deployment-example；LiveKit 用其官方 compose），**逐个启动、不要同时跑**。
 2. 固定实验条件：分辨率/码率/帧率、路数、订阅关系、是否屏幕共享、压测时长、重复次数。
 3. 两边的压测端都用 `cmd/loadtest`（同一份客户端消除"客户端差异"这一变量；LiveKit 也提供标准 WebRTC 接口）。
 4. 采集同一组指标：`/healthz` 换成 LiveKit 的 Prometheus 指标即可，CPU/内存用 `docker stats --no-stream`。
@@ -130,4 +130,4 @@ LANES="2 4 8" VIDEO_KBPS="800 1500" ./scripts/matrix.sh
 - 真实公网路径与 NAT 穿透（本机只有 loopback）；
 - **强制中继**：把 `TURN_URLS` 只留 `?transport=udp` 并封掉 7881/udp，用界面「指标」面板确认 `candidateType=relay`，再对比 RTT/码率；
 - LiveKit 同条件对照（需要能跑它的容器）；
-- 与数据库相关的链路（迁移执行、指标落库、聚合查询）——见 `deploy/README.md` 的验收清单。
+- 与数据库相关的链路（迁移执行、指标落库、聚合查询）——见 `deployment-example/api/README.md` 的验收清单。
