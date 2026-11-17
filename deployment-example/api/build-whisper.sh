@@ -1,5 +1,5 @@
 #!/bin/bash
-# 在服务器上编译 whisper-cli（arm64 原生编译；约几分钟）。
+# 在服务器上编译 whisper-cli（服务器上原生编译；约几分钟）。
 #
 # 用法（服务器上执行）：
 #   sudo ./build-whisper.sh [whisper.cpp 源码目录，默认 /tmp/whisper.cpp] [安装目录，默认 /opt/easylive/api/bin]
