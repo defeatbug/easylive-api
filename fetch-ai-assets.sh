@@ -1,5 +1,5 @@
 #!/bin/bash
-# 下载 AI 语音所需的预编译产物（arm64）：Piper 二进制 + 语音模型 + Whisper 模型。
+# 下载 AI 语音所需的预编译产物（amd64）：Piper 二进制 + 语音模型 + Whisper 模型。
 #
 # 用法（构建机或服务器上执行均可）：
 #   ./fetch-ai-assets.sh [输出目录，默认 build/ai]
@@ -9,7 +9,7 @@
 #                       espeak-ng-data 靠相对路径定位，不能只拷二进制）
 #   <输出目录>/models/  ggml-small.bin、zh_CN-huayan-medium.onnx、zh_CN-huayan-medium.onnx.json
 #
-# 注意：whisper-cli 不在这里下载——它没有官方 arm64 预编译包，
+# 注意：whisper-cli 不在这里下载——它没有官方预编译包，
 # 须在服务器上编一次，见 deployment-example/api/build-whisper.sh。
 # AI 资产缺失不影响开会（只影响 AI 转写/语音功能，缺失时 AI 会话明确拒绝并记日志）。
 set -e
@@ -20,9 +20,9 @@ mkdir -p "$OUT/piper" "$OUT/models"
 
 PIPER_VER="2023.11.14-2"
 
-echo "1. Piper (linux_aarch64) ------------------------------"
+echo "1. Piper (linux_x86_64) ------------------------------"
 curl -fL -o /tmp/piper.tar.gz \
-  "https://github.com/rhasspy/piper/releases/download/${PIPER_VER}/piper_linux_aarch64.tar.gz"
+  "https://github.com/rhasspy/piper/releases/download/${PIPER_VER}/piper_linux_x86_64.tar.gz"
 # 压缩包顶层是个 piper/ 目录；--strip-components=1 去掉它，让二进制与
 # espeak-ng-data 直接落在 $OUT/piper/ 下（与 .env 里的 PIPER_BIN 路径一致）
 tar xzf /tmp/piper.tar.gz -C "$OUT/piper" --strip-components=1

@@ -1,6 +1,6 @@
 # easylive 生产部署（宿主机二进制 + systemd + nginx）
 
-服务器：Linux arm64，systemd。应用以二进制直接跑在宿主机上，不走 docker；
+服务器：Linux x86_64，systemd。应用以二进制直接跑在宿主机上，不走 docker；
 只有 postgres 还在 docker 里（一个容器）。
 
 ## 服务器目录结构
@@ -29,8 +29,8 @@
 ## 1. 构建（构建机上执行，不需要在服务器上装 Go）
 
 ```bash
-bash build.sh             # 产出 build/bin/easylive-api（linux/arm64 静态二进制）
-bash fetch-ai-assets.sh   # 下载 Piper arm64 + 语音模型 + Whisper 模型到 build/ai/
+bash build.sh             # 产出 build/bin/easylive-api（linux/amd64 静态二进制）
+bash fetch-ai-assets.sh   # 下载 Piper amd64 + 语音模型 + Whisper 模型到 build/ai/
 ```
 
 ## 2. 传到服务器（scp）

@@ -46,8 +46,8 @@ go test ./signaling/ -v -timeout 180s
 
 ```
 main.go                 装配顺序：配置 → 数据库(可选) → Pion 引擎 → 房间管理器 → 信令 Hub → Fiber → 优雅关闭
-build.sh                部署构建：交叉编译 linux/arm64 静态二进制到 build/bin/
-fetch-ai-assets.sh      下载 AI 语音产物（Piper arm64 + 语音模型 + Whisper 模型）到 build/ai/
+build.sh                部署构建：交叉编译 linux/amd64 静态二进制到 build/bin/
+fetch-ai-assets.sh      下载 AI 语音产物（Piper amd64 + 语音模型 + Whisper 模型）到 build/ai/
 config/                 环境变量读取（含默认值）与关键配置打印
 protocol/               信令协议的**唯一事实源**（Go 侧），与 web/src/lib/protocol.ts 1:1 对齐
 sfu/

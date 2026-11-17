@@ -8,7 +8,7 @@ SHELL := /bin/sh
 POSTGRES_USER ?= postgres
 POSTGRES_DB_NAME ?= sfu_dev
 
-.PHONY: help up down logs psql run gen test test-fast build lint build-arm64
+.PHONY: help up down logs psql run gen test test-fast build lint build-amd64
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-8s\033[0m %s\n", $$1, $$2}'
@@ -62,6 +62,6 @@ lint: ## [容器内] go vet
 	go vet ./...
 
 # ---- 生产部署（宿主机二进制，见 deployment-example/）----
-build-arm64: ## 交叉编译 linux/arm64 部署二进制（./build.sh）
+build-amd64: ## 交叉编译 linux/amd64 部署二进制（./build.sh）
 	bash ./build.sh
 
